@@ -135,7 +135,7 @@ impl Page {
         let link = HostClient::new(HostConfig { dir: dir.clone(), program, args, cdp_port: Some(0) });
         let mut cx = HeadlessAppContext::with_platform(gpui_platform::current_platform(true).text_system(), Arc::new(()), gpui_platform::current_headless_renderer);
         cx.update(gpui_base::init);
-        let block = BrowserBlock { url: url.into(), profile: "default".into() };
+        let block = BrowserBlock { url: url.into(), profile: "default".into(), ..Default::default() };
         let l = link.clone();
         let window = cx
             .open_window(size(px(w), px(h)), |window, cx| {

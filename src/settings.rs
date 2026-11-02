@@ -402,6 +402,10 @@ pub struct Person {
     /// Where words typed into a browser block's address bar are searched.
     #[serde(skip_serializing_if = "SearchEngine::is_google")]
     pub search_engine: SearchEngine,
+    /// The labs checkout (its projects/herdr-mods/remote-desktop/web/bridge.mjs starts the
+    /// + menu's Remote desktop); `$HERDR_LABS_CHECKOUT` wins.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub labs_checkout: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -486,6 +490,7 @@ impl Default for Person {
             theme: None,
             colors: BTreeMap::new(),
             search_engine: SearchEngine::Google,
+            labs_checkout: None,
         }
     }
 }

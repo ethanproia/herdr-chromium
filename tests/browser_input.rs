@@ -232,7 +232,7 @@ fn open(program: std::path::PathBuf) -> S {
     let link = HostClient::new(HostConfig { dir, program, args: vec![], cdp_port: Some(0) });
     let mut cx = HeadlessAppContext::with_platform(gpui_platform::current_platform(true).text_system(), Arc::new(()), gpui_platform::current_headless_renderer);
     cx.update(gpui_base::init);
-    let block = layout::BrowserBlock { url: format!("file://{}", page.display()), profile: "default".into() };
+    let block = layout::BrowserBlock { url: format!("file://{}", page.display()), profile: "default".into(), ..Default::default() };
     let window = cx
         .open_window(size(px(520.), px(360.)), |window, cx| {
             cx.new(|cx| {

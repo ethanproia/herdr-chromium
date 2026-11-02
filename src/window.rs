@@ -2991,6 +2991,10 @@ impl AppWindow {
                 }
                 self.folders = mods::scan().into_iter().map(|f| (f.id.clone(), f)).collect();
             }
+            // HERDR: browser block. The + menu's Remote desktop: the labs bridge prints one url with a
+            // one-time token; it opens in a new browser block with raw chords on. The person's
+            // explicit source for raw chords; agents can't run it (their browser.* go to the agent).
+            "browser.remote" => self.open_remote_desktop(Self::arg(a, "machine").map(str::to_owned), window, cx),
             "layout.set" if shipped_layouts().contains(&self.layout_name.as_str()) => {
                 let n = match serde_json::from_value::<Node>(a.get("layout").cloned().unwrap_or_default()) {
                     Ok(n) => n,
@@ -3911,7 +3915,7 @@ impl AppWindow {
         let made = match step {
             Step::Done => return,
             Step::Open { url, place, profile, reply } => {
-                let block = crate::layout::BrowserBlock { url: url.unwrap_or_default(), profile };
+                let block = crate::layout::BrowserBlock { url: url.unwrap_or_default(), profile, ..Default::default() };
                 let r = self.open_browser(block, place.as_deref());
                 let ok = r.is_ok();
                 reply(r);
@@ -3961,7 +3965,7 @@ impl AppWindow {
     // HERDR: browser block. A page asked for a new window: a browser beside it (a split in its
     // tab); a layout block's page opens a new tab.
     fn browser_new_window(&mut self, from: &str, url: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let block = crate::layout::BrowserBlock { url: url.to_owned(), profile: "default".into() };
+        let block = crate::layout::BrowserBlock { url: url.to_owned(), profile: "default".into(), ..Default::default() };
         let r = if self.model.tab_of(from).is_some() {
             let machine = self.model.space_of(from).and_then(|s| s.machine.clone());
             let pane = self.model.fresh_id_on("p", machine.as_deref());
@@ -3979,6 +3983,40 @@ impl AppWindow {
             }
             Err(e) => tracing::warn!("browser {from}: new window for {url}: {e}"),
         }
+    }
+
+    // HERDR: browser block. Runs `node <labs>/projects/herdr-mods/remote-desktop/web/bridge.mjs
+    // --ensure [--machine m]` off the UI thread; its one printed url opens with raw chords. The
+    // url carries a token: it is never logged, and the document keeps it without the token.
+    fn open_remote_desktop(&mut self, machine: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let labs = std::env::var("HERDR_LABS_CHECKOUT").ok().filter(|v| !v.is_empty())
+            .or_else(|| settings::load_person().ok().and_then(|p| p.labs_checkout));
+        let Some(labs) = labs else {
+            return self.fail("Remote desktop needs the labs checkout: set labs_checkout in settings.json (or HERDR_LABS_CHECKOUT)");
+        };
+        let bridge = std::path::Path::new(&labs).join("projects/herdr-mods/remote-desktop/web/bridge.mjs");
+        if !bridge.exists() {
+            return self.fail(format!("no remote-desktop bridge at {}", bridge.display()));
+        }
+        cx.spawn_in(window, async move |this, cx| {
+            let found = cx.background_executor().spawn(async move { remote_desktop_url(&bridge, machine.as_deref()) }).await;
+            let _ = this.update_in(cx, |this, window, cx| match found {
+                Ok(url) => {
+                    let block = crate::layout::BrowserBlock { url: crate::browser::view::without_token(&url), launch_url: Some(url), raw_chords: true, ..Default::default() };
+                    if let Err(e) = this.open_browser(block, Some("tab")) {
+                        tracing::warn!("remote desktop: {e}");
+                    }
+                    this.flush_documents(false, window, cx);
+                    this.sync(window, cx);
+                    cx.notify();
+                }
+                Err(e) => {
+                    let spec = json!({"kind":"toast", "notification":{"title":"Remote desktop failed","body":e,"level":"error"}});
+                    this.open_overlay(mods::new_overlay_id(), spec, window, cx);
+                }
+            });
+        })
+        .detach();
     }
 
     // HERDR: browser block. A browser pane: a new tab (default) or beside the focused pane.
@@ -4734,6 +4772,30 @@ impl Render for AppWindow {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_remote_desktop_bridge_url_is_read_and_its_token_never_reaches_an_error() {
+        let dir = std::env::temp_dir().join(format!("hrd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let token = "0123456789abcdef0123456789abcdef0123456789abcdef";
+        let bridge = |name: &str, body: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, body).unwrap();
+            p
+        };
+        // Prints its url (after a blank line); --machine reaches it.
+        let ok = bridge("ok.mjs", &format!("const m = process.argv.includes('--machine') ? process.argv[process.argv.indexOf('--machine') + 1] : '';\nconsole.log('');\nconsole.log(`http://127.0.0.1:7123/?token={token}&machine=${{m}}`);\n"));
+        assert_eq!(super::remote_desktop_url(&ok, Some("box")).unwrap(), format!("http://127.0.0.1:7123/?token={token}&machine=box"));
+        // Not a local url: refused, and the error doesn't repeat it.
+        let remote = bridge("remote.mjs", &format!("console.log('https://evil.test/?token={token}')\n"));
+        let e = super::remote_desktop_url(&remote, None).unwrap_err();
+        assert!(!e.contains(token), "{e}");
+        // A failing bridge: its last stderr line, the status, never stdout (where a url would be).
+        let fail = bridge("fail.mjs", &format!("console.log('http://127.0.0.1:1/?token={token}'); console.error('no machine named x'); process.exit(3)\n"));
+        let e = super::remote_desktop_url(&fail, Some("x")).unwrap_err();
+        assert!(e.contains("no machine named x") && !e.contains(token), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use gpui::{div, point, px, size, Context, IntoElement, Render, TestAppContext, Window};
     use gpui::prelude::*;
 
@@ -4960,4 +5022,24 @@ mod tests {
         assert!(!super::adoptable(&record("live"), "sp1", Some("tb2"), None));
     }
 
+}
+
+/// HERDR: browser block. The bridge's one url (`http://127.0.0.1:<port>/?token=..&machine=..`):
+/// only a local http url is accepted. Errors never include it (it carries the token).
+fn remote_desktop_url(bridge: &std::path::Path, machine: Option<&str>) -> Result<String, String> {
+    let mut cmd = std::process::Command::new("node");
+    cmd.arg(bridge).arg("--ensure").stdin(std::process::Stdio::null());
+    if let Some(m) = machine {
+        cmd.arg("--machine").arg(m);
+    }
+    let out = cmd.output().map_err(|e| format!("can't run node: {e}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("the bridge failed ({}): {}", out.status, err.lines().last().unwrap_or("").chars().take(200).collect::<String>()));
+    }
+    let url = String::from_utf8_lossy(&out.stdout).lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("").to_owned();
+    if !url.starts_with("http://127.0.0.1:") {
+        return Err("the bridge printed no local url".into());
+    }
+    Ok(url)
 }

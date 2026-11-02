@@ -541,6 +541,14 @@ An agent takes a browser (on, default true): the person's input there is refused
 | `agent` | no |
 | `on` | no |
 
+## `browser.remote`
+
+Open a remote desktop (the + menu): starts the labs bridge (labs_checkout in settings.json) and opens its page in a new browser block with raw chords (Cmd+A/Z go to the remote machine). No machine: the page asks.
+
+| Argument | Required |
+|---|---|
+| `machine` | no |
+
 ## `browser.devtools`
 
 Open a browser's DevTools (open: false closes them).

@@ -93,6 +93,7 @@ pub const COMMANDS: &[Command] = &[
     cmd("browser.pick", &[opt("id"), opt("pane"), opt("x"), opt("y")], "Ask the person to pick an element in a browser (it enters pick mode); answers when they click: its selector, trimmed HTML, box, text, key styles and a cropped screenshot. With x and y (page DIPs), captures the element there at once."),
     cmd("browser.annotations", &[opt("id"), opt("pane"), opt("wait")], "What the person sent from a browser (Send: comments, markup, a picture; default: from any block): the newest batch, or with wait the next one. Page fields are listed as untrusted."),
     cmd("browser.lock", &[opt("id"), opt("pane"), opt("agent"), opt("on")], "An agent takes a browser (on, default true): the person's input there is refused with a visible \"<agent> is driving · Take Control\" strip until the agent unlocks (on: false) or the person takes control."),
+    cmd("browser.remote", &[opt("machine")], "Open a remote desktop (the + menu): starts the labs bridge (labs_checkout in settings.json) and opens its page in a new browser block with raw chords (Cmd+A/Z go to the remote machine). No machine: the page asks."),
     cmd("browser.devtools", &[opt("id"), opt("pane"), opt("open")], "Open a browser's DevTools (open: false closes them)."),
     // The app.
     cmd("app.help", &[], "Show the keys."),

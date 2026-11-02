@@ -1,0 +1,14 @@
+<!doctype html><title>keys</title>
+<style>body{font:16px sans-serif;margin:20px} textarea{width:400px;height:80px}</style>
+<textarea id=t>hello world</textarea>
+<script>
+// window.log: "keydown:<key>:<meta>" for every keydown, and "copy", "cut", "paste" (all cancelled),
+// "input:<inputType>" for what edit commands do. A remote-desktop page reads chords from keydown.
+window.log=[];
+document.addEventListener('keydown',e=>log.push('keydown:'+e.key+':'+e.metaKey),true);
+// Copy, cut and paste are observed and cancelled: the test never reads or writes the system clipboard.
+for(const ev of ['copy','cut','paste'])document.addEventListener(ev,e=>{e.preventDefault();log.push(ev)},true);
+document.addEventListener('beforeinput',e=>log.push('input:'+e.inputType),true);
+function rect(id){const r=document.getElementById(id).getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2}}
+window.sel=()=>{const t=document.getElementById('t');return [t.selectionStart,t.selectionEnd,t.value.length]};
+</script>

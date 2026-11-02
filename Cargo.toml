@@ -58,6 +58,11 @@ path = "tests/browser_shot.rs"
 harness = false
 
 [[test]]
+name = "browser_raw_chords"
+path = "tests/browser_raw_chords.rs"
+harness = false
+
+[[test]]
 name = "browser_perf"
 path = "tests/browser_perf.rs"
 harness = false
