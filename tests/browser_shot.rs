@@ -111,7 +111,7 @@ fn frames(program: std::path::PathBuf, args: Vec<String>, url: &str, ok: impl Fn
     let link = HostClient::new(HostConfig { dir, program, args, cdp_port: None });
     let mut cx = HeadlessAppContext::with_platform(gpui_platform::current_platform(true).text_system(), Arc::new(()), gpui_platform::current_headless_renderer);
     cx.update(gpui_base::init);
-    let block = layout::BrowserBlock { url: url.into(), profile: "default".into() };
+    let block = layout::BrowserBlock { url: url.into(), profile: "default".into(), ..Default::default() };
     let states = Arc::new(Mutex::new(HashMap::new()));
     let window = cx
         .open_window(size(px(480.), px(300.)), |window, cx| {
@@ -188,7 +188,7 @@ fn stub_input() {
     let link = HostClient::new(HostConfig { dir, program: program.into(), args: vec!["--stub".into()], cdp_port: None });
     let mut cx = HeadlessAppContext::with_platform(gpui_platform::current_platform(true).text_system(), Arc::new(()), gpui_platform::current_headless_renderer);
     cx.update(gpui_base::init);
-    let block = layout::BrowserBlock { url: "https://example.com".into(), profile: "default".into() };
+    let block = layout::BrowserBlock { url: "https://example.com".into(), profile: "default".into(), ..Default::default() };
     let states = Arc::new(Mutex::new(HashMap::new()));
     let window = cx
         .open_window(size(px(480.), px(300.)), |window, cx| {
@@ -266,7 +266,7 @@ fn agent(program: std::path::PathBuf, args: Vec<String>, url: &str, real: bool) 
     let link = HostClient::new(HostConfig { dir: dir.clone(), program, args, cdp_port: Some(0) });
     let mut cx = HeadlessAppContext::with_platform(gpui_platform::current_platform(true).text_system(), Arc::new(()), gpui_platform::current_headless_renderer);
     cx.update(gpui_base::init);
-    let block = layout::BrowserBlock { url: url.into(), profile: "default".into() };
+    let block = layout::BrowserBlock { url: url.into(), profile: "default".into(), ..Default::default() };
     let window = cx
         .open_window(size(px(480.), px(300.)), |window, cx| {
             cx.new(|cx| {
@@ -392,7 +392,7 @@ fn main() {
     let link = HostClient::new(HostConfig { dir, program: "/nonexistent".into(), args: vec![], cdp_port: None });
     let mut cx = HeadlessAppContext::with_platform(gpui_platform::current_platform(true).text_system(), Arc::new(()), gpui_platform::current_headless_renderer);
     cx.update(gpui_base::init);
-    let block = layout::BrowserBlock { url: "https://example.com".into(), profile: "default".into() };
+    let block = layout::BrowserBlock { url: "https://example.com".into(), profile: "default".into(), ..Default::default() };
     let states = Arc::new(Mutex::new(HashMap::new()));
     let window = cx
         .open_window(size(px(480.), px(300.)), |window, cx| {

@@ -39,6 +39,21 @@ pub struct BrowserBlock {
     pub url: String,
     #[serde(default = "default_profile", skip_serializing_if = "is_default_profile")]
     pub profile: String,
+    /// Raw chords: Cmd+A and Cmd+Z (and shift-Cmd+Z) reach the page as keys instead of edit
+    /// commands, for a remote-desktop page. Set only by the app (the + menu's Remote desktop),
+    /// never from the page or its url.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub raw_chords: bool,
+    /// The url the page first loads, when it differs from `url` (a one-time token in it): used
+    /// once, never written to the document.
+    #[serde(skip)]
+    pub launch_url: Option<String>,
+}
+
+impl Default for BrowserBlock {
+    fn default() -> Self {
+        Self { url: String::new(), profile: default_profile(), raw_chords: false, launch_url: None }
+    }
 }
 
 fn default_profile() -> String {
@@ -798,9 +813,9 @@ mod tests {
           { "id": "bare", "type": "block", "content": {"browser": {}} } ],
           "floating": [ { "id": "peek", "content": {"browser": {"url": "https://a.test"}} } ] }"#;
         let mut n: Node = serde_json::from_str(json).unwrap();
-        let web = BrowserBlock { url: "https://example.com".into(), profile: "work".into() };
+        let web = BrowserBlock { url: "https://example.com".into(), profile: "work".into(), ..Default::default() };
         assert_eq!(n.find("web").unwrap().content(), Some(&Content::Browser { browser: web.clone() }));
-        let bare = BrowserBlock { url: String::new(), profile: "default".into() };
+        let bare = BrowserBlock { url: String::new(), profile: "default".into(), ..Default::default() };
         assert_eq!(n.find("bare").unwrap().content(), Some(&Content::Browser { browser: bare }));
         // The default profile isn't written out; other blocks stay what they were.
         let text = serde_json::to_string(&n).unwrap();
@@ -814,7 +829,7 @@ mod tests {
         assert!(!set_browser_url(&mut n, "root", "https://x.test"));
         assert!(!set_browser_url(&mut n, "nope", "https://x.test"));
         let back: Node = serde_json::from_str(&serde_json::to_string(&n).unwrap()).unwrap();
-        assert_eq!(browser_blocks(&back)[1].1, BrowserBlock { url: "https://example.com/next".into(), profile: "work".into() });
+        assert_eq!(browser_blocks(&back)[1].1, BrowserBlock { url: "https://example.com/next".into(), profile: "work".into(), ..Default::default() });
         assert_eq!(browser_blocks(&back)[0].1.url, "https://b.test");
         // Not a terminal: the other block kinds still parse as before.
         let t: Content = serde_json::from_str(r#"{"terminal": "t1"}"#).unwrap();

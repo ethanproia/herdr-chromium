@@ -129,6 +129,8 @@ enum Route {
 pub struct BrowserInput {
     id: BrowserId,
     link: Arc<dyn HostLink>,
+    /// HERDR: raw chords (set by the view from the block, never by the page).
+    raw_chords: bool,
     /// The block's top-left in window coordinates, updated every paint.
     origin: Point<Pixels>,
     focused: bool,
@@ -152,7 +154,12 @@ pub struct BrowserInput {
 
 impl BrowserInput {
     pub fn new(id: BrowserId, link: Arc<dyn HostLink>) -> Self {
-        Self { id, link, origin: Point::default(), focused: false, caps_lock: false, held_keys: Vec::new(), held_buttons: Vec::new(), last_pos: (0.0, 0.0), marked: None, caret: None, owners: vec![Owner::Browse], lease: None, space_held: false, comment: CommentField::default(), overlay: Vec::new() }
+        Self { id, link, raw_chords: false, origin: Point::default(), focused: false, caps_lock: false, held_keys: Vec::new(), held_buttons: Vec::new(), last_pos: (0.0, 0.0), marked: None, caret: None, owners: vec![Owner::Browse], lease: None, space_held: false, comment: CommentField::default(), overlay: Vec::new() }
+    }
+
+    /// HERDR: raw chords for this block (a remote-desktop page): Cmd+A/Z go to the page as keys.
+    pub fn set_raw_chords(&mut self, on: bool) {
+        self.raw_chords = on;
     }
 
     fn send(&self, event: InputEvent) {
@@ -447,7 +454,9 @@ impl BrowserInput {
             return false;
         }
         // Clipboard and edit chords become explicit commands: CEF off-screen does not act on them as keys.
-        if let Some(command) = edit_command(k) {
+        // HERDR: raw chords (a remote-desktop block): select all, undo and redo go to the page as keys,
+        // so the remote machine gets them; copy, cut and paste stay commands (the page maps them).
+        if let Some(command) = edit_command(k).filter(|c| !(self.raw_chords && raw_chord(*c))) {
             self.link.send(AppToHost::Edit { id: self.id.clone(), command });
             return true;
         }
@@ -588,6 +597,11 @@ pub fn cursor_style(name: &str) -> CursorStyle {
 
 /// The clipboard and edit chords a focused page should get (cmd on macOS, ctrl elsewhere).
 /// The page gets them as `AppToHost::Edit`, not as `Key` events.
+/// The edit chords a raw-chords block hands to the page as keys.
+pub fn raw_chord(c: EditCommand) -> bool {
+    matches!(c, EditCommand::SelectAll | EditCommand::Undo | EditCommand::Redo)
+}
+
 pub fn edit_command(k: &gpui::Keystroke) -> Option<EditCommand> {
     let m = k.modifiers;
     let primary = if cfg!(target_os = "macos") { m.platform && !m.control } else { m.control && !m.platform };

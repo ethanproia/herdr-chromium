@@ -32,6 +32,23 @@ use super::zoom;
 use super::styles::StylePanelView;
 use super::{annotate, region};
 
+/// `url` without its `token` query parameter (what a document may keep of a launch url).
+pub fn without_token(url: &str) -> String {
+    let Some((base, query)) = url.split_once('?') else { return url.to_owned() };
+    let (query, frag) = query.split_once('#').map_or((query, None), |(q, f)| (q, Some(f)));
+    let kept: Vec<&str> = query.split('&').filter(|kv| !kv.is_empty() && kv.split('=').next() != Some("token")).collect();
+    let mut out = base.to_owned();
+    if !kept.is_empty() {
+        out.push('?');
+        out.push_str(&kept.join("&"));
+    }
+    if let Some(f) = frag {
+        out.push('#');
+        out.push_str(f);
+    }
+    out
+}
+
 /// What Send hands the agent side (fork-agent's S8): one batch, one picture.
 ///
 /// Coordinates: `annotations[].target.rect` and `region.rect` are page DIPs in the *viewport*
@@ -758,7 +775,12 @@ impl BrowserView {
         });
         let focus = cx.focus_handle();
         // Part 4: mouse, keys and IME for this page; it tells the host about focus too.
-        let input = cx.new(|_| BrowserInput::new(id.to_owned(), link.clone() as Arc<dyn HostLink>));
+        let raw = block.raw_chords;
+        let input = cx.new(|_| {
+            let mut i = BrowserInput::new(id.to_owned(), link.clone() as Arc<dyn HostLink>);
+            i.set_raw_chords(raw);
+            i
+        });
         let on = cx.on_focus(&focus, window, |v, _, cx| {
             v.input.update(cx, |i, _| i.set_focused(true));
             cx.emit(BrowserEvent::Focused);
@@ -879,10 +901,21 @@ impl BrowserView {
         cx.notify();
     }
 
+    /// The block as the view has it (url, profile, raw chords).
+    pub fn block(&self) -> &BrowserBlock {
+        &self.block
+    }
+
     /// The layout changed the block (another url typed into the document): follow it.
-    pub fn set_block(&mut self, block: BrowserBlock, cx: &mut Context<Self>) {
+    pub fn set_block(&mut self, mut block: BrowserBlock, cx: &mut Context<Self>) {
+        // The launch url is the view's, used once: the document's copy never brings it back.
+        block.launch_url = self.block.launch_url.clone();
         if block == self.block {
             return;
+        }
+        if block.raw_chords != self.block.raw_chords {
+            let on = block.raw_chords;
+            self.input.update(cx, |i, _| i.set_raw_chords(on));
         }
         let go = block.url != self.state.url && !block.url.is_empty();
         self.block = block;
@@ -902,6 +935,9 @@ impl BrowserView {
         }
         match msg {
             H::Url { url, .. } => {
+                // A raw-chords (remote desktop) block's url may carry its one-time token: the app
+                // keeps, shows and saves it without the token.
+                let url = if self.block.raw_chords { without_token(&url) } else { url };
                 self.annotations.set_page(&url);
                 if url != self.state.url {
                     self.overlay.changed(Change::Navigate);
@@ -1043,7 +1079,8 @@ impl BrowserView {
         }
         match self.sized {
             None => {
-                let url = Some(self.block.url.clone()).filter(|u| !u.is_empty());
+                // A launch url (with a one-time token) is used once and never kept.
+                let url = self.block.launch_url.take().or_else(|| Some(self.block.url.clone())).filter(|u| !u.is_empty());
                 // The shared profile is the host's default; another one names its own cache.
                 let profile = Some(self.block.profile.clone()).filter(|p| p != "default");
                 self.link.send(AppToHost::Create { id: self.id.clone(), url, size, scale, profile });
@@ -2326,6 +2363,15 @@ mod tests {
             }
         });
         (seen, kill)
+    }
+
+    #[::core::prelude::v1::test]
+    fn launch_urls_lose_their_token_in_the_document() {
+        let t = "0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(without_token(&format!("http://127.0.0.1:7000/?token={t}&machine=box")), "http://127.0.0.1:7000/?machine=box");
+        assert_eq!(without_token(&format!("http://127.0.0.1:7000/?token={t}")), "http://127.0.0.1:7000/");
+        assert_eq!(without_token("http://127.0.0.1:7000/?a=1&token=x#f"), "http://127.0.0.1:7000/?a=1#f");
+        assert_eq!(without_token("http://127.0.0.1:7000/x"), "http://127.0.0.1:7000/x");
     }
 
     #[::core::prelude::v1::test]
