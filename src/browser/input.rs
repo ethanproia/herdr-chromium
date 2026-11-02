@@ -456,7 +456,7 @@ impl BrowserInput {
         // Clipboard and edit chords become explicit commands: CEF off-screen does not act on them as keys.
         // HERDR: raw chords (a remote-desktop block): select all, undo and redo go to the page as keys,
         // so the remote machine gets them; copy, cut and paste stay commands (the page maps them).
-        if let Some(command) = edit_command(k).filter(|c| !(self.raw_chords && raw_chord(*c))) {
+        if let Some(command) = chord_command(k, self.raw_chords) {
             self.link.send(AppToHost::Edit { id: self.id.clone(), command });
             return true;
         }
@@ -597,6 +597,12 @@ pub fn cursor_style(name: &str) -> CursorStyle {
 
 /// The clipboard and edit chords a focused page should get (cmd on macOS, ctrl elsewhere).
 /// The page gets them as `AppToHost::Edit`, not as `Key` events.
+/// HERDR: the edit command a chord becomes in this block, or None when it goes to the page as a
+/// key: with raw chords on, select all, undo and redo are keys; copy, cut and paste stay commands.
+pub fn chord_command(k: &gpui::Keystroke, raw_chords: bool) -> Option<EditCommand> {
+    edit_command(k).filter(|c| !(raw_chords && raw_chord(*c)))
+}
+
 /// The edit chords a raw-chords block hands to the page as keys.
 pub fn raw_chord(c: EditCommand) -> bool {
     matches!(c, EditCommand::SelectAll | EditCommand::Undo | EditCommand::Redo)
@@ -805,6 +811,27 @@ impl EntityInputHandler for BrowserInput {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn raw_chords_send_select_all_undo_redo_as_keys_and_keep_clipboard_edits() {
+        use super::{EditCommand as E, chord_command};
+        let k = |s: &str| gpui::Keystroke::parse(s).unwrap();
+        let cmd = if cfg!(target_os = "macos") { "cmd" } else { "ctrl" };
+        let cases = [("a", E::SelectAll), ("z", E::Undo), ("shift-z", E::Redo), ("c", E::Copy), ("x", E::Cut), ("v", E::Paste)];
+        for (key, edit) in cases {
+            let stroke = k(&format!("{cmd}-{key}"));
+            // Off: every chord is its edit command, as before.
+            assert_eq!(chord_command(&stroke, false), Some(edit), "{key} off");
+            // On: select all, undo and redo go to the page as keys; the clipboard ones stay edits.
+            let raw = matches!(edit, E::SelectAll | E::Undo | E::Redo);
+            assert_eq!(chord_command(&stroke, true), if raw { None } else { Some(edit) }, "{key} on");
+        }
+        // Keys that are no edit chord stay keys either way.
+        for raw in [false, true] {
+            assert_eq!(chord_command(&k(&format!("{cmd}-b")), raw), None);
+            assert_eq!(chord_command(&k("a"), raw), None);
+        }
+    }
+
     use super::*;
     use gpui::{Keystroke, Modifiers, Render, TestAppContext, actions, div, prelude::*};
     use std::sync::Mutex;

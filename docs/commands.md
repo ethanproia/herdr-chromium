@@ -543,7 +543,7 @@ An agent takes a browser (on, default true): the person's input there is refused
 
 ## `browser.remote`
 
-Open a remote desktop (the + menu): starts the labs bridge (labs_checkout in settings.json) and opens its page in a new browser block with raw chords (Cmd+A/Z go to the remote machine). No machine: the page asks.
+Open a remote desktop: the person's + menu only (not `herdr-app do`, where browser.* goes to the agent and an agent must not start the bridge). Starts the labs bridge (labs_checkout in settings.json) and opens its page in a new browser block with raw chords (Cmd+A/Z go to the remote machine). No machine: the page asks.
 
 | Argument | Required |
 |---|---|
