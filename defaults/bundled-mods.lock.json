@@ -1,0 +1,19 @@
+{
+  "repo": "essexlabs/labs",
+  "mods": {
+    "split-chooser": {
+      "branch": "ethan/herdr-mods-notepad",
+      "commit": "20a397f64a3081cda546d9ef177ff160da1f7813",
+      "path": "projects/herdr-mods/split-chooser",
+      "version": "0.1.0"
+    },
+    "remote-desktop": {
+      "branch": "ethan/herdr-mods-notepad",
+      "commit": "20a397f64a3081cda546d9ef177ff160da1f7813",
+      "path": "projects/herdr-mods/remote-desktop/mod",
+      "version": "0.1.0",
+      "ship": false,
+      "why": "duplicates the native browser.remote entry; held until Ethan picks one"
+    }
+  }
+}

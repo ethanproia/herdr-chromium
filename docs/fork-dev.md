@@ -144,3 +144,17 @@ wheel-scrolling, or decoded video frames for W3, not frames the app drew.
 A headless window never draws; the app acks frames on receipt when headless,
 so screenshots stay current. The script still draws the app once before
 each screenshot for builds without that fix (`FORK_WEB_NO_DRAW=1` skips it).
+
+## Bundled mods: `scripts/sync-bundled-mods.py`
+
+The fork ships some of Ethan's mods built in, under `fork-` names so a home's
+own mods of the same name are never touched. Their source of record is
+essexlabs/labs `projects/herdr-mods`; `defaults/bundled-mods.lock.json` pins
+each to a labs branch and commit (`"ship": false` holds one back). To update:
+re-pin the commit, run `scripts/sync-bundled-mods.py` (any labs clone with the
+commit: `LABS_GIT=<clone>`), commit `defaults/`. `--check` fails if
+`defaults/mods/fork-*` or `defaults/layouts/fork.json` drifted from the pins.
+
+The sync also derives `fork-pane` (the shipped `pane` whose split buttons open
+`fork-split-chooser`) and the `fork` layout (`main` with `fork-pane`). Pick it
+with `layout.switch fork`; `main` is unchanged.
