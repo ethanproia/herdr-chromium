@@ -141,17 +141,32 @@ pub struct HostConfig {
     pub cdp_port: Option<u16>,
 }
 
+/// HERDR_BROWSER_CDP_PORT: no TCP port unless a developer build asks for one with a number
+/// (`0`: any free port). Anything else, a misspelled `off` included, keeps CDP on the app's pipe,
+/// and release builds never open one (an open port is unauthenticated; agents use the broker).
+fn cdp_port(value: Option<&str>, developer_build: bool) -> Option<u16> {
+    let value = value?.trim();
+    match value.parse::<u16>() {
+        Ok(port) if developer_build => Some(port),
+        Ok(_) => {
+            tracing::warn!("HERDR_BROWSER_CDP_PORT ignored: release builds keep CDP on the app's pipe");
+            None
+        }
+        Err(_) if value.is_empty() || value == "off" => None,
+        Err(_) => {
+            tracing::warn!("HERDR_BROWSER_CDP_PORT={value:?} is not a port number; CDP stays on the app's pipe");
+            None
+        }
+    }
+}
+
 impl HostConfig {
     pub fn from_env() -> Self {
         let program = std::env::var_os("HERDR_BROWSER_HOST").filter(|v| !v.is_empty()).map(PathBuf::from).unwrap_or_else(|| {
             std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("herdr-browser-host"))).unwrap_or_else(|| "herdr-browser-host".into())
         });
         let args = std::env::var("HERDR_BROWSER_HOST_ARGS").map(|a| a.split_whitespace().map(str::to_owned).collect()).unwrap_or_default();
-        // No TCP port unless a developer asks for one (agents go through the broker).
-        let cdp_port = match std::env::var("HERDR_BROWSER_CDP_PORT").ok().as_deref() {
-            Some("off") | None | Some("") => None,
-            Some(p) => p.parse().ok().or(Some(0)),
-        };
+        let cdp_port = cdp_port(std::env::var("HERDR_BROWSER_CDP_PORT").ok().as_deref(), cfg!(debug_assertions));
         Self { dir: crate::mods::app_dir().join("browser"), program, args, cdp_port }
     }
 
@@ -2793,6 +2808,16 @@ pub fn socket_of(dir: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use herdr_browser_protocol::Size;
+
+    #[::core::prelude::v1::test]
+    fn the_cdp_port_opens_only_for_a_number_in_a_developer_build() {
+        for off in [None, Some(""), Some("off"), Some("of"), Some("Off"), Some("no"), Some("false"), Some("-1"), Some("70000"), Some("9222x")] {
+            assert_eq!(cdp_port(off, true), None, "{off:?}");
+        }
+        assert_eq!(cdp_port(Some("9222"), true), Some(9222));
+        assert_eq!(cdp_port(Some(" 0 "), true), Some(0));
+        assert_eq!(cdp_port(Some("9222"), false), None, "release builds never open a port");
+    }
 
     #[::core::prelude::v1::test]
     fn load_error_cards_name_the_kind_and_cap_the_url() {
