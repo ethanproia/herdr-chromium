@@ -29,6 +29,25 @@ pub fn css_edits_line(edits: &[StyleEdit]) -> Option<String> {
     (!parts.is_empty()).then(|| format!("{PREFIX}{}", parts.join("; ")))
 }
 
+/// The line the agent gets as the person's words: property and new value only (`padding → 16px`,
+/// `color: removed`). The old values came from the page; they go separately (`was_values`), fenced.
+pub fn person_line(edits: &[StyleEdit]) -> Option<String> {
+    let parts: Vec<String> = edits
+        .iter()
+        .filter(|e| e.from != e.to)
+        .map(|e| match &e.to {
+            Some(to) => format!("{} → {to}", e.prop),
+            None => format!("{}: removed", e.prop),
+        })
+        .collect();
+    (!parts.is_empty()).then(|| format!("{PREFIX}{}", parts.join("; ")))
+}
+
+/// `(prop, old value)` for each real edit that replaced a value: page text, untrusted.
+pub fn was_values(edits: &[StyleEdit]) -> Vec<(String, String)> {
+    edits.iter().filter(|e| e.from != e.to).filter_map(|e| Some((e.prop.clone(), e.from.clone()?))).collect()
+}
+
 /// The comment with the edits line appended on its own line (or the line alone).
 pub fn with_edits(comment: &str, edits: &[StyleEdit]) -> String {
     match (comment.trim(), css_edits_line(edits)) {
@@ -52,6 +71,8 @@ mod tests {
         assert_eq!(css_edits_line(&edits).unwrap(), "CSS edits — padding: 8px → 16px; margin: removed (was 4px); gap: unset → 12px");
         assert_eq!(css_edits_line(&[e("color", Some("red"), Some("red"))]), None, "no-op edits say nothing");
         assert_eq!(css_edits_line(&[]), None);
+        assert_eq!(person_line(&edits).unwrap(), "CSS edits — padding → 16px; margin: removed; gap → 12px", "no page value in the person's line");
+        assert_eq!(was_values(&edits), [("padding".to_string(), "8px".to_string()), ("margin".to_string(), "4px".to_string())]);
         assert_eq!(with_edits(" make it roomier ", &edits[..1]), "make it roomier\nCSS edits — padding: 8px → 16px");
         assert_eq!(with_edits("", &edits[1..2]), "CSS edits — margin: removed (was 4px)");
         assert_eq!(with_edits("just a note", &[]), "just a note");
