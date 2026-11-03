@@ -136,6 +136,22 @@ def exec_commands(files):
     return sorted({c.decode() for rel, data in files.items() if rel.endswith((".js", ".mjs")) for c in EXEC_CALL.findall(data)})
 
 
+IMPORT = re.compile(rb'(?:\bfrom\s*|\bimport\s*\(?\s*)["\'](\.{1,2}/[^"\']+)["\']')
+
+
+def escaping_imports(name, files):
+    """Relative imports that leave the mod's own folder: nothing outside it is installed with it."""
+    bad = []
+    for rel, data in files.items():
+        if not rel.endswith((".js", ".mjs")):
+            continue
+        for spec in IMPORT.findall(data):
+            target = os.path.normpath(os.path.join(os.path.dirname(rel), spec.decode()))
+            if target.startswith(".."):
+                bad.append(f"{name}/{rel} imports {spec.decode()}")
+    return bad
+
+
 def folder_files(d):
     have = {}
     for dirpath, _, fs in os.walk(d):
@@ -167,6 +183,9 @@ def main():
     for name, files in out.items():
         declared = {c.split()[0] for c in lock["mods"][name[len(PREFIX):]].get("exec", [])}
         undeclared += [f"{name} runs {c}" for c in exec_commands(files) if c not in declared]
+    escaping = [b for name, files in out.items() for b in escaping_imports(name, files)]
+    if escaping:
+        sys.exit("sync-bundled-mods: imports outside the mod's own folder (not installed with it): " + "; ".join(escaping))
     if undeclared:
         sys.exit("sync-bundled-mods: commands not declared in the lockfile's exec lists: " + "; ".join(undeclared))
     if "--bless-stock" in sys.argv:

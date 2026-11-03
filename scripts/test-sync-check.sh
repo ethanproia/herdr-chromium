@@ -43,6 +43,18 @@ json.dump(lock, open(p, "w"), indent=2)
 EOF
 out=$(check); [[ $? -ne 0 && $out == *"fork-core runs git"* ]] && ok "undeclared exec command fails" || bad "undeclared exec: $out"
 
+out=$(python3 - <<'EOF'
+import importlib.util
+spec = importlib.util.spec_from_file_location("sync", "scripts/sync-bundled-mods.py")
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+print(m.escaping_imports("fork-core", {
+    "roles/menu.js": b'import { x } from "../../clones/mac/menu-browser/labels.js";',
+    "roles/ok.js": b'import { y } from "../look.js";',
+}))
+EOF
+)
+[[ $out == *"roles/menu.js imports ../../clones"* && $out != *"ok.js"* ]] && ok "import leaving the mod folder is caught" || bad "escaping import: $out"
+
 find "$work" -delete
 echo "failures: $fails"
 exit $((fails > 0))
