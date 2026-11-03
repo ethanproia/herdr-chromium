@@ -53,6 +53,11 @@ path = "tests/shot_pixels.rs"
 harness = false
 
 [[test]]
+name = "titlebar_fullscreen"
+path = "tests/titlebar_fullscreen.rs"
+harness = false
+
+[[test]]
 name = "browser_shot"
 path = "tests/browser_shot.rs"
 harness = false

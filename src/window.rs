@@ -8,6 +8,8 @@ use crate::hc::Core;
 mod floats;
 mod movable;
 mod pane_drag;
+#[cfg(target_os = "macos")]
+mod native_titlebar;
 mod titlebar;
 
 use crate::layout::{Axis, Background as Paint, Content, Fit, HeaderContent, Kind, Line, Node, PaneFrame, Size as Span};
@@ -3222,6 +3224,7 @@ impl AppWindow {
                 cx.quit();
             }
             "window.close" | "window.minimize" | "window.maximize" => return self.window_command(name, window, cx),
+            "window.native" => return self.answer(Self::window_native(window)),
             // Hiding apps is macOS's (bound natively there).
             "app.hide" | "app.hide_others" | "app.show_all" => return,
             other => {
