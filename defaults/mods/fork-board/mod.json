@@ -12,7 +12,7 @@
   "source": {
     "repo": "essexlabs/labs",
     "branch": "ethan/herdr-board-mod",
-    "commit": "1bae883e8629b09f0a38e5b35746b75f6b70e40d",
+    "commit": "ede14fc4083832b99a7c576c3be8d58ab4239ecc",
     "path": "projects/herdr-mods/board/mods/board"
   }
 }

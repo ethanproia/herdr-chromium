@@ -1,0 +1,2 @@
+{ "id": "browser-native", "name": "Browser", "group": "Tools", "icon": "globe.svg", "order": 1,
+  "open": { "command": "browser.new" }, "places": ["tab", "split"], "unlessInstalled": "browser" }

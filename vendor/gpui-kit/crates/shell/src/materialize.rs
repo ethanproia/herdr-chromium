@@ -1200,7 +1200,7 @@ fn materialize_component(
 
             let button = with_hover(button, &states);
             let button = with_active_and_focus(button, &states);
-            let button = components::tooltip::with_tooltip(button, &behavior);
+            let button = components::tooltip::with_tooltip(button, &behavior, window);
             let button = with_input_handlers(button, &behavior, runtime);
             finish(button, refinement, children)
         }
@@ -1443,7 +1443,7 @@ fn materialize_component(
             // accounts for this node's own `text_color`, so an explicit color
             // still wins and an icon in a dark button comes out light.
             warn_unhonoured_a11y(&behavior, "svg", &[]);
-            let path = SharedString::from(path);
+            let path = crate::AppAssets::cache_key(&path);
             // HERDR: `spin`.
             if let Some(ms) = behavior.spin
                 && HOSTED.with(|h| h.get())
@@ -1491,7 +1491,11 @@ fn materialize_component(
         Component::Image(path) => {
             warn_unhonoured_a11y(&behavior, "image", &[]);
             // HERDR: animated images need an identity to retain their frame state.
-            let mut image = gpui::img(SharedString::from(path)).id(element_id(id, behavior.key.clone()));
+            let mut source = gpui::ImageSource::from(path);
+            if let gpui::ImageSource::Resource(gpui::Resource::Embedded(path)) = &mut source {
+                *path = crate::AppAssets::cache_key(path);
+            }
+            let mut image = gpui::img(source).id(element_id(id, behavior.key.clone()));
             image.style().refine(&refinement);
             image.into_any_element()
         }
@@ -2199,7 +2203,7 @@ fn flex_element(
             }
         });
     }
-    let stateful = components::tooltip::with_tooltip(stateful, &behavior);
+    let stateful = components::tooltip::with_tooltip(stateful, &behavior, window);
     if behavior.scrollbar {
         let mut stateful = stateful;
         stateful.style().refine(&refinement);
