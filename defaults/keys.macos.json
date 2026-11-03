@@ -36,7 +36,7 @@
     "shift-f2": "space.rename",
     "cmd-/": "app.help",
     "cmd-shift-/": "app.help",
-    "cmd-b": "layout.toggle:sidebar",
+    "cmd-b": "fork-core.toggle-sidebar",
     "cmd-=": "app.zoom_in",
     "cmd-+": "app.zoom_in",
     "cmd--": "app.zoom_out",

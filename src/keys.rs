@@ -104,9 +104,14 @@ fn gone_mod(action: &str) -> bool {
         && name.split_once('.').is_some_and(|(m, _)| !m.starts_with("frame-") && !crate::mods::mods_dir().join(m).is_dir())
 }
 
-// HERDR: fork-core's split commands open its New panel chooser; while fork-core is
-// turned off or missing their keys fall back to the built-in split instead of going dead.
-const FALLBACKS: &[(&str, &str)] = &[("fork-core.split-right", "pane.split:right"), ("fork-core.split-down", "pane.split:down")];
+// HERDR: fork-core's split commands open its New panel chooser and its sidebar toggle steps
+// rail/open/hidden; while fork-core is turned off or missing their keys fall back to the
+// built-in command instead of going dead.
+const FALLBACKS: &[(&str, &str)] = &[
+    ("fork-core.split-right", "pane.split:right"),
+    ("fork-core.split-down", "pane.split:down"),
+    ("fork-core.toggle-sidebar", "layout.toggle:sidebar"),
+];
 
 /// The action a binding runs: itself, a gone mod's fallback, or None (bound to nothing).
 fn resolve(action: &str, gone: impl Fn(&str) -> bool) -> Option<String> {
@@ -226,6 +231,8 @@ mod tests {
         // Turned off (mods_disabled) or folder missing: gone_mod is true either way.
         assert_eq!(resolve("fork-core.split-right", |_| true).as_deref(), Some("pane.split:right"));
         assert_eq!(resolve("fork-core.split-down", |_| true).as_deref(), Some("pane.split:down"));
+        assert_eq!(resolve("fork-core.toggle-sidebar", |_| false).as_deref(), Some("fork-core.toggle-sidebar"));
+        assert_eq!(resolve("fork-core.toggle-sidebar", |_| true).as_deref(), Some("layout.toggle:sidebar"));
         // Any other gone mod's key stays unbound.
         assert_eq!(resolve("ribbon.next", |_| true), None);
     }
@@ -235,6 +242,12 @@ mod tests {
         // A person's own action on the key is kept as written: no fallback applies to it.
         assert_eq!(super::resolve("pane.zoom", |_| false).as_deref(), Some("pane.zoom"));
         assert_eq!(super::parse(r#"{ "global": { "cmd-d": "pane.zoom" } }"#).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn own_cmd_b_is_never_replaced() {
+        assert_eq!(super::resolve("tab.new", |_| false).as_deref(), Some("tab.new"));
+        assert_eq!(super::parse(r#"{ "global": { "cmd-b": "tab.new" } }"#).unwrap().len(), 1);
     }
 
     #[test]
