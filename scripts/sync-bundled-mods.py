@@ -19,7 +19,7 @@ branch and commit, the folder in labs, "ship": false to hold one back,
 only folder references (mods/<n>/, mod:<n>), never plain strings such as tool ids;
 "layout" pins the labs layout that becomes defaults/layouts/labs.json (and its
 preview picture, defaults/layouts/labs.svg).
-LABS_GIT (default ~/work.noindex/herdr-board/labs-wt) is any labs clone that
+LABS_GIT (default ~/work.noindex/herdr-fork/labs-pins) is any labs clone that
 has the commits; nothing is fetched here.
 
 Shipped names get a "fork-" prefix so a home's own mods of the same name are
@@ -168,7 +168,7 @@ def stock_digests():
 
 def main():
     lock = json.load(open(LOCK))
-    git = os.path.expanduser(os.environ.get("LABS_GIT", "~/work.noindex/herdr-board/labs-wt"))
+    git = os.path.expanduser(os.environ.get("LABS_GIT", "~/work.noindex/herdr-fork/labs-pins"))
     missing = [m["commit"][:9] for m in [*lock["mods"].values(), lock["layout"]] if m.get("ship", True)
                and subprocess.run(["git", "-C", git, "cat-file", "-e", m["commit"] + "^{commit}"], capture_output=True).returncode]
     if missing:
