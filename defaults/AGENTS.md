@@ -705,6 +705,12 @@ What's about the user, never a look:
   background; this is a threshold, not a guaranteed resulting ratio.
   Box/block, Powerline and sprite glyph colors are never adjusted.
   Changes apply immediately, including text already on screen.
+- `toast_corner`: where notices stack, `"top-right"` (default) or
+  `"bottom-right"`. Top right starts below the layout's top bar (and the
+  side panel's strip while it is open), so toasts never cover those controls.
+  Toasts form a deck: the newest in front, up to three peeking behind.
+  Hovering the deck lists them all and pauses their timers until the
+  pointer leaves.
 - `glass`: macOS only, `true` blurs what's behind the window through the
   layout's own background colors (sidebar, canvas, shown at 60%); panes,
   terminals and browser blocks stay opaque. Off by default.
