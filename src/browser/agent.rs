@@ -211,6 +211,21 @@ impl Agent {
         Ok(())
     }
 
+    /// The broker's door (agent.sock): the same grants as `allowed`, per CDP method. `profile` is the
+    /// block's; only exactly "agent" skips Control, and a block the app doesn't know is refused.
+    pub fn broker_allowed(&self, id: &BrowserId, method: &str, profile: Option<&str>) -> Result<(), String> {
+        let Some(profile) = profile else { return Err(format!("no browser block {id:?}")) };
+        for grant in super::broker::needs(method, self.grants.get(id, Grant::Sensitive))? {
+            if grant == Grant::Control && profile == AGENT_PROFILE {
+                continue;
+            }
+            if !self.grants.get(id, grant) {
+                return Err(format!("the person hasn't allowed {} (browser {id:?}): they turn it on in the shield in its bar", grant.what()));
+            }
+        }
+        Ok(())
+    }
+
     fn park(&mut self, id: &BrowserId, op: Op, reply: Reply) -> u64 {
         self.next_req += 1;
         self.pending.insert(self.next_req, Pending { id: id.clone(), generation: self.generation, op, reply });
