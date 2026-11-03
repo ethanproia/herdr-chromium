@@ -22,8 +22,11 @@
         "qlmanage",
         "rm",
         "sh (runs ffmpeg in the background)",
-        "sips"
-      ]
+        "sips",
+        "stat",
+        "test"
+      ],
+      "exec_note": "also runs ffmpeg by its found path (toolPath), not a literal name"
     },
     "core": {
       "branch": "ethan/herdr-core-retire",
@@ -31,14 +34,31 @@
       "version": "0.1.0",
       "pr": "essexlabs/labs#1303 (on #1298)",
       "path": "projects/herdr-mods/core",
-      "rename": "paths"
+      "rename": "paths",
+      "exec": [
+        "git",
+        "sh"
+      ]
     },
     "notepad": {
       "branch": "ethan/herdr-mods",
       "commit": "beeb3c485415dcadd2d72aee0f6d5b17509496c2",
       "path": "projects/herdr-mods/notepad",
       "version": "0.1.0",
-      "pr": "essexlabs/labs#1284 (merged)"
+      "pr": "essexlabs/labs#1284 (merged)",
+      "exec": [
+        "cp",
+        "curl",
+        "find",
+        "git",
+        "mkdir",
+        "mktemp",
+        "open",
+        "rm",
+        "rmdir",
+        "sh",
+        "sips"
+      ]
     },
     "notepad-view": {
       "path": "projects/herdr-mods/notepad-view",
@@ -60,7 +80,10 @@
       "commit": "59bde8f7e60e813bd2cca6749a8cf1f4980cc962",
       "version": "0.1.0",
       "pr": "essexlabs/labs#1303 (on #1298)",
-      "path": "projects/herdr-mods/clones/mac/spaces-browser"
+      "path": "projects/herdr-mods/clones/mac/spaces-browser",
+      "exec": [
+        "git"
+      ]
     }
   },
   "layout": {
@@ -70,5 +93,28 @@
     "pr": "essexlabs/labs#1303 (on #1298)",
     "path": "projects/herdr-mods/clones/mac/layouts/Labs.json",
     "preview": "projects/herdr-mods/clones/mac/layouts/labs.svg"
+  },
+  "stock": {
+    "agents": "09c89201c4a39944",
+    "changes": "87b5c7bf576cab0e",
+    "confirm": "c3c5e99c42bfb7c2",
+    "files": "5c8f8f5dbb56984a",
+    "help": "bda54340f8f99a4f",
+    "machine-add": "94ba64971e67cb5e",
+    "menu": "b306b52329864d0e",
+    "new-menu": "26c2c996b53c6d4c",
+    "pane": "4af182fe5751a96d",
+    "peek": "dcb2cca951488605",
+    "picker": "d5183ad58247fe3a",
+    "prompt": "f69767163714eba3",
+    "spaces": "607b6c0651b5591a",
+    "tabs": "2bfd3d2c54497c52",
+    "terminals-bar": "2959e52e89528b33",
+    "terminals-pane": "b049ae39286a0a89",
+    "toast": "0bbc0f21aabd9a9d",
+    "win98": "f12f2010539e0996",
+    "workspace-chrome": "cf1673749eee9578",
+    "workspace-status": "39244abc10f76527",
+    "worktree": "dc989d09e30827a2"
   }
 }
