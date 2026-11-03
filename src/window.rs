@@ -836,7 +836,13 @@ impl AppWindow {
             crate::telemetry::set_setting(settings::telemetry_setting(&loaded));
             match loaded {
                 Ok(p) => {
+                    // HERDR: a changed mods_disabled list: find mods again and rebind keys.
+                    let off_changed = p.mods_disabled != self.person.mods_disabled;
                     self.person = p;
+                    if off_changed {
+                        self.sync_folders(window, cx);
+                        self.watched.keys = Some(std::time::SystemTime::UNIX_EPOCH);
+                    }
                     let _ = std::fs::remove_file(file("settings.error"));
                 }
                 Err(e) => self.report("settings", &e),
@@ -1069,6 +1075,11 @@ impl AppWindow {
     fn show_layout_notes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         for clone in mods::take_sync_notes() {
             let n = json!({ "title": format!("Your edits are in {clone}"), "body": "Herdr's own layouts and mods can't be changed: clone one to make it yours.", "level": "info", "timeout": 12000 });
+            self.open_overlay(mods::new_overlay_id(), json!({ "kind": "toast", "notification": n }), window, cx);
+        }
+        // HERDR: keys a mod wanted that the person already uses (src/mod_keys.rs).
+        for line in crate::mod_keys::take_notes() {
+            let n = json!({ "title": "Mod keys", "body": line, "level": "info", "timeout": 12000 });
             self.open_overlay(mods::new_overlay_id(), json!({ "kind": "toast", "notification": n }), window, cx);
         }
     }
@@ -2308,7 +2319,7 @@ impl AppWindow {
             return Err(format!("no space {space:?}"));
         }
         if !self.folders.contains_key(&m) {
-            return Err(format!("no mod {m:?} in mods/"));
+            return Err(mods::missing(&m));
         }
         let machine = self.machine_of(&space);
         self.require_document(machine.as_deref())?;
@@ -2339,7 +2350,7 @@ impl AppWindow {
             return Err(format!("no pane {target:?}"));
         }
         if !self.folders.contains_key(&name) {
-            return Err(format!("no mod {name:?} in mods/"));
+            return Err(mods::missing(&name));
         }
         let machine = self.model.space_of(&target).and_then(|s| s.machine.clone());
         self.require_document(machine.as_deref())?;
@@ -3085,7 +3096,7 @@ impl AppWindow {
             }
             "mod.open" => {
                 let name = Self::arg(a, "name").unwrap_or_default();
-                let Some(f) = self.folders.get(name) else { return self.fail(format!("no mod folder {name:?}")) };
+                let Some(f) = self.folders.get(name) else { return self.fail(mods::missing(name)) };
                 let mut spec = mod_overlay(&f.dir);
                 spec["mod"] = json!(name);
                 self.open_overlay(mods::new_overlay_id(), spec, window, cx);

@@ -406,6 +406,10 @@ pub struct Person {
     /// + menu's Remote desktop); `$HERDR_LABS_CHECKOUT` wins.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub labs_checkout: Option<String>,
+    /// HERDR: mods turned off by name: not found by the app (layouts, tabs, overlays,
+    /// keys), though their files stay installed. Removing a name turns it back on.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub mods_disabled: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -491,6 +495,7 @@ impl Default for Person {
             colors: BTreeMap::new(),
             search_engine: SearchEngine::Google,
             labs_checkout: None,
+            mods_disabled: Vec::new(),
         }
     }
 }

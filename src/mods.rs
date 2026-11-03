@@ -76,7 +76,9 @@ pub fn write_workspace() -> std::io::Result<()> {
         std::fs::create_dir_all(file.parent().unwrap())?;
         std::fs::write(&file, bytes)?;
     }
-    sync_defaults(&mods_dir(), &dir.join("installed.json"), DEFAULT_MODS)
+    sync_defaults(&mods_dir(), &dir.join("installed.json"), DEFAULT_MODS)?;
+    // HERDR: each mod's own keys.json joins the home's (src/mod_keys.rs).
+    crate::mod_keys::merge(&dir)
 }
 
 static SYNC_NOTES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
@@ -349,8 +351,24 @@ pub struct Found {
 }
 
 /// Every mod folder that has a main.js.
+// HERDR: settings `mods_disabled`: names the app treats as not installed.
+pub fn disabled() -> std::collections::BTreeSet<String> {
+    crate::settings::load_person().map(|p| p.mods_disabled.into_iter().collect()).unwrap_or_default()
+}
+
+// HERDR: why a mod name isn't available, for errors.
+pub fn missing(name: &str) -> String {
+    if disabled().contains(name) {
+        format!("mod {name:?} is turned off (settings mods_disabled)")
+    } else {
+        format!("no mod {name:?} in mods/")
+    }
+}
+
 pub fn scan() -> Vec<Found> {
+    let off = disabled();
     let mut found = scan_dir(&mods_dir(), "");
+    found.retain(|f| !off.contains(&f.id));
     found.extend(scan_dir(&frame_dir(), "frame-"));
     found.sort_by(|a, b| a.id.cmp(&b.id));
     found
