@@ -1,0 +1,2 @@
+{ "id": "changes", "name": "Changes", "group": "Tools", "icon": "changes.svg", "order": 20,
+  "open": { "mod": "changes" }, "places": ["side"] }
