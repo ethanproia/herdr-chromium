@@ -456,6 +456,10 @@ unsafe fn build_window_class(name: &'static str, superclass: &Class) -> *const C
             window_will_exit_fullscreen as extern "C" fn(&Object, Sel, id),
         );
         decl.add_method(
+            sel!(windowDidFailToEnterFullScreen:),
+            window_did_fail_to_enter_fullscreen as extern "C" fn(&Object, Sel, id),
+        );
+        decl.add_method(
             sel!(windowDidFailToExitFullScreen:),
             window_did_fail_to_exit_fullscreen as extern "C" fn(&Object, Sel, id),
         );
@@ -719,6 +723,29 @@ struct MacWindowState {
 }
 
 impl MacWindowState {
+    /// HERDR: puts the see-through title bar back once the window is windowed.
+    /// Entering fullscreen makes it opaque (macOS 15.3+) and only the will-exit
+    /// path set it back, which macOS 26+ can undo or skip, leaving a grey strip.
+    fn reassert_titlebar(&mut self) {
+        if !self.transparent_titlebar
+            || self.simple_fullscreen_state.is_some()
+            || (self.is_fullscreen() && !self.is_exiting_fullscreen)
+        {
+            return;
+        }
+        unsafe {
+            // Only titled windows; the full-size mask is set at creation (and changing it
+            // here could resize under this lock), so only the appearance is put back.
+            if !self.native_window.styleMask().contains(NSWindowStyleMask::NSTitledWindowMask) {
+                return;
+            }
+            self.native_window.setTitlebarAppearsTransparent_(YES);
+            self.native_window
+                .setTitleVisibility_(NSWindowTitleVisibility::NSWindowTitleHidden);
+        }
+        self.move_traffic_light();
+    }
+
     fn move_traffic_light(&mut self) {
         if let Some(traffic_light_position) = self.traffic_light_position {
             if self.is_fullscreen() && !self.is_exiting_fullscreen {
@@ -3074,7 +3101,15 @@ extern "C" fn window_did_exit_fullscreen(this: &Object, _: Sel, _: id) {
     // Moving the buttons during the transition captures their fullscreen frames.
     // Keep using the native windowed frames when restoring them on the next entry.
     lock.traffic_light_frames = lock.pre_fullscreen_traffic_light_frames.take();
-    lock.move_traffic_light();
+    lock.reassert_titlebar(); // HERDR
+}
+
+// HERDR: will_enter already made the title bar opaque; undo that.
+extern "C" fn window_did_fail_to_enter_fullscreen(this: &Object, _: Sel, _: id) {
+    let window_state = unsafe { get_window_state(this) };
+    let mut lock = window_state.as_ref().lock();
+    lock.traffic_light_frames = lock.pre_fullscreen_traffic_light_frames.take();
+    lock.reassert_titlebar();
 }
 
 pub(crate) fn is_macos_version_at_least(version: NSOperatingSystemVersion) -> bool {
@@ -3131,6 +3166,7 @@ extern "C" fn window_did_change_screen(this: &Object, _: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.as_ref().lock();
     lock.start_display_link();
+    lock.reassert_titlebar(); // HERDR: a display change can leave fullscreen without will_exit
     drop(lock);
     update_window_scale_factor(&window_state);
 }
@@ -3162,6 +3198,10 @@ extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) 
         return;
     }
 
+    let mut lock = lock;
+    if selector == sel!(windowDidBecomeKey:) {
+        lock.reassert_titlebar(); // HERDR: catch-all for fullscreen exits that skip will_exit
+    }
     let executor = lock.foreground_executor.clone();
     drop(lock);
 

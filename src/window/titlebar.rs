@@ -195,6 +195,21 @@ impl AppWindow {
         }
     }
 
+    /// `window.native`: the title bar flags as AppKit sees them (macOS only).
+    pub(super) fn window_native(window: &Window) -> Result<Value, String> {
+        #[cfg(target_os = "macos")]
+        if let Some(f) = super::native_titlebar::titlebar_flags(window) {
+            return Ok(json!({
+                "titlebar_transparent": f.transparent,
+                "full_size_content": f.full_size_content,
+                "title_hidden": f.title_hidden,
+                "fullscreen": f.fullscreen,
+            }));
+        }
+        let _ = window;
+        Err("window.native: macOS only".into())
+    }
+
     pub(super) fn window_command(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
         match name {
             "window.close" => {
