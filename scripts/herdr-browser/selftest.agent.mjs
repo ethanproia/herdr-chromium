@@ -230,7 +230,7 @@ try {
   // Wait for the answer to call 3 itself, not a fixed time: under load the server can take seconds to start.
   let buf = "";
   const answered = new Promise((r) => m.stdout.on("data", (d) => { buf += d; if (buf.split("\n").some((l) => /"id":3\b/.test(l))) r(); }));
-  for (const [id, method, params] of [[1, "initialize", {}], [2, "tools/list"], [3, "tools/call", { name: "browser_text", arguments: { tab: T } }]])
+  for (const [id, method, params] of [[1, "initialize", {}], [2, "tools/list"], [3, "tools/call", { name: "browser_text", arguments: { viewId: T } }]])
     m.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
   await Promise.race([answered, new Promise((r) => setTimeout(r, 60000))]);
   m.kill();
