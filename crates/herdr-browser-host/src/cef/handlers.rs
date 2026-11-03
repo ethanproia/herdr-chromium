@@ -380,6 +380,17 @@ wrap_load_handler! {
             super::on_loading(&self.id, is_loading != 0);
             send(HostToApp::Loading { id: self.id.clone(), loading: is_loading != 0, can_back: can_go_back != 0, can_forward: can_go_forward != 0 });
         }
+
+        /// The main frame's failed load goes to the app, which shows its own error card (aborts are not errors).
+        fn on_load_error(&self, _browser: Option<&mut Browser>, frame: Option<&mut Frame>, error_code: Errorcode, _error_text: Option<&CefString>, failed_url: Option<&CefString>) {
+            if !frame.is_some_and(|f| f.is_main() == 1) {
+                return;
+            }
+            let code = *error_code.as_ref() as i32;
+            if let Some(kind) = crate::load_error_kind(code) {
+                send(HostToApp::LoadError { id: self.id.clone(), url: s(failed_url), code, kind: kind.into() });
+            }
+        }
     }
 }
 
@@ -410,6 +421,12 @@ wrap_request_handler! {
             }
             send(HostToApp::NewWindow { id: self.id.clone(), url: s(target_url), disposition: disposition_name(&target_disposition).into() });
             1
+        }
+
+        /// A bad certificate is cancelled, never proceeded (v1 has no "proceed anyway"): the load
+        /// then fails, and on_load_error reports it as kind "certificate".
+        fn on_certificate_error(&self, _browser: Option<&mut Browser>, _cert_error: Errorcode, _request_url: Option<&CefString>, _ssl_info: Option<&mut Sslinfo>, _callback: Option<&mut Callback>) -> ::std::os::raw::c_int {
+            0
         }
     }
 }

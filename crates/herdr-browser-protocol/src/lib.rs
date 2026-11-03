@@ -258,6 +258,9 @@ pub enum HostToApp {
     Title { id: BrowserId, title: String },
     Url { id: BrowserId, url: String },
     Loading { id: BrowserId, loading: bool, can_back: bool, can_forward: bool },
+    /// The main frame failed to load (not an abort). `kind`: "dns" | "offline" | "refused" | "timeout" | "certificate" | "other";
+    /// `code` is the net error (ERR_NAME_NOT_RESOLVED = -105, ...). A certificate error is cancelled, never proceeded.
+    LoadError { id: BrowserId, url: String, code: i32, kind: String },
     /// CSS cursor name: "default", "pointer", "text", "grab", ...
     Cursor { id: BrowserId, name: String },
     Favicon { id: BrowserId, url: String },
@@ -359,6 +362,7 @@ mod tests {
         roundtrip_host(HostToApp::Frame { id: "b1".into(), seq: 1, surface: SurfaceRef::GlobalId { id: 42 }, size: PixelSize { w: 1600, h: 1200 }, scale: 2.0 });
         roundtrip_host(HostToApp::Frame { id: "b1".into(), seq: 2, surface: SurfaceRef::MachPort { name: "com.herdr.s".into() }, size: PixelSize { w: 2, h: 2 }, scale: 1.0 });
         roundtrip_host(HostToApp::Loading { id: "b1".into(), loading: true, can_back: false, can_forward: false });
+        roundtrip_host(HostToApp::LoadError { id: "b1".into(), url: "http://127.0.0.1:9/".into(), code: -102, kind: "refused".into() });
         roundtrip_host(HostToApp::ImeCaret { id: "b1".into(), x: 1.0, y: 2.0, w: 1.0, h: 16.0 });
         roundtrip_host(HostToApp::EvalResult { id: "b1".into(), req: 1, ok: true, value: serde_json::json!({"n": 2}) });
         roundtrip_host(HostToApp::CdpTarget { id: "b1".into(), target_id: "T1".into() });

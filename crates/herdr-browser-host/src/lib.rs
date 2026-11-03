@@ -18,6 +18,35 @@ pub mod cef;
 
 pub use stub::{id_byte, stub_pixel};
 
+/// The kind a failed load's net error is (`HostToApp::LoadError`); None for an abort (-3, a
+/// navigation replaced by another), which is no error to show.
+pub fn load_error_kind(code: i32) -> Option<&'static str> {
+    Some(match code {
+        -3 => return None,
+        -105 | -137 => "dns",
+        -106 => "offline",
+        -102 | -109 | -104 => "refused",
+        -7 | -118 => "timeout",
+        -299..=-200 => "certificate",
+        _ => "other",
+    })
+}
+
+#[cfg(test)]
+mod load_error_tests {
+    #[test]
+    fn net_errors_map_to_kinds_and_aborts_are_none() {
+        use super::load_error_kind as k;
+        assert_eq!(k(-3), None);
+        assert_eq!(k(-105), Some("dns"));
+        assert_eq!(k(-106), Some("offline"));
+        assert_eq!(k(-102), Some("refused"));
+        assert_eq!(k(-118), Some("timeout"));
+        assert_eq!(k(-202), Some("certificate"));
+        assert_eq!(k(-501), Some("other"));
+    }
+}
+
 /// Where frames are drawn. The stub writes pixels; the CEF backend will blit into the same surfaces.
 pub trait SurfaceAlloc {
     type Surface: HostSurface;
