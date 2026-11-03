@@ -50,6 +50,10 @@ pub(crate) struct Entry {
     /// While the readiness probe waits: when the last nudge (a mouse move) went out, and where
     /// the pointer is (the newest held mouse position, else the top-left corner).
     nudged: Option<std::time::Instant>,
+    /// App-paced frames (`HERDR_BROWSER_BEGIN_FRAME=app`): when the last BeginFrame was sent, and
+    /// the last ack (the app's draw tick: the phase BeginFrames lock to).
+    begin_frame: Option<std::time::Instant>,
+    vsync: Option<std::time::Instant>,
     pointer: (f32, f32),
     /// Copies of the newest page and popup paints, composed into each frame sent.
     view: Option<Surface>,
@@ -381,6 +385,54 @@ pub(crate) fn on_loading(id: &str, loading: bool) {
     }
 }
 
+/// `HERDR_BROWSER_BEGIN_FRAME=app`: Chromium draws only when asked (external BeginFrame). The
+/// host asks at a steady 60 Hz whose phase locks to the app's acks (its draw ticks), so frames
+/// follow the app's display clock instead of beating against Chromium's own timer (two 60 Hz
+/// clocks drift: two frames land in one vsync and one is coalesced, then a vsync gets none).
+/// Chromium stays pipelined: a BeginFrame does not wait for the previous frame's ack (measured: an
+/// ack-gated BeginFrame halves delivery to 30 fps), but none is sent while two are unacked.
+fn app_paced() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("HERDR_BROWSER_BEGIN_FRAME").is_ok_and(|v| v == "app"))
+}
+
+const FRAME: Duration = Duration::from_micros(16_667);
+
+/// The next BeginFrame time: a whole number of frames after the last ack (the app's phase), at
+/// least half a frame after the last BeginFrame.
+fn next_begin_frame(last: Option<std::time::Instant>, vsync: Option<std::time::Instant>) -> std::time::Instant {
+    let now = std::time::Instant::now();
+    let Some(last) = last else { return now };
+    let earliest = last + FRAME / 2;
+    let Some(anchor) = vsync.filter(|v| now.duration_since(*v) < Duration::from_secs(1)) else { return last + FRAME };
+    if anchor >= earliest {
+        return anchor;
+    }
+    let n = (earliest - anchor).as_nanos().div_ceil(FRAME.as_nanos()) as u32;
+    anchor + FRAME * n
+}
+
+fn pace_idle() {
+    let now = std::time::Instant::now();
+    let due: Vec<String> = with_host(|h| {
+        h.browsers
+            .iter_mut()
+            .filter(|(_, e)| !e.hidden && e.pool.in_flight_len() < herdr_browser_surface::FramePool::MAX_IN_FLIGHT)
+            .filter(|(_, e)| now >= next_begin_frame(e.begin_frame, e.vsync))
+            .map(|(id, e)| {
+                e.begin_frame = Some(now);
+                id.clone()
+            })
+            .collect()
+    })
+    .unwrap_or_default();
+    for id in due {
+        if let Some(host) = browser(&id).and_then(|b| b.host()) {
+            host.send_external_begin_frame();
+        }
+    }
+}
+
 /// Browsers whose readiness probe is waiting get a mouse move at the pointer's position every
 /// 100 ms until one reaches the page (harmless: a hover where the pointer already is).
 fn nudge_waiting() {
@@ -612,7 +664,13 @@ fn serve(socket: &Path, listener: UnixListener, args: &Args) -> io::Result<()> {
             break;
         }
         nudge_waiting();
-        std::thread::sleep(Duration::from_millis(4));
+        if app_paced() {
+            pace_idle();
+            // A BeginFrame is due within a frame: poll finer than 4 ms so it lands on its tick.
+            std::thread::sleep(Duration::from_millis(1));
+        } else {
+            std::thread::sleep(Duration::from_millis(4));
+        }
     }
 
     // Close every browser, let CEF finish closing, then shut down.
@@ -761,8 +819,8 @@ fn handle(m: AppToHost) {
                     return;
                 }
             };
-            with_host(|h| h.browsers.insert(id.clone(), Entry { browser: None, size, scale, pool: FramePool::new(), last: None, hidden: false, shots: Vec::new(), resized: None, _devtools: None, queued: Vec::new(), loaded: false, input_ready: false, load_gen: 0, nudged: None, pointer: (0.0, 0.0), view: None, popup: None, popup_shown: false, popup_rect: None, starting: Vec::new(), scroll: None, viewport: None }));
-            let window_info = WindowInfo { windowless_rendering_enabled: 1, shared_texture_enabled: 1, ..Default::default() };
+            with_host(|h| h.browsers.insert(id.clone(), Entry { browser: None, size, scale, pool: FramePool::new(), last: None, hidden: false, shots: Vec::new(), resized: None, _devtools: None, queued: Vec::new(), loaded: false, input_ready: false, load_gen: 0, nudged: None, begin_frame: None, vsync: None, pointer: (0.0, 0.0), view: None, popup: None, popup_shown: false, popup_rect: None, starting: Vec::new(), scroll: None, viewport: None }));
+            let window_info = WindowInfo { windowless_rendering_enabled: 1, shared_texture_enabled: 1, external_begin_frame_enabled: app_paced() as i32, ..Default::default() };
             let settings = BrowserSettings { windowless_frame_rate: 60, ..Default::default() };
             let mut client = handlers::client(&id);
             let url = CefString::from(url.as_deref().unwrap_or("about:blank"));
@@ -806,6 +864,10 @@ fn handle(m: AppToHost) {
         }
         M::FrameAck { id, seq } => {
             let next = with_host(|h| h.browsers.get_mut(&id).map(|e| (e.pool.ack(seq).map(|f| (f.seq, f.surface.clone())), e.scale))).flatten();
+            // App-paced: the ack marks the app's draw tick; BeginFrames lock to its phase.
+            if app_paced() {
+                with_host(|h| h.browsers.get_mut(&id).map(|e| e.vsync = Some(std::time::Instant::now())));
+            }
             match next {
                 Some((Some((seq, s)), scale)) => send_frame(&id, seq, s, scale),
                 Some((None, _)) => {}

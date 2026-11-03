@@ -30,6 +30,23 @@ fn paced(p: &mut Page, d: Duration, mut each: impl FnMut(&mut Page, u32)) {
     }
 }
 
+/// Window size in DIPs from `HERDR_PERF_SIZE=WxH` (default 1024x768). The test window is 2x, so
+/// 3008x1692 is a 6016x3384 px frame, a full-screen window on Ethan's display.
+fn window_size() -> (f32, f32) {
+    std::env::var("HERDR_PERF_SIZE")
+        .ok()
+        .and_then(|v| {
+            let (w, h) = v.split_once('x')?;
+            Some((w.parse().ok()?, h.parse().ok()?))
+        })
+        .unwrap_or((1024.0, 768.0))
+}
+
+fn open_page(url: &str) -> Option<Page> {
+    let (w, h) = window_size();
+    Page::open_sized(Host::Cef, url, w, h)
+}
+
 fn runs() -> usize {
     std::env::var("HERDR_PERF_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(5)
 }
@@ -60,8 +77,9 @@ fn pct(v: &mut [f64], p: f64) -> f64 {
 fn r1(server: &fixtures::Server) {
     let (mut fps, mut drawn, mut acked, mut gap95) = (vec![], vec![], vec![], vec![]);
     let (mut cpu, mut blit) = (vec![], vec![]);
+    let (mut dropped, mut drawn_gap95) = (vec![], vec![]);
     for run in 0..runs() {
-        let mut p = Page::open(Host::Cef, &server.url("scroll.html")).expect("CEF host");
+        let mut p = open_page(&server.url("scroll.html")).expect("CEF host");
         p.run_for(Duration::from_millis(500));
         p.clear_frames();
         let t0 = cpu_secs(&p);
@@ -76,6 +94,15 @@ fn r1(server: &fixtures::Server) {
         fps.push(s.fps);
         gap95.push(s.p95_gap_ms);
         drawn.push(f.iter().filter(|r| r.painted.is_some()).count() as f64 / secs);
+        // Frames the host painted that the app never received (seq gaps: coalesced pending
+        // frames) plus received frames never drawn, per second.
+        let (lo, hi) = (f.first().map_or(0, |r| r.seq), f.last().map_or(0, |r| r.seq));
+        let never_drawn = f.iter().filter(|r| r.painted.is_none()).count();
+        dropped.push(((hi - lo + 1) as usize - f.len() + never_drawn) as f64 / secs);
+        let mut painted: Vec<Instant> = f.iter().filter_map(|r| r.painted).collect();
+        painted.sort();
+        let mut gaps: Vec<f64> = painted.windows(2).map(|w| (w[1] - w[0]).as_secs_f64() * 1e3).collect();
+        drawn_gap95.push(pct(&mut gaps, 0.95));
         acked.push(f.iter().filter(|r| r.acked.is_some()).count() as f64 / secs);
         cpu.push((t1 - t0) / secs * 100.0);
         if let Some(b) = blit_p95() {
@@ -87,6 +114,8 @@ fn r1(server: &fixtures::Server) {
     report("R1-scroll-drawn-fps", "drawn", "fps", ">= 55", |m| m >= 55.0, &drawn);
     report("R1-scroll-acked-fps", "delivery", "fps", "", |_| true, &acked);
     report("R1-scroll-p95-gap", "delivery", "ms", "<= 20", |m| m <= 20.0, &gap95);
+    report("R1-scroll-drawn-p95-gap", "drawn", "ms", "<= 20", |m| m <= 20.0, &drawn_gap95);
+    report("R1-scroll-dropped", "host frames not drawn", "per s", "", |_| true, &dropped);
     report("R6-cpu-scrolling", "host+helpers", "% of a core", "", |_| true, &cpu);
     if !blit.is_empty() {
         report("A4-blit-p95", "host copy incl. GPU wait", "ms", "", |_| true, &blit);
@@ -100,7 +129,7 @@ fn r2(server: &fixtures::Server) {
         let (mut ratio, mut decoded_fps) = (vec![], vec![]);
         let mut error = None;
         for _ in 0..runs().min(3) {
-            let mut p = Page::open(Host::Cef, &server.url(&format!("video.html?src={clip}"))).expect("CEF host");
+            let mut p = open_page(&server.url(&format!("video.html?src={clip}"))).expect("CEF host");
             p.run_for(Duration::from_millis(800));
             let before = p.eval("videoStats()").unwrap();
             if !before["error"].is_null() {
@@ -135,7 +164,7 @@ fn r2(server: &fixtures::Server) {
 fn r3(server: &fixtures::Server) {
     let (mut anim, mut raf, mut raf_delivery) = (vec![], vec![], vec![]);
     for _ in 0..runs() {
-        let mut p = Page::open(Host::Cef, &server.url("animation.html")).expect("CEF host");
+        let mut p = open_page(&server.url("animation.html")).expect("CEF host");
         p.run_for(Duration::from_millis(500));
         p.clear_frames();
         let start = Instant::now();
@@ -143,7 +172,7 @@ fn r3(server: &fixtures::Server) {
         anim.push(p.frame_stats(start).fps);
         drop(p);
 
-        let mut p = Page::open(Host::Cef, &server.url("raf.html")).expect("CEF host");
+        let mut p = open_page(&server.url("raf.html")).expect("CEF host");
         p.run_for(Duration::from_millis(500));
         p.clear_frames();
         let c0 = p.eval("rafCount").unwrap().as_f64().unwrap_or(0.0);
@@ -165,7 +194,7 @@ const MARKER: &str = "data:text/html,<style>html,body{margin:0;height:100%25;bac
 fn r4() {
     let (mut click, mut key, mut click_drawn) = (vec![], vec![], vec![]);
     for _ in 0..runs() {
-        let mut p = Page::open(Host::Cef, MARKER).expect("CEF host");
+        let mut p = open_page(MARKER).expect("CEF host");
         p.hash_frames(true);
         p.click(50.0, 50.0); // focus the page
         p.run_for(Duration::from_millis(500));
@@ -203,7 +232,7 @@ fn r4() {
 fn r5(server: &fixtures::Server) {
     let (mut first, mut during, mut blanks) = (vec![], vec![], 0usize);
     for _ in 0..runs() {
-        let mut p = Page::open(Host::Cef, &server.url("scroll.html")).expect("CEF host");
+        let mut p = open_page(&server.url("scroll.html")).expect("CEF host");
         p.resize_block(Some((800.0, 600.0)));
         p.run_for(Duration::from_millis(500));
         // Backing scale from the frame the 800 DIP wide block got.
@@ -244,7 +273,7 @@ fn r5(server: &fixtures::Server) {
 fn r6(server: &fixtures::Server) {
     let (mut idle, mut rss, mut procs) = (vec![], vec![], vec![]);
     for _ in 0..runs().min(3) {
-        let mut p = Page::open(Host::Cef, &server.url("form.html")).expect("CEF host");
+        let mut p = open_page(&server.url("form.html")).expect("CEF host");
         p.run_for(Duration::from_secs(2));
         let u = p.usage_over(Duration::from_secs(5));
         idle.push(u.cpu);
@@ -258,7 +287,7 @@ fn r6(server: &fixtures::Server) {
     // ("the window's job"), so each tab here is its own Page with its own host process. That
     // overstates memory (one CEF browser process and GPU process per tab instead of shared).
     for tabs in [3usize, 5] {
-        let mut pages: Vec<Page> = (0..tabs).map(|i| Page::open(Host::Cef, &server.url(if i % 2 == 0 { "form.html" } else { "scroll.html" })).expect("CEF host")).collect();
+        let mut pages: Vec<Page> = (0..tabs).map(|i| open_page(&server.url(if i % 2 == 0 { "form.html" } else { "scroll.html" })).expect("CEF host")).collect();
         for p in &mut pages {
             p.run_for(Duration::from_millis(500));
         }
@@ -341,7 +370,8 @@ fn main() {
     // SAFETY: before any thread is started.
     unsafe { std::env::set_var("HERDR_BROWSER_STATS", "1") };
     let server = fixtures::Server::start();
-    println!("R runs: {} per number; offscreen, harness pumping at 60 Hz", runs());
+    let (w, h) = window_size();
+    println!("R runs: {} per number; offscreen, harness pumping at 60 Hz; window {w}x{h} DIPs at 2x", runs());
     if wanted("R1") { r1(&server) }
     if wanted("R2") { r2(&server) }
     if wanted("R3") { r3(&server) }
