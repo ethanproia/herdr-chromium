@@ -5792,6 +5792,62 @@ export default class Code extends View {
     });
 }
 
+// HERDR: a board's "Drop to add" highlight: enter and leave once per crossing, and on drop or exit.
+#[gpui::test]
+fn a_script_sees_an_os_file_drag_enter_and_leave(cx: &mut TestAppContext) {
+    use gpui::{ExternalPaths, FileDropEvent, point, px};
+    cx.update(|cx| crate::init(cx));
+    let runtime = ShellRuntime::new_isolated().expect("runtime");
+    cx.update(|cx| runtime.set_global(cx));
+    let source = r#"
+import { View, div } from "gpui-kit";
+export default class Board extends View {
+  init() { this.enters = []; this.leaves = 0; this.drops = 0; }
+  render(cx) {
+    return div().size_full()
+      .child(div().w(200).h(100)
+        .on_drop((e, cx) => { this.drops += 1; cx.notify(); })
+        .on_drag_enter((e, cx) => { this.enters.push(e.count); cx.notify(); })
+        .on_drag_leave((e, cx) => { this.leaves += 1; cx.notify(); }))
+      .child(`enters=${this.enters.join(",")} leaves=${this.leaves} drops=${this.drops}`);
+  }
+}
+"#;
+    let view_type = runtime.load_source("drag-board", source).expect("load");
+    let runtime_for_view = runtime.clone();
+    let object_slot = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let slot = object_slot.clone();
+    let (_root, context) = cx.add_window_view(move |window, cx| {
+        let object = runtime_for_view.instantiate(&view_type, window, cx).expect("instantiate");
+        *slot.borrow_mut() = Some(object.clone());
+        let view = cx.new(|_| ScriptView::new(runtime_for_view, object));
+        crate::root::ShellRoot::new(view.into(), window, cx)
+    });
+    let frame = |context: &mut VisualTestContext| {
+        context.update(|window, cx| window.draw(cx).clear(cx));
+        context.run_until_parked();
+        context.update(|window, cx| window.draw(cx).clear(cx));
+    };
+    frame(context);
+    let (inside, outside) = (point(px(20.), px(20.)), point(px(600.), px(400.)));
+    let paths = || ExternalPaths::new(vec![(std::path::PathBuf::from("/tmp/a.png"), false)]);
+    for event in [
+        FileDropEvent::Entered { position: inside, paths: paths() },
+        FileDropEvent::Pending { position: point(px(30.), px(30.)) },
+        FileDropEvent::Pending { position: outside },
+        FileDropEvent::Pending { position: inside },
+        FileDropEvent::Exited,
+        FileDropEvent::Entered { position: inside, paths: paths() },
+        FileDropEvent::Submit { position: inside },
+    ] {
+        context.simulate_event(event);
+        frame(context);
+    }
+    let object = object_slot.borrow().clone().unwrap();
+    let tree = context.update(|window, cx| runtime.render_to_spec(&object, None, window, cx)).expect("render");
+    assert!(tree.contains("enters=1,1,1 leaves=3 drops=1"), "{tree}");
+}
+
 #[gpui::test]
 fn an_unknown_input_event_names_the_valid_ones(cx: &mut TestAppContext) {
     cx.update(|cx| crate::init(cx));
