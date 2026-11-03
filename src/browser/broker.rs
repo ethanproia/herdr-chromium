@@ -293,6 +293,16 @@ mod tests {
         // The agent's own block needs no Control, but file upload is never allowed.
         assert_eq!(ask(&mut s, 25, "theirs", "Runtime.evaluate"), "no browser host is running");
         assert!(ask(&mut s, 26, "theirs", "DOM.setFileInputFiles").contains("not available"));
+        // The agent's own block holds only its own traffic: network needs no Cdp there.
+        assert_eq!(ask(&mut s, 27, "theirs", "Network.enable"), "no browser host is running");
+        // Only the exact "agent" profile: padded, other-case or the person's still need Control and Cdp.
+        for (i, p) in [" agent", "AGENT", "default", "agent "].iter().enumerate() {
+            let id = format!("odd{i}");
+            states.lock().unwrap().insert(id.clone(), BrowserState { profile: p.to_string(), ..Default::default() });
+            agent.lock().unwrap().grants.set(&id, Grant::Control, true);
+            let e = ask(&mut s, 30 + i as u64, &id, "Network.enable");
+            assert!(e.contains("raw CDP"), "profile {p:?}: {e}");
+        }
         drop(b);
         let _ = std::fs::remove_dir_all(&dir);
     }

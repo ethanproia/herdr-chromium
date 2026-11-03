@@ -279,6 +279,26 @@ export function replaceLinkAt(row, offset, href, replacement) {
   return left.slice(0, left.length - trail) + (trail + lead ? " " : "") + right.slice(lead);
 }
 
+// Caret after one edit turned `before` into `after` (UTF-16 indexes, same as the text box).
+// The end of the changed span: a mid-line edit stays there, an edit at the end stays at the end.
+// A deletion stays at the cut. Equal strings report the end.
+//
+// Inserting text that equals the characters already after the caret is ambiguous: "ab" becoming
+// "abb" is either a "b" typed at index 1 (caret 2) or a "b" appended (caret 3). The strings do not
+// say which. This reports the right edge of that overlap, which keeps an edit at the end of the
+// line at the end. TextareaState can set_selected_range and cannot read it back, so the caller
+// cannot substitute the real caret. A ")" that completes a link typed just before another ")"
+// is this case, and the caret lands one character too far right.
+export function caretAfterEdit(before, after) {
+  const b = String(before ?? ""), a = String(after ?? "");
+  let i = 0;
+  const n = Math.min(b.length, a.length);
+  while (i < n && b.charCodeAt(i) === a.charCodeAt(i)) i++;
+  let be = b.length, ae = a.length;
+  while (be > i && ae > i && b.charCodeAt(be - 1) === a.charCodeAt(ae - 1)) { be--; ae--; }
+  return ae < 0 ? 0 : ae > a.length ? a.length : ae;
+}
+
 // Where the markdown links sit in a line (JS string offsets = the text box's UTF-16 offsets), for inline badges.
 export function linkSpans(text) {
   const out = [];
@@ -288,4 +308,48 @@ export function linkSpans(text) {
     out.push({ start: m.index, end: m.index + m[0].length, text: m[0], label: m[1].replace(/\\(.)/g, "$1"), href: m[2].replace(/^<(.*)>$/, "$1") });
   }
   return out;
+}
+
+// ---- long-note windowing: prefix sums over row heights, binary search for the rows on screen ----
+// prefixOffsets(hs)[i] is the y of row i's top (relative to the first row); the last entry is the total height.
+export function prefixOffsets(hs) {
+  const p = new Float64Array(hs.length + 1);
+  for (let i = 0; i < hs.length; i++) p[i + 1] = p[i] + hs[i];
+  return p;
+}
+
+// Rows i in [first, last) are the ones that touch [top, bottom] (both relative to the first row's top):
+// first = the first row whose bottom edge reaches `top`; last = the first row (after first) whose top edge reaches
+// `bottom`, or n. Same answer as walking the rows from the start, in O(log n).
+export function visibleRange(prefix, top, bottom) {
+  const n = prefix.length - 1;
+  let lo = 0, hi = n;                      // first i in [0, n] with prefix[i + 1] >= top (n: none)
+  while (lo < hi) { const m = (lo + hi) >> 1; if (prefix[m + 1] >= top) hi = m; else lo = m + 1; }
+  const first = lo;
+  lo = first; hi = n;                      // first j in [first, n] with prefix[j] >= bottom (n: none)
+  while (lo < hi) { const m = (lo + hi) >> 1; if (prefix[m] >= bottom) hi = m; else lo = m + 1; }
+  return { first, last: lo };
+}
+
+// Keep a per-index height cache aligned with a row splice.
+// `inserted` are the heights of the new rows (undefined = not measured yet, so the row uses an estimate
+// until it is drawn). Heights after the splice stay with their rows; they are not left pointing at a neighbor.
+export function spliceHeights(heights, start, deleteCount, inserted = []) {
+  const next = heights.slice();
+  if (inserted.length && next.length < start) next.length = start;   // windowed mode measures only drawn rows: pad, don't append early
+  next.splice(start, deleteCount, ...inserted);
+  return next;
+}
+
+// Same gap math as moving a row: `to` is the index the row is dropped before.
+// Dropping a row into its own gap (`to === from` or `to === from + 1`) changes nothing.
+export function moveHeight(heights, from, to) {
+  if (to === from || to === from + 1) return heights.slice();
+  const next = heights.slice();
+  const [h] = from < next.length ? next.splice(from, 1) : [undefined];
+  const dest = to > from ? to - 1 : to;
+  if (next.length < dest) next.length = dest;   // sparse (windowed mode): pad so the height lands at `dest`, not the end
+  next.splice(dest, 0, h);
+  while (next.length && next[next.length - 1] === undefined) next.length--;   // trailing unmeasured rows carry nothing
+  return next;
 }
