@@ -10993,6 +10993,8 @@ mod tests {
     }
 
     // HERDR: selection hooks for script toolbars.
+    use std::cell::RefCell;
+
     fn selection_events(view: &InputView<TextareaMode>, cx: &mut TestAppContext) -> (Rc<RefCell<Vec<(usize, usize, bool, bool)>>>, gpui::Subscription) {
         let seen: Rc<RefCell<Vec<(usize, usize, bool, bool)>>> = Rc::new(RefCell::new(Vec::new()));
         let sink = seen.clone();
