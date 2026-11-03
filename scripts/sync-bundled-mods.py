@@ -119,6 +119,10 @@ def digest(files):
 def main():
     lock = json.load(open(LOCK))
     git = os.path.expanduser(os.environ.get("LABS_GIT", "~/work.noindex/herdr-board/labs-wt"))
+    missing = [m["commit"][:9] for m in lock["mods"].values() if m.get("ship", True)
+               and subprocess.run(["git", "-C", git, "cat-file", "-e", m["commit"] + "^{commit}"], capture_output=True).returncode]
+    if missing:
+        sys.exit(f"sync-bundled-mods: {git} lacks {', '.join(missing)}; set LABS_GIT to an essexlabs/labs clone and fetch")
     out = build(lock, git)
     if "--check" in sys.argv:
         bad = []

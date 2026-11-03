@@ -4402,7 +4402,7 @@ function newSticky({ x: x2, y: y3, color = STICKY_COLORS[0], text = "", width = 
     strokeStyle: "solid",
     roughness: 0,
     opacity: 100,
-    roundness: { type: 3 },
+    roundness: { type: 3, value: 8 },
     customData: { sticky: true, text }
   });
   el.height = stickyHeight(el);
@@ -4619,8 +4619,7 @@ function elementItem(el, elementsMap, scale, opts) {
     if (color && el.points.length) pieces.push(svgPiece(Wm(el), color, xf));
   } else if (el.type === "image") {
     const file = opts.imagePath?.(el.fileId);
-    if (file) images.push({ x: el.x, y: el.y, w: el.width, h: el.height, file });
-    else pieces.push(boxPiece(el, "#868e96", xf, scale));
+    if (!file) pieces.push(boxPiece(el, "#868e96", xf, scale));
     const kind = el.customData?.kind;
     if (kind === "gif" || kind === "video") texts.push({ x: el.x + 8, y: el.y + el.height - 24, w: 60, h: 18, lines: [kind === "gif" ? "\u25B6 gif" : "\u25B6 video"], fontSize: 12, lineHeight: 1.25, font: "Helvetica", color: "#ffffff", align: "left" });
   } else if (el.type === "frame" || el.type === "magicframe") {
@@ -5029,6 +5028,7 @@ var Board = class extends View {
     this.saveError = null;
     this.imageFiles = /* @__PURE__ */ new Map();
     this.preparing = false;
+    this.tries = /* @__PURE__ */ new Map();
     this.menu = null;
     this.shapeKind = "rectangle";
     this.stickyColor = STICKY_COLORS[0];
@@ -5196,6 +5196,7 @@ var Board = class extends View {
       const [x1, y1] = tt2(els);
       this.scrollX = 40 - x1;
       this.scrollY = 80 - y1;
+      this.needFit = true;
     }
     this.status = "ready";
     this.rebuild(cx);
@@ -5265,7 +5266,8 @@ var Board = class extends View {
       try {
         do {
           this.prepareAgain = false;
-          const todo = Object.entries(this.doc.files ?? {}).filter(([id]) => !this.imageFiles.has(id));
+          const todo = Object.entries(this.doc.files ?? {}).filter(([id]) => !this.imageFiles.has(id) && (this.tries.get(id) ?? 0) < 4);
+          for (const [id] of todo) this.tries.set(id, (this.tries.get(id) ?? 0) + 1);
           for (let i = 0; i < todo.length; i += 6) {
             await Promise.all(todo.slice(i, i + 6).map(([id, f2]) => this.cacheOne(id, f2)));
             this.rebuild(cx2);
@@ -5310,7 +5312,9 @@ var Board = class extends View {
       await exec("qlmanage", ["-t", "-s", String(CACHE_SIDE), "-o", tmp, src]);
       from = `${tmp}/${src.slice(src.lastIndexOf("/") + 1)}.png`;
     }
-    const r = await exec("sips", ["-Z", String(CACHE_SIDE), "-s", "format", "png", from, "--out", dest]);
+    const px = await this.pixelSize(from);
+    const resize = Math.max(px.w, px.h) > CACHE_SIDE ? ["-Z", String(CACHE_SIDE)] : [];
+    const r = await exec("sips", [...resize, "-s", "format", "png", from, "--out", dest]);
     if (from !== src) await exec("rm", ["-rf", from.slice(0, from.lastIndexOf("/"))]);
     if (r.code !== 0) throw new Error(String(r.stderr || "sips failed").trim());
   }
@@ -5327,6 +5331,13 @@ var Board = class extends View {
   tick(cx) {
     globalThis.__runDueTimers();
     if (this.status !== "ready") return;
+    if (this.needFit && !this.size) this.sizeWait = (this.sizeWait ?? 0) + 1;
+    if (this.needFit && (this.size || this.sizeWait > 15)) {
+      this.needFit = false;
+      this.fitView(cx, 1);
+      return;
+    }
+    if (!this.preparing && Object.keys(this.doc.files ?? {}).some((id) => !this.imageFiles.has(id) && (this.tries.get(id) ?? 0) < 4)) this.prepareImages(cx);
     if (this.herdrZoom() !== this.builtZ) this.rebuild(cx);
     if (this.dirty && !this.saving && Date.now() >= this.saveAt && !this.pointer && !this.editing) {
       cx.spawn(async (cx2) => this.save(cx2));
@@ -5406,7 +5417,8 @@ var Board = class extends View {
     }
     const h2 = this.handleCorners();
     if (h2) {
-      for (const c2 of Object.values(h2.corners)) {
+      for (const k2 of Object.values(h2.corners)) {
+        const c2 = { x: k2.x - this.scrollX * s, y: k2.y - this.scrollY * s };
         draw.push({ kind: "path", color: theme().background ?? "#ffffff", path: rectPath(c2.x - HANDLE, c2.y - HANDLE, c2.x + HANDLE, c2.y + HANDLE, 0) });
         draw.push({ kind: "path", color: sel(), path: rectPath(c2.x - HANDLE, c2.y - HANDLE, c2.x + HANDLE, c2.y + HANDLE, 1.5) });
       }
@@ -5425,6 +5437,16 @@ var Board = class extends View {
       }
     }
     return div2().absolute().top(0).left(0).size_full().children(this.drawList(draw, this.vz));
+  }
+  /**
+   * Pictures are drawn here, directly in the board's own render. Herdr only loads image files for
+   * images that are part of a mod's own description, not for ones inside the retained layer views
+   * the strokes and shapes use (seen in a headless run: the same file drew here and not there), so
+   * pictures sit under the layers, in board order. Strokes and stickies always draw above them.
+   */
+  imageDivs() {
+    const vz = this.vz;
+    return this.elements().filter((e4) => e4.type === "image" && this.imageFiles.has(e4.fileId)).map((e4) => image(this.imageFiles.get(e4.fileId)).absolute().left(e4.x * vz).top(e4.y * vz).w(e4.width * vz).h(e4.height * vz));
   }
   /** Static layers whose bounds meet the view. */
   visibleLayerViews() {
@@ -5452,7 +5474,7 @@ var Board = class extends View {
     const ui2 = uiColors();
     const bg = t.background ?? "#1e1e1e";
     const cursor = (el) => this.tool === "hand" || this.spaceDown ? el.cursor_grab() : this.tool === "text" ? el.cursor_text() : this.tool === "selection" ? el.cursor_default() : el.cursor_crosshair();
-    const canvas = cursor(div2().id("canvas").absolute().top(0).left(0).size_full().bg(bg).overflow_hidden()).on_mouse_down("left", (e4, cx) => this.onDown(e4, cx)).on_mouse_down("middle", (e4, cx) => this.onPanStart(e4, cx)).on_mouse_down("right", (e4, cx) => this.onContext(e4, cx)).on_drop((e4, cx) => this.importPaths(e4.paths, cx)).on_mouse_move((e4, cx) => this.onMove(e4, cx)).on_mouse_up("left", (e4, cx) => this.onUp(cx)).on_mouse_up("middle", (e4, cx) => this.onUp(cx)).on_scroll_wheel((e4, cx) => this.onWheel(e4, cx)).child(div2().absolute().left(this.scrollX * this.vz).top(this.scrollY * this.vz).size_full().children([...this.visibleLayerViews(), this.liveView, ...this.textEditor()])).child(this.emptyHint(ui2));
+    const canvas = cursor(div2().id("canvas").absolute().top(0).left(0).size_full().bg(bg).overflow_hidden()).on_mouse_down("left", (e4, cx) => this.onDown(e4, cx)).on_mouse_down("middle", (e4, cx) => this.onPanStart(e4, cx)).on_mouse_down("right", (e4, cx) => this.onContext(e4, cx)).on_drop((e4, cx) => this.importPaths(e4.paths, cx)).on_mouse_move((e4, cx) => this.onMove(e4, cx)).on_mouse_up("left", (e4, cx) => this.onUp(cx)).on_mouse_up("middle", (e4, cx) => this.onUp(cx)).on_scroll_wheel((e4, cx) => this.onWheel(e4, cx)).child(div2().absolute().left(this.scrollX * this.vz).top(this.scrollY * this.vz).size_full().children([...this.imageDivs(), ...this.visibleLayerViews(), this.liveView, ...this.textEditor()])).child(this.emptyHint(ui2));
     return root.track_focus(this.focus).on_key_down((e4, cx) => this.onKey(e4, cx)).on_key_up((e4, cx) => {
       if (e4.key === "space") {
         this.spaceDown = false;
@@ -5881,6 +5903,7 @@ var Board = class extends View {
       next = { x: ptr.corner.includes("w") ? b.x + b.width - nb.width : b.x, y: ptr.corner.includes("n") ? b.y + b.height - height : b.y, width: nb.width, height };
     }
     this.scene.mutateElement(el, next, { informMutation: false, isDragging: true });
+    if (el.type === "image") cx.notify();
     cx.notify(this.liveView);
   }
   onContext(e4, cx) {
@@ -6170,6 +6193,7 @@ var Board = class extends View {
     for (const el of moving) this.scene.mutateElement(el, { x: el.x + dx, y: el.y + dy }, { informMutation: false, isDragging: true });
     for (const el of moving) if (el.boundElements?.some((b) => b.type === "arrow")) Xe2(el, this.scene, { simultaneouslyUpdated: moving });
     ptr.last = p2;
+    if (moving.some((el) => el.type === "image")) cx.notify();
     cx.notify(this.liveView);
   }
   resizeNew(p2, square, cx) {
@@ -6384,13 +6408,13 @@ var Board = class extends View {
     }
     cx.notify();
   }
-  fitView(cx) {
+  fitView(cx, maxZoom = MAX_ZOOM) {
     const els = this.elements();
     if (!els.length) return this.setZoom(1, null, cx);
     const [x1, y1, x2, y22] = tt2(els);
     const w3 = (this.size?.width ?? 800) / this.herdrZoom();
     const h2 = (this.size?.height ?? 600) / this.herdrZoom();
-    this.vz = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, Math.min((w3 - 80) / Math.max(x2 - x1, 1), (h2 - 120) / Math.max(y22 - y1, 1))));
+    this.vz = Math.min(maxZoom, Math.max(MIN_ZOOM, Math.min((w3 - 80) / Math.max(x2 - x1, 1), (h2 - 120) / Math.max(y22 - y1, 1))));
     this.scrollX = (w3 / this.vz - (x2 - x1)) / 2 - x1;
     this.scrollY = (h2 / this.vz - (y22 - y1)) / 2 - y1;
     this.rebuild(cx);

@@ -3,7 +3,7 @@
   "mods": {
     "board": {
       "branch": "ethan/herdr-board-mod",
-      "commit": "7cdbd7b14a4a2e7b7ae1de34856d9b32ef0521c4",
+      "commit": "1bae883e8629b09f0a38e5b35746b75f6b70e40d",
       "path": "projects/herdr-mods/board/mods/board",
       "version": "0.1.0",
       "pr": "essexlabs/labs#1280",
@@ -19,13 +19,13 @@
     },
     "notepad": {
       "branch": "ethan/herdr-mods-notepad",
-      "commit": "2ae45e0063346b56f98e47211a9d3d7cc24da981",
+      "commit": "9bfdce0a9fbb95e66e70f289f1fed51bb9862171",
       "path": "projects/herdr-mods/notepad",
       "version": "0.1.0"
     },
     "remote-desktop": {
       "branch": "ethan/herdr-mods-notepad",
-      "commit": "2ae45e0063346b56f98e47211a9d3d7cc24da981",
+      "commit": "9bfdce0a9fbb95e66e70f289f1fed51bb9862171",
       "path": "projects/herdr-mods/remote-desktop/mod",
       "version": "0.1.0",
       "ship": false,
@@ -33,7 +33,7 @@
     },
     "split-chooser": {
       "branch": "ethan/herdr-mods-notepad",
-      "commit": "2ae45e0063346b56f98e47211a9d3d7cc24da981",
+      "commit": "9bfdce0a9fbb95e66e70f289f1fed51bb9862171",
       "path": "projects/herdr-mods/split-chooser",
       "version": "0.1.0"
     }
