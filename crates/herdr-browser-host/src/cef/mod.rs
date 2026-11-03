@@ -415,6 +415,10 @@ pub(crate) fn on_loading(id: &str, loading: bool) {
             e.load_gen += 1;
             e.loaded = false;
             e.input_ready = false;
+            let dropped = drop_stale_input(&mut e.queued);
+            if dropped > 0 {
+                debug(format_args!("{id}: new load {}, dropped {dropped} input events held for the previous document", e.load_gen));
+            }
             return None;
         }
         e.loaded = true;
@@ -433,6 +437,15 @@ pub(crate) fn on_loading(id: &str, loading: bool) {
         handlers::eval_unsent(id);
         input_live(id, generation);
     }
+}
+
+/// Input held before a new load started was meant for the document being left: never replay it
+/// into the next one (keys typed on page A must not land on page B). Input that arrives after
+/// the load starts is held for the new page as before. Returns how many events were dropped.
+fn drop_stale_input(queued: &mut Vec<InputEvent>) -> usize {
+    let n = queued.len();
+    queued.clear();
+    n
 }
 
 /// Browsers whose readiness probe is waiting get a mouse move at the pointer's position every
@@ -745,7 +758,8 @@ fn apply_scheme(ctx: &RequestContext, dark: Option<bool>) {
 /// The request context for a block's `profile`: None (CEF's global context) for the default
 /// profile, else one context per name with its own cookies and storage under `<root>/<name>`.
 fn context_for(profile: Option<&str>) -> Result<Option<RequestContext>, String> {
-    let name = match profile.map(str::trim) {
+    // Exact names only: " default " is not an alias of the person's profile (it fails the name check).
+    let name = match profile {
         None | Some("") | Some("default") => return Ok(None),
         Some(n) => n.to_string(),
     };
@@ -1061,9 +1075,13 @@ fn browser_msg(m: AppToHost) {
             }
         }
         M::Find { text, forward, match_case, find_next, .. } => {
+            handlers::find_started(&id);
             host.find(Some(&CefString::from(text.as_str())), forward as i32, match_case as i32, find_next as i32)
         }
-        M::StopFind { clear_selection, .. } => host.stop_finding(clear_selection as i32),
+        M::StopFind { clear_selection, .. } => {
+            handlers::find_stopped(&id);
+            host.stop_finding(clear_selection as i32)
+        }
         M::DevTools { .. } => send(HostToApp::Error {
             id: Some(id),
             message: "unsupported: the DevTools window is not available in the headless browser host; inspect will come from a built-in panel driven through the app's CDP broker".into(),
@@ -1245,6 +1263,15 @@ fn write_png(s: &Surface, path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::popup_place;
+
+    #[test]
+    fn a_new_load_drops_input_held_for_the_old_document() {
+        let key = herdr_browser_protocol::InputEvent::Text { text: "secret".into() };
+        let mut held = vec![key.clone(), key];
+        assert_eq!(super::drop_stale_input(&mut held), 2);
+        assert!(held.is_empty());
+        assert_eq!(super::drop_stale_input(&mut held), 0);
+    }
 
     #[test]
     fn popups_land_at_their_bounds_clipped_to_the_frame() {
