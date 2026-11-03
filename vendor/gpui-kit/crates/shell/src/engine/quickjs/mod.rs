@@ -3863,6 +3863,13 @@ impl ShellRuntime {
                     payload.set("secondary", *secondary)?;
                     payload.set("shift", *shift)?;
                 }
+                // HERDR: UTF-16 offsets, the unit of InputRange.
+                InputEvent::SelectionChange { start, end, reversed, composing } => {
+                    payload.set("start", *start as f64)?;
+                    payload.set("end", *end as f64)?;
+                    payload.set("reversed", *reversed)?;
+                    payload.set("composing", *composing)?;
+                }
                 InputEvent::Change | InputEvent::Focus | InputEvent::Blur | InputEvent::PasteWithoutText => {}
             }
             handler.call::<_, ()>((
@@ -6127,7 +6134,9 @@ globalThis.__gpui = (() => {
   // to read it back off `this`.
   const tokenStateMethods = (handle, invoke) => Object.fromEntries([
     "content", "tokens", "replace_with_token", "replace_range_with_token",
-    "set_selected_range", "replace"
+    "set_selected_range", "replace",
+    // HERDR: selection hooks for script toolbars.
+    "selected_range", "selection_bounds", "caret_bounds"
   ].map(name => [name, (...args) => invoke(handle, name, args)]));
   // A value is plain text or a content snapshot with tokens.
   const setValue = (handle, setText, invoke) => (next) =>

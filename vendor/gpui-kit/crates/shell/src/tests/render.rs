@@ -5792,6 +5792,53 @@ export default class Code extends View {
     });
 }
 
+// HERDR: the selection hooks a notepad toolbar uses, read from a script.
+#[gpui::test]
+fn a_script_sees_textarea_selection_changes_and_bounds(cx: &mut TestAppContext) {
+    cx.update(|cx| crate::init(cx));
+    let runtime = ShellRuntime::new_isolated().expect("runtime");
+    cx.update(|cx| runtime.set_global(cx));
+    let source = r#"
+import { View, div } from "gpui-kit";
+import { Textarea, TextareaState } from "gpui-base";
+export default class Note extends View {
+  init() {
+    this.body = TextareaState.new({ value: "é😀 bold me\nnext line", rows: 4 });
+    this.events = [];
+    this.body.on("selection", (e, cx) => { this.events.push(`${e.start}-${e.end}:${e.composing}`); cx.notify(); });
+  }
+  render(cx) {
+    const r = this.body.selected_range();
+    const b = this.body.selection_bounds();
+    const c = this.body.caret_bounds();
+    return div().child(Textarea.new(this.body).h(120))
+      .child(`events=${this.events.join(",")} range=${r.start}-${r.end} bounds=${b ? Math.round(b.height) + "@" + (b.x >= 0 && b.y >= 0) : "null"} caret=${c ? "yes" : "null"}`);
+  }
+}
+"#;
+    let view_type = runtime.load_source("selection-note", source).expect("load");
+    let window = cx.add_window(|_, _| Empty);
+    let mut context = VisualTestContext::from_window(*window.deref(), cx);
+    let object = context.update(|window, cx| runtime.instantiate(&view_type, window, cx)).expect("instantiate");
+    let view = context.update(|_, cx| cx.new(|_| ScriptView::new(runtime.clone(), object.clone())));
+    draw(&mut context, &view);
+    let area = runtime.entities().first_textarea().expect("textarea");
+    // Select "bold" (bytes 7..11 after "é😀 "; UTF-16 4..8) as a drag or set_selected_range would.
+    context.update(|_, cx| area.update(cx, |state, cx| state.set_selected_range(7..11, cx)));
+    draw(&mut context, &view);
+    draw(&mut context, &view);
+    let tree = context.update(|window, cx| runtime.render_to_spec(&object, None, window, cx)).expect("render");
+    assert!(tree.contains("events=4-8:false range=4-8"), "{tree}");
+    assert!(tree.contains("@true caret=yes"), "{tree}");
+    assert!(!tree.contains("bounds=null"), "{tree}");
+    // Back to a caret: one more event, no selection bounds.
+    context.update(|_, cx| area.update(cx, |state, cx| state.set_selected_range(0..0, cx)));
+    draw(&mut context, &view);
+    draw(&mut context, &view);
+    let tree = context.update(|window, cx| runtime.render_to_spec(&object, None, window, cx)).expect("render");
+    assert!(tree.contains("events=4-8:false,0-0:false range=0-0 bounds=null caret=yes"), "{tree}");
+}
+
 #[gpui::test]
 fn an_unknown_input_event_names_the_valid_ones(cx: &mut TestAppContext) {
     cx.update(|cx| crate::init(cx));
