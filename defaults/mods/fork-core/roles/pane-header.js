@@ -8,7 +8,7 @@ import { h_flex } from "gpui-base";
 import { panes, agents, props, run, theme, home, shared, openOverlay } from "herdr";
 import { SELF } from "../self.js";
 import { fadeLabel, over } from "../scroll.js";
-import { icon, runCopy, runHeaderAction, openRegistry, watchRegistry, REGISTRY_WAKE } from "../look.js";
+import { icon, runPaneCopy, runHeaderAction, openRegistry, watchRegistry, REGISTRY_WAKE } from "../look.js";
 import { normalizeTool, FALLBACKS } from "../registry.js";
 import { copyPlan, copySpecFor, headerDirPath, headerMenuEntries, menuHeight, toolHeaderElId } from "../pure.js";
 
@@ -65,7 +65,8 @@ export default class PaneHeader {
 
   // The Copy button: the copy never passes the text through argv, and "Copied" shows only when it succeeded.
   copy(src, cx) {
-    runCopy(src[0], src[1]).then((ok) => {
+    if (!src) return;
+    runPaneCopy(src[0], src[1], this.me()?.mod, cx).then((ok) => {
       this.copied = ok;
       cx.notify();
       if (ok) cx.timer.after(1200, (cx) => { this.copied = false; cx.notify(); });

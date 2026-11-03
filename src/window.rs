@@ -3689,9 +3689,11 @@ impl AppWindow {
             Request::CloseOverlay { id } => self.close_overlay(&id, window, cx),
             Request::Refresh => self.refresh_mods(cx),
             // HERDR: browser block. `browser.*` may answer later (eval, screenshot): the reply goes with it.
-            // browser.new is the person's command, not the agent's: it answers the new pane's id.
+            // browser.new over the control socket is anyone's (agents included): it opens an agent-profile
+            // browser, never the person's logins; the person's own path is the menu and keys (`run`).
             Request::Control { cmd, reply } if cmd.get("do").and_then(Value::as_str) == Some("browser.new") => {
-                let r = self.open_person_browser(cmd.get("args").unwrap_or(&json!({})));
+                let a = cmd.get("args").cloned().unwrap_or(json!({}));
+                let r = self.open_new_browser(&a, new_browser(Self::arg(&a, "url"), Via::Control));
                 let _ = reply.send(r.unwrap_or_else(|error| json!({ "error": error })));
                 self.flush_documents(false, window, cx);
                 self.sync(window, cx);
@@ -4267,7 +4269,9 @@ impl AppWindow {
     // HERDR: browser block. A page asked for a new window: a browser beside it (a split in its
     // tab, when both minimums fit); a layout block's page (or no room) opens a new tab.
     fn browser_new_window(&mut self, from: &str, url: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let block = crate::layout::BrowserBlock { url: url.to_owned(), profile: "default".into(), ..Default::default() };
+        // The page's new window keeps its opener's profile: an agent page can't open one on the person's logins.
+        let profile = self.browsers.profile_of(from).unwrap_or_else(|| crate::browser::agent::AGENT_PROFILE.into());
+        let block = crate::layout::BrowserBlock { url: url.to_owned(), profile, ..Default::default() };
         // Beside the page when there is room for both minimums, else a new tab.
         let room = self.model.tab_of(from).is_some().then(|| self.split_room(from, Axis::Row, &Node::block("", Content::Browser { browser: block.clone() })).ok()).flatten();
         let r = if let Some(share) = room {
@@ -4326,13 +4330,17 @@ impl AppWindow {
     // HERDR: browser block. The person's browser (browser.new): their profile, raw chords off; a new
     // tab, or right/down of `pane` (else the focused pane).
     fn open_person_browser(&mut self, a: &Value) -> Result<Value, String> {
+        self.open_new_browser(a, new_browser(Self::arg(a, "url"), Via::Person))
+    }
+
+    fn open_new_browser(&mut self, a: &Value, block: crate::layout::BrowserBlock) -> Result<Value, String> {
         if let Some(pane) = Self::arg(a, "pane") {
             if self.model.tab_of(pane).is_none() {
                 return Err(format!("no pane {pane:?}"));
             }
             self.model.focus_pane(pane);
         }
-        self.open_browser(person_browser(Self::arg(a, "url")), Self::arg(a, "place"))
+        self.open_browser(block, Self::arg(a, "place"))
     }
 
     // HERDR: browser block. A browser pane: a new tab (default) or beside the focused pane.
@@ -5291,9 +5299,17 @@ fn changed_asset_paths(home: &std::path::Path, changed: &[std::path::PathBuf]) -
 mod tests {
     #[test]
     fn the_persons_browser_uses_their_profile_with_raw_chords_off() {
-        let b = super::person_browser(Some("https://example.test/"));
+        let b = super::new_browser(Some("https://example.test/"), super::Via::Person);
         assert_eq!((b.url.as_str(), b.profile.as_str(), b.raw_chords, b.launch_url.is_none()), ("https://example.test/", "default", false, true));
-        assert_eq!(super::person_browser(None).url, "");
+        assert_eq!(super::new_browser(None, super::Via::Person).url, "");
+    }
+
+    #[test]
+    fn the_control_socket_never_opens_the_persons_profile() {
+        // `herdr-app do browser.new` is reachable by any agent: it gets an agent-profile block.
+        let b = super::new_browser(Some("https://bank.test/"), super::Via::Control);
+        assert_eq!(b.profile, "agent");
+        assert_ne!(b.profile, crate::browser::agent::PERSON_PROFILE);
     }
 
     #[test]
@@ -5716,8 +5732,20 @@ mod tests {
 }
 
 // HERDR: browser block. The person's own browser: their cookies and logins, keys as in any app.
-fn person_browser(url: Option<&str>) -> crate::layout::BrowserBlock {
-    crate::layout::BrowserBlock { url: url.unwrap_or_default().to_owned(), profile: "default".into(), ..Default::default() }
+/// Who asked for a new browser: the person (menu, keys, pane menu) or the control socket (anyone).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Via {
+    Person,
+    Control,
+}
+
+/// A new browser block: the person's own profile only on the person's path.
+fn new_browser(url: Option<&str>, via: Via) -> crate::layout::BrowserBlock {
+    let profile = match via {
+        Via::Person => crate::browser::agent::PERSON_PROFILE,
+        Via::Control => crate::browser::agent::AGENT_PROFILE,
+    };
+    crate::layout::BrowserBlock { url: url.unwrap_or_default().to_owned(), profile: profile.into(), ..Default::default() }
 }
 
 /// The new pane's share of `room` when splitting beside a pane: half, moved so each side keeps
