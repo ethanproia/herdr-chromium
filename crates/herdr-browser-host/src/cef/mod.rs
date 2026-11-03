@@ -250,6 +250,7 @@ fn paint(id: &str, layer: Option<(bool, *mut std::ffi::c_void, u32, u32)>) {
             if entry.hidden && entry.shots.is_empty() {
                 return Ok(Out(None));
             }
+            let mut direct = None;
             if let Some((popup, src, w, h)) = layer {
                 let px = PixelSize { w, h };
                 let slot = if popup { &mut entry.popup } else { &mut entry.view };
@@ -257,12 +258,26 @@ fn paint(id: &str, layer: Option<(bool, *mut std::ffi::c_void, u32, u32)>) {
                     *slot = Some(herdr_browser_surface::create_pixels(px).map_err(|e| format!("surface: {e}"))?);
                 }
                 let copy = slot.as_ref().expect("just made");
-                blitter.copy(src, copy.as_ptr(), w as usize, h as usize)?;
+                if popup || entry.popup_shown {
+                    blitter.copy(src, copy.as_ptr(), w as usize, h as usize)?;
+                } else {
+                    // The common case, a page frame with no popup open: copy CEF's surface into the
+                    // kept view and the outgoing frame in one GPU pass with one wait.
+                    let dst = entry.pool.acquire(px).map_err(|e| format!("surface: {e}"))?;
+                    blitter.copy_to_all(src, &[copy.as_ptr(), dst.as_ptr()], w as usize, h as usize)?;
+                    direct = Some(dst);
+                }
             }
             let Some(view) = entry.view.as_ref() else { return Ok(Out(None)) };
             let vs = view.size();
-            let dst = entry.pool.acquire(vs).map_err(|e| format!("surface: {e}"))?;
-            blitter.copy(view.as_ptr(), dst.as_ptr(), vs.w as usize, vs.h as usize)?;
+            let dst = match direct {
+                Some(dst) => dst,
+                None => {
+                    let dst = entry.pool.acquire(vs).map_err(|e| format!("surface: {e}"))?;
+                    blitter.copy(view.as_ptr(), dst.as_ptr(), vs.w as usize, vs.h as usize)?;
+                    dst
+                }
+            };
             if let (true, Some(popup), Some(rect)) = (entry.popup_shown, entry.popup.as_ref(), entry.popup_rect) {
                 let ps = popup.size();
                 let place = popup_place(rect, entry.scale, (ps.w, ps.h), (vs.w, vs.h));
