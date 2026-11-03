@@ -30,7 +30,8 @@ use super::dialogs::{DialogsEvent, Downloads, PageDialogs};
 use super::markup::{self, Markup, Tool};
 use super::zoom;
 use super::styles::StylePanelView;
-use super::{annotate, design_bar, region};
+use super::{annotate, design_bar, region, send_to};
+use super::handoff::Recipient;
 
 /// `url` without its `token` query parameter (what a document may keep of a launch url).
 pub fn without_token(url: &str) -> String {
@@ -578,6 +579,8 @@ pub enum BrowserEvent {
     Annotations(AnnotationBatch),
     /// Show a toast (a download finished or failed): `{"title","body","level"}`.
     Notice(serde_json::Value),
+    /// S27: the Send badge was clicked; the window answers with `show_recipients`.
+    PickRecipient,
 }
 
 /// One browser block on screen.
@@ -606,6 +609,12 @@ pub struct BrowserView {
     address_stale: bool,
     states: Arc<Mutex<HashMap<BrowserId, BrowserState>>>,
     _events: Task<()>,
+    /// S27: the recipient popover and the last addressed send.
+    send_to: send_to::SendTo,
+    /// The agent the Send in flight goes to (taken by finish_attach).
+    send_target: Option<Recipient>,
+    /// Re-checks the Send chip once a second while the batch is unread.
+    chip_poll: Option<Task<()>>,
     _focus: [Subscription; 2],
     _address: Subscription,
     _visibility: Subscription,
@@ -859,6 +868,9 @@ impl BrowserView {
             address_stale: true,
             states,
             _events: events,
+            send_to: send_to::SendTo::default(),
+            send_target: None,
+            chip_poll: None,
             _focus: [on, off],
             _address: typed,
             _visibility: visibility,
@@ -1694,8 +1706,33 @@ impl BrowserView {
                 batch.scale = scale;
             }
         }
+        if let Some(to) = self.send_target.take() {
+            let r = send_to::deliver(&self.link.config().dir, &batch, &to, now_ms()).map(|_| (to, batch.id));
+            self.send_to.delivered(r, now_ms());
+            self.poll_chip(cx);
+        }
         cx.emit(BrowserEvent::Annotations(batch));
         cx.notify();
+    }
+
+    /// S27: the window's answer to PickRecipient, the running agents.
+    pub fn show_recipients(&mut self, list: Vec<send_to::Candidate>, cx: &mut Context<Self>) {
+        self.send_to.show(list);
+        cx.notify();
+    }
+
+    /// While the sent batch is unread, redraw once a second so the chip moves to Read / Not read yet.
+    fn poll_chip(&mut self, cx: &mut Context<Self>) {
+        self.chip_poll = Some(cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(Duration::from_secs(1)).await;
+            let more = this.update(cx, |v, cx| {
+                cx.notify();
+                v.send_to.waiting(&send_to_root(&v.link.config().dir))
+            });
+            if !matches!(more, Ok(true)) {
+                break;
+            }
+        }));
     }
 
     fn annotation_layer(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -1846,8 +1883,32 @@ impl BrowserView {
                     .into_any_element(),
             );
         }
-        let state = design_bar::StripState { owner, tool: self.markup.read(cx).tool, styles_on: self.styles_on_pick, comment_on: self.comment_on_pick, count: self.annotations.count() };
-        design_bar::strip(&state, FIND_HEIGHT, cx, |v, a, _, cx| v.design_action(a, cx))
+        let count = self.annotations.count();
+        let state = design_bar::StripState { owner, tool: self.markup.read(cx).tool, styles_on: self.styles_on_pick, comment_on: self.comment_on_pick, count };
+        let strip = design_bar::strip(&state, FIND_HEIGHT, cx, |v, a, _, cx| v.design_action(a, cx))?;
+        // S27: the Send chip beside the badge, and the recipient list under it.
+        let chip = self.send_to.chip(&send_to_root(&self.link.config().dir), now_ms()).map(|c| c.text());
+        let popover = send_to::popover(&self.send_to, count, cx, |v, choice, _, cx| {
+            match choice {
+                Some(t) => {
+                    if let Some(to) = v.send_to.choose(&t) {
+                        v.send_target = Some(to);
+                        v.send_annotations(cx);
+                    }
+                }
+                None => v.send_to.open = None,
+            }
+            cx.notify();
+        });
+        Some(
+            div()
+                .relative()
+                .flex_none()
+                .child(strip)
+                .when_some(chip, |d, c| d.child(div().absolute().top_0().right(px(8.)).h(px(FIND_HEIGHT)).flex().items_center().text_xs().text_color(rgb(0xd4d4d4)).child(c)))
+                .when_some(popover, |d, p| d.child(div().absolute().top(px(FIND_HEIGHT)).right(px(8.)).child(p)))
+                .into_any_element(),
+        )
     }
 
     /// A1: what a strip control asks.
@@ -1870,7 +1931,7 @@ impl BrowserView {
                 let on = !self.comment_on_pick;
                 self.set_comment_on_pick(on, cx);
             }
-            A::Send => self.send_annotations(cx),
+            A::Send => cx.emit(BrowserEvent::PickRecipient),
             A::Done => {
                 self.input.update(cx, |i, _| while i.owner() != Owner::Browse && i.escape() {});
                 self.drain_overlay(cx);
@@ -2612,6 +2673,11 @@ pub fn load_error_words(kind: &str, url: &str) -> (String, String) {
         "certificate" => ("This connection isn't private".into(), "The site's certificate isn't valid, so it wasn't opened.".into()),
         _ => ("This page couldn't load".into(), "Reload to try again.".into()),
     }
+}
+
+/// The S27 inbox under the browser dir.
+fn send_to_root(dir: &Path) -> PathBuf {
+    super::inbox::root(dir)
 }
 
 /// At most `n` characters, with an ellipsis when cut.
