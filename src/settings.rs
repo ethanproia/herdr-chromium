@@ -410,6 +410,10 @@ pub struct Person {
     /// keys), though their files stay installed. Removing a name turns it back on.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub mods_disabled: Vec<String>,
+    /// HERDR: macOS: the window blurs what's behind it, seen through the layout's own
+    /// backgrounds (sidebar, canvas); panes stay opaque. Off unless set to true.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub glass: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -496,6 +500,7 @@ impl Default for Person {
             search_engine: SearchEngine::Google,
             labs_checkout: None,
             mods_disabled: Vec::new(),
+            glass: false,
         }
     }
 }
@@ -529,6 +534,8 @@ pub struct Settings {
     pub option_as_alt: OptionAsAlt,
     pub search_engine: SearchEngine,
     pub sounds: Sounds,
+    /// HERDR: see `Person::glass`.
+    pub glass: bool,
 }
 
 /// Attention sounds: when an agent needs you, and when one finished while you
@@ -570,6 +577,7 @@ impl Default for Settings {
             option_as_alt: OptionAsAlt::Auto,
             search_engine: SearchEngine::Google,
             sounds: Sounds::default(),
+            glass: false,
         }
     }
 }
@@ -607,6 +615,7 @@ impl Settings {
             minimum_contrast: person.minimum_contrast,
             option_as_alt: person.option_as_alt,
             search_engine: person.search_engine,
+            glass: person.glass,
         }
     }
 }
@@ -871,6 +880,15 @@ pub const DEFAULT_FONT: &str = "JetBrains Mono";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn glass_is_off_unless_set_and_not_written_when_off() {
+        let off: Person = serde_json::from_str("{}").unwrap();
+        assert!(!off.glass && !Settings::compose(&off, &crate::layout::Look::default(), true).glass);
+        assert!(!serde_json::to_string(&off).unwrap().contains("glass"));
+        let on: Person = serde_json::from_str(r#"{"glass": true}"#).unwrap();
+        assert!(Settings::compose(&on, &crate::layout::Look::default(), true).glass);
+    }
 
     #[test]
     fn layout_look_wins_and_settings_fill_what_it_leaves_unset() {

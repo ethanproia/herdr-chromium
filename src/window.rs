@@ -69,6 +69,9 @@ fn separator_line(row: bool, width: f32, color: Hsla, top: f32) -> Div {
         .when(!row, |d| d.h(px(width)).w_full())
 }
 
+/// HERDR: how much of a layout color stays with `glass` on (the rest is the blur).
+const GLASS_ALPHA: f32 = 0.6;
+
 fn c(name: &str) -> Hsla {
     settings::color_or_literal(name)
 }
@@ -426,6 +429,8 @@ pub struct AppWindow {
     /// Where a press on a `window_drag` node started, until it moves the window.
     drag_from: Option<Point<Pixels>>,
     titlebar_applied: Option<(crate::layout::Titlebar, Option<[f32; 2]>)>,
+    /// HERDR: the glass setting the window background was last set for.
+    glass_applied: Option<bool>,
     focused_pane: Option<String>,
     synced_model_pane: Option<String>,
     window_active: bool,
@@ -511,6 +516,7 @@ impl AppWindow {
             pointer: Point::default(),
             drag_from: None,
             titlebar_applied: None,
+            glass_applied: None,
             focused_pane: None,
             synced_model_pane: None,
             window_active: true,
@@ -4718,7 +4724,11 @@ fn apply_look(el: Div, n: &Node, focused: bool) -> Div {
     if let Some(bg) = focus.and_then(|f| f.background.as_ref()) {
         el = el.bg(c(bg));
     } else if let Some(bg) = &n.background {
-        el = paint(el, bg);
+        el = match bg {
+            // HERDR: glass: the layout's own colors let the blur through; panes keep theirs.
+            Paint::Color(name) if settings::get().glass => el.bg(c(name).opacity(GLASS_ALPHA)),
+            _ => paint(el, bg),
+        };
     }
     if let Some(line) = focus.and_then(|f| f.border.as_ref()).or(n.border.as_ref()) {
         el = el.border(settings::z(line.width)).border_color(c(&line.color));
