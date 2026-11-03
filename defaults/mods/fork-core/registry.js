@@ -5,6 +5,9 @@
 
 export const RUN_ALLOW = ["pane.zoom", "pane.close", "pane.split", "tab.new", "browser.new", "layout.show", "layout.hide", "layout.select"];
 export const PLACES = ["tab", "split", "pane", "side"];
+// Plus.on_key_down binds these before a tool shortcut: ⌘N is New space, ⌘1–⌘9 are agents.
+// Matched the same way as that handler (one character, lower-cased).
+const MENU_SHORTCUTS = new Set(["n", "1", "2", "3", "4", "5", "6", "7", "8", "9"]);
 const ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const MOD_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
@@ -85,12 +88,20 @@ export function normalizeTool(raw, folder, opts = {}) {
   let header = [];
   if (raw.header != null) {
     if (!Array.isArray(raw.header)) bad("header must be a list");
+    const seen = new Set();
     header = raw.header.map((h) => {
       if (!isObj(h) || typeof h.id !== "string" || !h.id) bad("header button needs an id");
+      // Element ids are `ph-tool-<id>-<pane>` and `hm-act-<id>`. Two buttons with the same id
+      // share those ids, so gpui hover and click state mix between them.
+      if (seen.has(h.id)) bad("duplicate header id");
+      seen.add(h.id);
       return { id: h.id, icon: resolveIcon(h.icon, base), label: typeof h.label === "string" ? h.label : h.id, action: action(h.action, folder) };
     });
   }
-  if (raw.shortcut != null && !(typeof raw.shortcut === "string" && raw.shortcut.length === 1)) bad("shortcut must be one character");
+  // openPopup is drawn on the tool's own mod. A terminal or command has no mod to open, so the popup
+  // would be given none. Reject the descriptor rather than ship a button that cannot open.
+  if (header.some((h) => h.action.openPopup) && !open.mod) bad("openPopup needs open.mod");
+  if (raw.shortcut != null && raw.shortcut !== "" && !(typeof raw.shortcut === "string" && raw.shortcut.length === 1)) bad("shortcut must be one character");
   if (raw.order != null && typeof raw.order !== "number") bad("order must be a number");
 
   return {
@@ -119,6 +130,60 @@ export function parseDescriptor(text, folder, opts = {}) {
 
 export const sortTools = (tools) => [...tools].sort((a, b) => a.order - b.order || a.name.localeCompare(b.name));
 
+const shortcutLabel = (t) => (t.bundled ? `tools/${t.id}.json` : `${t.folder}/tool.json`);
+
+// The + menu looks up toolsFor(tools, "tab") in this order and opens the first shortcut hit,
+// ahead of ⌘N. Clear a shortcut that menu already owns, or that an earlier tab tool took, so
+// the row does not advertise a key that will not open it. The tool stays, and the cleared key is
+// named in `warnings` (not with the descriptors that were dropped). A tool that is not in that
+// list cannot take the key, so its shortcut is left as written.
+export function settleShortcuts(tools, labelOf = shortcutLabel) {
+  const taken = new Set();
+  const warnings = [];
+  const out = [];
+  for (const t of tools) {
+    const raw = typeof t.shortcut === "string" ? t.shortcut : "";
+    const key = raw.toLowerCase();
+    const inMenu = key.length === 1 && Array.isArray(t.places) && t.places.includes("tab");
+    if (!inMenu) { out.push(t); continue; }
+    if (MENU_SHORTCUTS.has(key) || taken.has(key)) {
+      warnings.push(`${labelOf(t)}: shortcut cleared (${raw} ${MENU_SHORTCUTS.has(key) ? "is reserved" : "already used"})`);
+      out.push({ ...t, shortcut: "" });
+      continue;
+    }
+    taken.add(key);
+    out.push(t);
+  }
+  return { tools: out, warnings };
+}
+
+// Cache key for the last good scan. Bump it when a stored tool's shape changes so an older
+// blob is ignored instead of being drawn. Entries still pass through normalizeTool: a v1 row
+// missing `open` or `places` is dropped, and the rest are kept.
+export const REGISTRY_CACHE_KEY = "registry.v1";
+
+// Stored tools -> tools safe for toolsFor / resolveOpen. One bad row does not drop the rest.
+export function toolsFromCache(entries, self = "core") {
+  if (!Array.isArray(entries)) return [];
+  const tools = [];
+  for (const entry of entries) {
+    if (!isObj(entry)) continue;
+    const folder = typeof entry.folder === "string" && entry.folder ? entry.folder : self;
+    try { tools.push(normalizeTool(entry, folder, { bundled: entry.bundled === true, self })); } catch { /* skip this row */ }
+  }
+  // The cache is drawn before the next scan. Drop the same collisions loadRegistry does.
+  return settleShortcuts(tools).tools;
+}
+
+export function readRegistryCache(raw, self = "core") {
+  try {
+    const c = JSON.parse(raw ?? "null");
+    return toolsFromCache(c?.tools, self);
+  } catch {
+    return [];
+  }
+}
+
 // Merge by id; a plugin's descriptor replaces a bundled one with the same id.
 export function mergeTools(bundled, plugins) {
   const byId = new Map();
@@ -144,10 +209,12 @@ export function resolveOpen(tool, now = Date.now()) {
 }
 
 // One scan: bundled + discovered, merged. Bad files are skipped and named in `errors`.
+// A shortcut the + menu will not honor is cleared and named in `warnings`; that tool stays.
 export async function loadRegistry(io) {
   const files = await io.scan();
   const disabled = new Set(io.disabled?.() ?? []);
   const bundled = [], plugins = [], errors = [], seen = new Set();
+  const labels = new Map();
   for (const f of [...files].sort((a, b) => a.folder.localeCompare(b.folder) || a.file.localeCompare(b.file))) {
     if (!f.bundled && (disabled.has(f.folder) || f.folder === io.self)) continue;
     const label = f.bundled ? `tools/${f.file.split("/").pop()}` : `${f.folder}/tool.json`;
@@ -160,21 +227,30 @@ export async function loadRegistry(io) {
       if (seen.has(r.tool.id)) { errors.push(`${label}: id ${r.tool.id} already taken by another plugin`); continue; }
       seen.add(r.tool.id);
     }
-    (f.bundled ? bundled : plugins).push(r.tool);
+    const list = f.bundled ? bundled : plugins;
+    list.push(r.tool);
+    labels.set(r.tool, label);
   }
   // Bundled descriptors that open another mod show only while that mod is installed and not switched off.
   const inst = io.installed ? new Set(await io.installed()) : null;
-  // unlessInstalled: a stand-in that steps aside when that mod is there (the fork's native Browser vs the browser mod).
-  const usable = (t) => (!t.unlessInstalled || !inst || !inst.has(t.unlessInstalled))
+  // unlessInstalled: a stand-in that steps aside only when that mod is installed and enabled
+  // (the fork's native Browser vs the browser mod). Switched off, the stand-in stays: the mod's own entry is dropped too.
+  const usable = (t) => (!t.unlessInstalled || !inst || !inst.has(t.unlessInstalled) || disabled.has(t.unlessInstalled))
     && (!t.open.mod || t.open.mod === io.self || ((!inst || inst.has(t.open.mod)) && !disabled.has(t.open.mod)));
   const kept = bundled.filter(usable);
   // Stand-ins for tools that will ship their own tool.json: used while an installed folder has none.
   if (inst) for (const [id, raw] of Object.entries(FALLBACKS)) {
     if (plugins.some((t) => t.id === id) || kept.some((t) => t.id === id)) continue;
     const folder = [id, `fork-${id}`].find((f) => inst.has(f) && !disabled.has(f));
-    if (folder) plugins.push(normalizeTool(raw, folder, { self: io.self }));
+    if (folder) {
+      const tool = normalizeTool(raw, folder, { self: io.self });
+      labels.set(tool, `${folder}/tool.json`);
+      plugins.push(tool);
+    }
   }
-  return { tools: mergeTools(kept, plugins), errors };
+  // Menu order, not scan order: Plus finds the first tab tool, which is this sorted list.
+  const settled = settleShortcuts(mergeTools(kept, plugins), (t) => labels.get(t) ?? shortcutLabel(t));
+  return { tools: settled.tools, errors, warnings: settled.warnings };
 }
 
 // The Notepad as it was before it shipped its own tool.json (header buttons and copy included).
@@ -190,32 +266,87 @@ export const FALLBACKS = {
   },
 };
 
-// Holds the last good registry. refresh() resolves true when something changed; a failed scan keeps what it had.
+// Holds the last good registry. refresh() resolves true when something changed; a failed scan keeps the
+// tools and skipped-descriptor errors it had, and records the failure on `warnings`.
+// The first successful scan counts as a change even when the tools match a cache that was copied onto `tools`
+// beforehand (`loaded` is still false, and `key` was never seeded). Callers that share one in-flight scan each
+// see that same result. A refresh that arrives while a scan is running marks the registry dirty. When the
+// current scan finishes, one more runs, and another if a refresh arrived during that one. A write that landed
+// after this scan had already listed or read its files is applied before refresh() resolves, instead of waiting
+// for a later event. `changed` stays true when any scan in that chain differed from the registry it started from.
 export function createRegistry(io) {
+  let dirty = false;
   const reg = {
     tools: [],
     errors: [],
+    warnings: [],
     loaded: false,
     key: "",
     inflight: null,
     refresh() {
-      if (reg.inflight) return reg.inflight;
+      if (reg.inflight) {
+        dirty = true;
+        return reg.inflight;
+      }
       reg.inflight = (async () => {
+        let changed = false;
         try {
-          const r = await loadRegistry(io);
-          const key = JSON.stringify(r);
-          const changed = key !== reg.key || !reg.loaded;
-          reg.tools = r.tools; reg.errors = r.errors; reg.key = key; reg.loaded = true;
-          return changed;
-        } catch (e) {
-          const msg = `scan failed: ${e?.message ?? e}`;
-          const changed = reg.errors[0] !== msg;
-          reg.errors = [msg, ...reg.errors.filter((x) => !x.startsWith("scan failed"))];
+          do {
+            dirty = false;
+            try {
+              const r = await loadRegistry(io);
+              const key = JSON.stringify(r);
+              // `key` is the last good scan. A failure leaves that key and writes over `warnings`,
+              // so the next good scan can match `key` while the held warnings still say it failed.
+              // Compare the held tools, errors and warnings too, or the footer never clears.
+              const held = JSON.stringify({ tools: reg.tools, errors: reg.errors, warnings: reg.warnings });
+              changed = changed || key !== reg.key || key !== held || !reg.loaded;
+              reg.tools = r.tools; reg.errors = r.errors; reg.warnings = r.warnings; reg.key = key; reg.loaded = true;
+            } catch (e) {
+              const msg = `scan failed: ${e?.message ?? e}`;
+              const prior = reg.warnings.find((w) => w.startsWith("scan failed"));
+              changed = changed || prior !== msg;
+              reg.warnings = [msg, ...reg.warnings.filter((w) => !w.startsWith("scan failed"))];
+            }
+          } while (dirty);
           return changed;
         } finally { reg.inflight = null; }
       })();
       return reg.inflight;
     },
+  };
+  return reg;
+}
+
+// Hosts wake other views and rewrite their cache from refresh(). That work must follow the tools, not
+// refresh()'s flag: the flag is true for the first scan and for an error-only change, and every caller
+// that joined the in-flight scan would otherwise publish again. `publish` runs for a scan that left
+// different tools than the ones already held (the cache seed, or the last scan). The wrapper has the
+// same in-flight join as refresh(): a call that arrives after the scan underneath has already read still
+// marks this flight dirty, and a follow-up scan publishes only when its tools differ.
+export function publishRegistryChanges(reg, publish) {
+  const refresh = reg.refresh;
+  let flight = null;
+  let dirty = false;
+  reg.refresh = () => {
+    if (flight) {
+      dirty = true;
+      return flight;
+    }
+    flight = (async () => {
+      let changed = false;
+      try {
+        do {
+          dirty = false;
+          const before = JSON.stringify(reg.tools);
+          // Await first. `changed || await refresh()` would skip the follow-up once changed is true.
+          changed = (await refresh()) || changed;
+          if (reg.loaded && JSON.stringify(reg.tools) !== before) publish(reg.tools);
+        } while (dirty);
+        return changed;
+      } finally { flight = null; }
+    })();
+    return flight;
   };
   return reg;
 }

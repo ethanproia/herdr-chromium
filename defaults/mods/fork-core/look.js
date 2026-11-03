@@ -2,12 +2,12 @@
 // the safe copy runner, how a tool opens, and the host side of the registry.
 import { div, svg } from "gpui-kit";
 import { h_flex } from "gpui-base";
-import { exec, appHome, readTextFile, settings, notify, run, shared, setShared } from "herdr";
+import { exec, appHome, readTextFile, settings, notify, run, watchFolder, shared, setShared, openOverlay } from "herdr";
 import { SELF, icon } from "./self.js";
-import { keysym, COPY_TEXT } from "./pure.js";
-import { resolveOpen, createRegistry } from "./registry.js";
+import { keysym, COPY_TEXT, watchMembership, registryWatchRelevant, headerActionPlan, registryNotice, runRegistryWatch, registryWatchFailure } from "./pure.js";
+import { resolveOpen, createRegistry, readRegistryCache, toolsFromCache, publishRegistryChanges, REGISTRY_CACHE_KEY } from "./registry.js";
 
-export { keysym, icon };
+export { keysym, registryNotice, icon };
 export const KEYFONT = ".SystemUIFont";   // the bundled UI font has no bold or symbols: macOS menus use the system one
 
 // A group label ("Tools", "Agents", "Workspace").
@@ -49,6 +49,15 @@ export function runCopy(script, arg) {
 
 export function copyText(text, doneTitle = "Link copied") {
   runCopy(COPY_TEXT, text).then((ok) => { if (ok) notify({ title: doneTitle, body: text, timeout: 2000 }); });
+}
+
+// The same typed actions the wide header buttons run. `mod` is the tool's own mod (openPopup only).
+export function runHeaderAction(action, { pane, mod } = {}) {
+  const plan = headerActionPlan(action, pane);
+  if (!plan) return;
+  if (plan.kind === "toggleShared") setShared(plan.key, shared(plan.key) !== true);
+  else if (plan.kind === "run") run(plan.name, plan.args);
+  else if (plan.kind === "popup" && mod) openOverlay({ mod, kind: "popup", props: plan.props, width: plan.width, height: plan.height });
 }
 
 // ---- opening a tool ------------------------------------------------------------------------------------------------
@@ -97,21 +106,113 @@ export const registryIO = {
   disabled() { const d = settings()?.mods_disabled; return Array.isArray(d) ? d.filter((x) => typeof x === "string") : []; },
 };
 
-// A registry seeded from the last good scan, kept in shared state ("core.registry"), so every menu opens with its
-// rows at once. localStorage can't hold it: each popup is its own mod copy with its own (empty) storage. Only the
-// always-shown tab strip (writer: true) refreshes and publishes it; menus read it and refresh quietly behind it.
-const CACHE = "core.registry";
+// One registry per worker. Every role reads this copy; one header owns the poll and the folder watch.
+// The shared key holds the last good tool list plus a wake count: localStorage can't hold the list, because each
+// popup is its own mod copy with its own empty storage. Only the always-shown tab strip (writer: true) publishes
+// the list; menus read it and refresh quietly behind it. Headers read the key in render, so any bump redraws them.
+// A bare number (an older wake with no list yet) still counts.
+export const REGISTRY_WAKE = "core.registry";
+
+let registry = null;
+let registryWriter = false;
+let watchMembers = [];
+let watchOwner = null;
+const watchCx = new Map();
+
+function wakeCount(prev) {
+  if (typeof prev === "number") return prev;
+  return typeof prev?.wake === "number" ? prev.wake : 0;
+}
+
+// The writer publishes its list; anyone else only bumps the wake and keeps the writer's list.
+function publishShared(tools) {
+  try {
+    const prev = shared(REGISTRY_WAKE);
+    const wake = wakeCount(prev) + 1;
+    if (registryWriter) setShared(REGISTRY_WAKE, { tools, wake });
+    else if (Array.isArray(prev?.tools)) setShared(REGISTRY_WAKE, { tools: prev.tools, wake });
+    else setShared(REGISTRY_WAKE, wake);
+  } catch { /* a caller with no host call still gets the new tools on its own notify */ }
+}
+
 export function openRegistry({ writer = false } = {}) {
+  const late = writer && !registryWriter;
+  registryWriter = registryWriter || writer;
+  if (registry) {
+    // A writer arriving after this worker already scanned publishes what it has, since the next scan may see no change.
+    if (late && registry.loaded && JSON.stringify(shared(REGISTRY_WAKE)?.tools) !== JSON.stringify(registry.tools)) publishShared(registry.tools);
+    return registry;
+  }
   const reg = createRegistry(registryIO);
-  const c = shared(CACHE);
-  if (Array.isArray(c?.tools)) { reg.tools = c.tools; reg.seeded = true; }
-  const refresh = reg.refresh;
-  reg.refresh = async () => {
-    const changed = await refresh();
-    if (writer && reg.loaded && JSON.stringify(shared(CACHE)?.tools) !== JSON.stringify(reg.tools)) setShared(CACHE, { tools: reg.tools });
-    return changed;
-  };
+  // The shared copy first (it reaches popups); this worker's own storage only when nothing is shared yet.
+  // Either way the cached rows are validated before they are drawn.
+  let cached = null;
+  try { cached = shared(REGISTRY_WAKE); } catch { /* empty until the scan */ }
+  if (Array.isArray(cached?.tools)) { reg.tools = toolsFromCache(cached.tools, SELF); reg.seeded = true; }
+  else {
+    try { reg.tools = readRegistryCache(localStorage.getItem(REGISTRY_CACHE_KEY), SELF); } catch { /* empty until the scan */ }
+  }
+  // One publish per scan, and only when the loaded tools differ from the seeded copy. The first
+  // scan reports a change even when they match, and the + menu, New panel and tab strip share it.
+  publishRegistryChanges(reg, (tools) => {
+    try { localStorage.setItem(REGISTRY_CACHE_KEY, JSON.stringify({ tools })); } catch { /* the next scan still fills menus */ }
+    publishShared(tools);
+  });
+  registry = reg;
   return reg;
+}
+
+function beginRegistryWatch(id) {
+  const cx = watchCx.get(id);
+  if (!cx || watchOwner !== id) return;
+  const reg = openRegistry();
+  const reload = (cx) => {
+    if (watchOwner !== id) return;
+    cx.spawn(async (cx) => {
+      if (watchOwner !== id) return;
+      const changed = await reg.refresh();
+      if (watchOwner !== id) return;
+      if (changed && reg.errors.length) console.log(`core: skipped ${reg.errors.join("; ")}`);
+      if (changed && reg.warnings.length) console.log(`core: ${reg.warnings.join("; ")}`);
+      if (changed) cx.notify();
+    });
+  };
+  reload(cx);
+  cx.timer.every(30000, reload);
+  cx.spawn(async (cx) => {
+    const modsOf = () => `${appHome()}/mods`;
+    // watchFolder takes no cancel handle, so a call stays blocked until mods/ changes even
+    // after the owner leaves. A newer owner has its own watch. Ignore the late batch, and
+    // retry a throw while this id still owns the watch instead of leaving it unwatched.
+    await runRegistryWatch({
+      isOwner: () => watchOwner === id,
+      watch: () => watchFolder(modsOf()),
+      onBatch: (paths) => {
+        if (registryWatchRelevant(paths, modsOf(), SELF)) reload(cx);
+      },
+      onError: (e) => console.log(registryWatchFailure(e)),
+      wait: (ms) => new Promise((resolve) => { cx.timer.after(ms, resolve); }),
+    });
+  });
+}
+
+function applyWatch(event) {
+  const next = watchMembership(watchMembers, watchOwner, event);
+  watchMembers = next.members;
+  watchOwner = next.owner;
+  if (next.start) beginRegistryWatch(next.start);
+}
+
+// The first header polls and watches mods/. Later headers share that registry. When the owner
+// closes, the oldest header still on screen takes the watch; a leave of anyone else changes nothing.
+export function watchRegistry(cx) {
+  const id = {};
+  watchCx.set(id, cx);
+  applyWatch({ type: "join", id });
+  return () => {
+    watchCx.delete(id);
+    applyWatch({ type: "leave", id });
+  };
 }
 
 // Keeps the highlighted row on the same item when rows arrive or move (by row id, not position).

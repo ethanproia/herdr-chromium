@@ -1,23 +1,13 @@
 // Role "tabs": the tab strip (replaces the old tabs-browser). Tabs, + right after the last tab, the Files / Changes
 // panel buttons, window buttons. Key commands: `<this folder>.split-right`, `.split-down`, `.new-browser`.
 import { openInSide } from "./side-strip.js";
-import { toggleSidebar } from "./sections.js";
+import { toggleSidebar, find } from "./sections.js";
 import { div, svg, image } from "gpui-kit";
 import { h_flex } from "gpui-base";
 import { spaces, panes, run, openOverlay, theme, window, shared, setShared, layout, nextCommand, settings } from "herdr";
 import { SELF } from "../self.js";
 import { fadeLabel, over } from "../scroll.js";
-import { icon, registryIO, openInTab, openRegistry } from "../look.js";
-import { createRegistry } from "../registry.js";
-
-function find(node, id) {
-  if (node?.id === id) return node;
-  for (const child of node?.children ?? []) {
-    const found = find(child, id);
-    if (found) return found;
-  }
-  return null;
-}
+import { icon, openInTab, openRegistry } from "../look.js";
 
 const SIDE = (id) => `panels.side.${id}`;
 
@@ -37,8 +27,9 @@ export default class Tabs {
       }
     });
     this.pressed = null;
-    this.migratePanels();
     // The side panel is remembered per space. It is synced here, on a gentle tick, never from render().
+    // The old tab bar stored those choices in its own folder's local storage. This mod cannot read that
+    // store, so nothing is copied across, and no version flag is set for a migration that did not run.
     cx.timer.every(150, () => this.syncPanel());
     // Tools installed or removed later: re-scan every 30 s (cheap; publishes only when the list changed).
     cx.timer.every(30000, (cx) => cx.spawn(async (cx) => { if (await this.reg.refresh()) cx.notify(); }));
@@ -50,16 +41,6 @@ export default class Tabs {
     const tool = this.reg.tools.find((t) => t.id === "browser" || t.id === "browser-native");
     if (tool) return openInTab(tool, space);
     run("tab.new", { name: "Browser", space, mod: "browser", props: { id: `b${Date.now().toString(36)}` } });
-  }
-
-  // Once: the old per-space choices (local storage) move to the shared keys panels.side.<space>.
-  migratePanels() {
-    if (shared("panels.version") === 1) return;
-    try {
-      const old = JSON.parse(localStorage.getItem("panels") ?? "{}");
-      for (const [id, v] of Object.entries(old)) if (shared(SIDE(id)) === undefined) setShared(SIDE(id), v ?? null);
-    } catch {}
-    setShared("panels.version", 1);
   }
 
   enabledPanels() { return [...(shared("workspace.panels") ?? ["files", "changes"])]; }

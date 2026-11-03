@@ -3,12 +3,12 @@
 // The pane header (pane-browser) holds its Markdown toggle (shared "notepad.md") and Export (this mod as a popup).
 // Save-with-check and the folder watch loop are adapted from herdsidian (MIT, (c) 2026 Andersson Quintero).
 import { View, div, svg } from "gpui-kit";
-import { h_flex, v_flex, Textarea, TextareaState, Popup, TextView, Editor, EditorState } from "gpui-base";
+import { h_flex, v_flex, Textarea, TextareaState, Popup } from "gpui-base";
 import { theme, settings, home, appHome, exec, readTextFile, writeTextFile, watchFolder, nextCommand, props, shared, setShared,
-  closeOverlay, openOverlay, notify, pickFolder, panes } from "herdr";
+  closeOverlay, openOverlay, notify, pickFolder } from "herdr";
 import { splitRows, joinRows, isFence, parseRow, filterTypes, setType, continuePrefix, isEmptyItem, toggleTask,
   parseInline, titleOf, slugOf, toPlain, toHtml, splitFront, iconOf, withIcon, TYPES, linkSpans, replaceLinkAt,
-  mergeAppend as joinAppend, draftRestore, BY_MARK } from "./rows.js";
+  mergeAppend as joinAppend, draftRestore, loadedAfterRestore, savePlan, BY_MARK } from "./rows.js";
 import { IconPicker, iconElement } from "./iconpicker.js";
 import { loadItems, openHref, KIND_ICON } from "./mentions.js";
 import { filterItems, encodeLink, parseHref } from "./mentions-core.js";
@@ -82,9 +82,6 @@ function inline(text) {
   return v;
 }
 const BADGE_ICON = { agent: "chat", tab: "list", file: "file", date: "calendar", url: "globe" };
-const VIRTUAL_MIN = 60;    // lines above which only the rows on screen are drawn (measured faster from ~60 up)
-const OVERSCAN = 300;      // px drawn above and below the view
-const EST = new Map();     // row text -> estimated height
 const PH = { p: "Type '/' to style", h1: "Heading 1", h2: "Heading 2", h3: "Heading 3", task: "To-do", bullet: "List", number: "List", quote: "Empty quote" };
 // Rows whose markdown prefix is drawn as a control (checkbox, bullet...) and kept out of the text box.
 const DECORATED = new Set(["h", "task", "bullet", "number", "quote"]);
@@ -93,7 +90,6 @@ export default class Notes extends View {
   init(_p, cx) {
     this.handle = cx.focus_handle();
     if (props()?.export) { this.exporting = false; return; }   // opened by the header's Export button
-    if (props()?.view) return this.initViewer(cx);              // a file mention opened beside the note
     if (props()?.headerMenu || props()?.backlinks) return;       // small popups: no note, no file watch
     this.ta = TextareaState.new({});   // placeholders are drawn by renderActive (they change with the row type)
     this.titleTa = TextareaState.new({ placeholder: "Untitled" });
@@ -123,8 +119,6 @@ export default class Notes extends View {
     this.width = 800;      // pane width (on_size_change); FORK: panes have no min width a mod can set
     this.rowH = {};        // measured row heights by state (see measure())
     this.editFix = 0;      // px added above the text box so it matches the styled line
-    this.hAt = [];         // measured row heights by index; long notes draw only the rows on screen
-    this.scrollY = 0; this.viewH = 0;
 
     cx.spawn(async (cx) => {
       try { await exec("mkdir", ["-p", NOTES_DIR]); } catch (e) { this.error = `Cannot create ${NOTES_DIR}: ${e}`; }
@@ -184,7 +178,11 @@ export default class Notes extends View {
     const c = this.cur;
     if (!c || !c.path) return;
     const disk = await readTextFile(c.path).catch(() => null);
-    if (disk === null || disk === c.loaded || disk === c.text || disk === c.writing || this.cur !== c) return;
+    if (disk === null || disk === c.writing || this.cur !== c) return;
+    // Disk already matches what we have. Catch the baseline up; leaving it stale makes the
+    // next append merge treat this text as a new suffix and write it twice.
+    if (disk === c.text) { c.loaded = disk; c.dirty = false; c.conflict = false; return; }
+    if (disk === c.loaded) return;
     // Something only appended (the `notepad` command agents use): merge it live, even mid-typing.
     if (this.isAppend(disk)) return this.mergeAppend(disk);
     if (c.dirty || this.active >= 0) { c.conflict = true; return; }
@@ -256,9 +254,13 @@ export default class Notes extends View {
     }
     try {
       const disk = await readTextFile(c.path).catch(() => null);
-      if (!force && disk !== c.loaded) {
-        if (this.isAppend(disk)) this.mergeAppend(disk);
-        else if (disk !== c.text) { c.conflict = true; return; }
+      if (!force) {
+        const plan = savePlan(c.loaded, c.text, disk);
+        // Disk already holds this text. A stale `loaded` must not make isAppend treat the
+        // local tail as an outside append and write it a second time.
+        if (plan === "same") { c.loaded = disk; c.dirty = false; c.conflict = false; return; }
+        if (plan === "merge") this.mergeAppend(disk);
+        else if (plan === "conflict") { c.conflict = true; return; }
       }
       const text = c.text;
       c.writing = text;
@@ -294,16 +296,13 @@ export default class Notes extends View {
       const { front, body } = splitFront(draft);
       this.cur.front = front; this.rows = splitRows(body); this.active = -1;
       this.cur.dirty = true;
-      // Pin the baseline to the draft's base so a later save still sees an outside edit.
-      // "save" and "merge" go through save(false), which re-reads the disk. A conflict only banners.
-      if (action === "conflict") {
-        this.cur.conflict = true;
-        this.cur.loaded = base !== undefined ? base : draft;
-      } else {
-        if (base !== undefined) this.cur.loaded = base;
-        this.save(false, cx);
-        clearDraftFiles();
-      }
+      // "merge" pins the draft's base so save(false) still sees an outside append.
+      // "save" keeps the current baseline: the disk already equals the draft or the base,
+      // and rewinding to the base would append the draft's tail a second time.
+      // A conflict only banners (Reload / Keep mine); it does not write.
+      this.cur.loaded = loadedAfterRestore(action, base, this.cur.loaded, draft);
+      if (action === "conflict") this.cur.conflict = true;
+      else { this.save(false, cx); clearDraftFiles(); }
     } else clearDraftFiles();
     this.draft = null;
     this.draftBase = undefined;
@@ -368,7 +367,6 @@ export default class Notes extends View {
     this.commit();
     if (i < 0 || i >= this.rows.length) { cx.notify(); return; }
     this.active = i;
-    if (this.rows.length > VIRTUAL_MIN) this.reveal(i);
     const text = this.seat(this.rows[i], i);
     this.setBox(text);
     const pos = at ?? (atEnd ? text.length : 0);
@@ -802,112 +800,9 @@ export default class Notes extends View {
     return list;
   }
 
-  // ---- long notes: draw only the rows on screen ----
-  // Measured 2026-11-03: building every row costs ~0.23 ms per line (1000 lines = 236 ms per redraw), so past
-  // VIRTUAL_MIN lines the note keeps its own scroll position (wheel events), draws the rows in view plus a margin
-  // (heights measured as they draw, estimated until then) and a thin scrollbar. Herdr's lazy `list` can't be used:
-  // its rows may not carry handlers, and every row here has some.
-  // Until a row has been drawn, its height is estimated from its type; cached by text (layout runs every redraw).
-  rowEstimate(i) {
-    if (i === 0) return 60;
-    const row = this.rows[i] ?? "";
-    let h = EST.get(row);
-    if (h === undefined) {
-      const { lh, top } = this.metrics(parseRow(row));
-      h = lh + 2 * S.rowPad + top;
-      if (EST.size > 20000) EST.clear();
-      EST.set(row, h);
-    }
-    return h;
-  }
-
-  layoutRows() {
-    const n = this.rows.length, hs = new Array(n);
-    let total = 0;
-    for (let i = 0; i < n; i++) { hs[i] = this.hAt[i] ?? this.rowEstimate(i); total += hs[i]; }
-    return { hs, total };
-  }
-
-  // Scroll so row i is on screen (used when the keyboard moves the line being edited).
-  reveal(i) {
-    const { hs } = this.layoutRows();
-    let y = S.padTop; for (let k = 0; k < i; k++) y += hs[k];
-    const view = this.viewH || 600;
-    if (y < this.scrollY) this.scrollY = Math.max(0, y - 40);
-    else if (y + hs[i] > this.scrollY + view) this.scrollY = y + hs[i] - view + 40;
-  }
-
-  renderVirtual(t, cx) {
-    const { hs, total } = this.layoutRows();
-    const n = this.rows.length, view = this.viewH || 800, height = S.padTop + total + 200;
-    this.scrollY = Math.max(0, Math.min(this.scrollY, Math.max(0, height - view)));
-    let y = S.padTop, first = 0;
-    while (first < n && y + hs[first] < this.scrollY - OVERSCAN) { y += hs[first]; first++; }
-    const firstY = y;
-    let last = first;
-    while (last < n && y < this.scrollY + view + OVERSCAN) { y += hs[last]; last++; }
-    if (this.active >= 0 && (this.active < first || this.active >= last)) this.commit();   // scrolled off: stop editing
-    const rows = [];
-    for (let i = first; i < last; i++) {
-      const el = i === this.active ? this.renderActive(t, i) : this.renderRow(t, this.rows[i], i, cx);
-      rows.push(i === 0 ? this.titleArea(t, el) : this.blockFrame(t, this.rows[i], i, el));
-    }
-    if (last >= n) rows.push(div().id("tail").w_full().h(200).cursor_text().on_click((_e, cx) => this.tail(cx)));
-    const thumbH = Math.max(28, view * view / height), thumbY = (view - thumbH) * (this.scrollY / Math.max(1, height - view));
-    return div().id("scroll").flex_1().min_h(0).relative().overflow_hidden()
-      .on_size_change((size, cx) => { if (Math.abs(size.height - this.viewH) > 1) { this.viewH = size.height; cx.notify(); } })
-      .on_scroll_wheel((e, cx) => {
-        const next = Math.max(0, Math.min(this.scrollY - (e.delta?.y ?? 0), Math.max(0, height - view)));
-        if (next !== this.scrollY) { this.scrollY = next; cx.notify(); }
-      })
-      .child(h_flex().size_full().justify_center()
-        .child(div().relative().w_full().max_w(S.width).h_full()
-          .child(v_flex().absolute().left(0).right(0).top(firstY - this.scrollY).px(this.pad).children(rows))))
-      .when(height > view, (el) => el.child(div().absolute().right(3).top(thumbY).w(4).h(thumbH).rounded(2).bg(t.border)));
-  }
-
   // Flush a pending save when the pane closes, so nothing typed is lost.
   // The draft is written first (one quick local write), so a failed or cut-short save never loses typing.
-  // Tell pane headers which file this viewer pane shows. PaneInfo has no props, so the path is shared by pane id.
-  claimViewer(attempt) {
-    const path = this.view;
-    if (typeof path !== "string" || !path) return;
-    let list = [];
-    try { list = panes().filter((p) => p.mod === "fork-notepad-view" || (p.mod === "fork-notepad" && typeof p.props?.view === "string")); } catch { return; }
-    const prev = shared("notepad.files");
-    const map = { ...(prev && typeof prev === "object" ? prev : {}) };
-    const live = new Set(list.map((p) => p.pane));
-    let changed = false;
-    for (const id of Object.keys(map)) if (!live.has(id)) { delete map[id]; changed = true; }
-    let id = this.viewPane && live.has(this.viewPane) && map[this.viewPane]?.token === this.viewToken ? this.viewPane : null;
-    if (!id) id = Object.keys(map).find((k) => map[k] && map[k].token === this.viewToken) ?? null;
-    if (!id) {
-      const free = list.filter((p) => !map[p.pane]);
-      // One unclaimed pane is ours. Several open together: a later pass takes the first free one,
-      // and a pane whose token lost the write tries again against what's left.
-      if (free.length === 1 || (attempt > 0 && free.length > 1)) id = free[0].pane;
-    }
-    if (!id) { if (changed) setShared("notepad.files", map); return; }
-    this.viewPane = id;
-    if (!map[id] || map[id].path !== path || map[id].token !== this.viewToken) {
-      map[id] = { path, token: this.viewToken };
-      changed = true;
-    }
-    if (changed) setShared("notepad.files", map);
-  }
-
-  releaseViewer() {
-    if (!this.viewPane) return;
-    const prev = shared("notepad.files");
-    if (!prev || typeof prev !== "object" || !prev[this.viewPane]) return;
-    const map = { ...prev };
-    delete map[this.viewPane];
-    setShared("notepad.files", map);
-    this.viewPane = null;
-  }
-
   async close(cx) {
-    if (props()?.view) { this.releaseViewer(); return; }
     if (!this.cur?.dirty) return;
     await writeTextFile(DRAFT, this.cur.text, await readTextFile(DRAFT).catch(() => null)).catch(() => {});
     await writeTextFile(DRAFT_BASE, JSON.stringify({ base: this.cur.loaded }), await readTextFile(DRAFT_BASE).catch(() => null)).catch(() => {});
@@ -1018,7 +913,6 @@ export default class Notes extends View {
         onRemove: (cx) => { this.pickerOpen = false; this.setIcon("", cx); },
       }))));
     return v_flex().id("title-area").w_full().pb(2)
-      .on_size_change((size) => { this.hAt[0] = size.height; })
       .on_hover((h, cx) => { if (h !== this.titleHover) { this.titleHover = h; cx.notify(); } })
       .child(h_flex().w_full().pb(4).child(pop)).child(el);
   }
@@ -1038,7 +932,6 @@ export default class Notes extends View {
   // both states; the difference is added above the text box, which makes both the height and the text position match
   // at any zoom. Measured 2026-11-03: 33.0 vs 33.5 at zoom 1.1 (proof in work.noindex/herdr-notepad/jitter/).
   measure(i, row, size, cx) {
-    this.hAt[i] = size.height;   // for the long-note window (renderVirtual)
     const state = i === this.active ? "edit" : "styled";
     const rec = (this.rowH[row] ??= {});
     if (state === "edit") rec.edit = size.height - this.editFix; else rec.styled = size.height;
@@ -1088,42 +981,7 @@ export default class Notes extends View {
       .when(Boolean(d) && d.to === i + 1 && i === this.rows.length - 1, (b) => b.child(line("bottom")));
   }
 
-  // ---- viewer (a file mention opened beside the note; read-only) ----
-  initViewer(cx) {
-    this.view = props().view;
-    this.viewToken = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
-    this.viewText = null; this.viewEditor = null;
-    this.claimViewer(0);
-    cx.timer.after(50, () => this.claimViewer(1));
-    cx.timer.after(200, () => this.claimViewer(1));
-    cx.spawn(async (cx) => {
-      const text = await readTextFile(this.view).catch(() => null);
-      this.viewText = text ?? "";
-      this.viewMissing = text === null;
-      if (!/\.(md|markdown|mdx)$/i.test(this.view) && text !== null) {
-        const ext = (this.view.match(/\.([a-z0-9]+)$/i) ?? [])[1] ?? "";
-        this.viewEditor = EditorState.new({ language: ext, value: text, readonly: true, soft_wrap: true, folding: false });
-      }
-      cx.notify();
-    });
-  }
-
-  renderViewer() {
-    const t = theme();
-    const name = this.view.slice(this.view.lastIndexOf("/") + 1);
-    const body = this.viewText === null ? div().text_size(13).text_color(t.dim).child("Loading…")
-      : this.viewMissing ? div().text_size(13).text_color(t.dim).child("File not found")
-      : this.viewEditor ? Editor.new(this.viewEditor).size_full()
-      : TextView.markdown(`view-${this.view}`, this.viewText).selectable(true);
-    return v_flex().id("viewer").size_full().bg(t.background).font_family(FONT)
-      .child(h_flex().h(32).px(12).gap(8).items_center().flex_none().border_b(1).border_color(t.border)
-        .child(div().text_size(13).font_weight(500).text_color(t.foreground).child(name))
-        .child(div().flex_1().min_w_0().truncate().text_size(12).text_color(t.dim).child(this.view)))
-      .child(div().id("viewer-scroll").flex_1().min_h(0).overflow_y_scrollbar().px(16).py(12).child(body));
-  }
-
   render(cx) {
-    if (props()?.view) return this.renderViewer();
     if (props()?.export) return this.renderExport();
     if (props()?.headerMenu) return this.renderHeaderMenu();
     if (props()?.backlinks) return this.renderBacklinks(cx);
@@ -1138,14 +996,14 @@ export default class Notes extends View {
 
     let content;
     if (!this.cur) content = div();
-    else if (this.rows.length <= VIRTUAL_MIN) content = v_flex().w_full()
+    else content = v_flex().w_full()
       .children(this.rows.map((row, i) => {
         const el = i === this.active ? this.renderActive(t, i) : this.renderRow(t, row, i, cx);
         return i === 0 ? this.titleArea(t, el) : this.blockFrame(t, row, i, el);
       }))
       .child(div().id("tail").w_full().h(200).cursor_text().on_click((_e, cx) => this.tail(cx)));
 
-    const root = v_flex().id("notes-root").track_focus(this.handle)
+    return v_flex().id("notes-root").track_focus(this.handle)
       .on_size_change((size, cx) => { if (Math.abs(size.width - this.width) > 1) { this.width = size.width; cx.notify(); } }).size_full().bg(t.background).text_color(t.foreground).font_family(FONT)
       .on_key_down((e, cx) => this.onKey(e, cx))
       .on_mouse_up("left", (_e, cx) => {
@@ -1163,9 +1021,8 @@ export default class Notes extends View {
         act("reload", "Reload", (_e, cx) => { readTextFile(NOTE_PATH).then((d) => { this.adopt(d ?? ""); cx.notify(); }); }),
         act("overwrite", "Keep mine", (_e, cx) => this.save(true, cx)),
       ])))
-      .when(Boolean(this.error), (el) => el.child(div().px(16).pt(8).text_size(12).text_color(t.blocked).child(this.error)));
-    if (this.cur && this.rows.length > VIRTUAL_MIN) return root.child(this.renderVirtual(t, cx));
-    return root.child(div().id("scroll").flex_1().min_h(0).overflow_y_scrollbar()
+      .when(Boolean(this.error), (el) => el.child(div().px(16).pt(8).text_size(12).text_color(t.blocked).child(this.error)))
+      .child(div().id("scroll").flex_1().min_h(0).overflow_y_scrollbar()
         .child(h_flex().w_full().justify_center()
           .child(v_flex().w_full().max_w(S.width).px(this.pad).pt(S.padTop).child(content))));
   }

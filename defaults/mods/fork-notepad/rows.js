@@ -158,6 +158,28 @@ export function draftRestore(base, draft, disk) {
   return "conflict";
 }
 
+// Baseline to keep after choosing Restore. "save" must not rewind to `base`: the disk already
+// equals the draft or the base, and rewinding makes the draft's own tail look like an append.
+// "merge" and "conflict" pin the older base so a later save still sees the outside edit.
+export function loadedAfterRestore(action, base, loaded, draft) {
+  if (action === "save") return loaded;
+  if (base !== undefined) return base;
+  return action === "conflict" ? draft : loaded;
+}
+
+// How a non-forced save should treat the file on disk.
+// "same": disk already equals local text (the baseline is stale). Advance the baseline; do not append that tail again.
+// "write": disk matches the baseline, so the local text is the change to write.
+// "merge": disk is a pure append of the baseline.
+// "conflict": disk changed in some other way.
+export function savePlan(loaded, text, disk) {
+  if (disk === text) return "same";
+  if (disk === loaded) return "write";
+  if (typeof loaded === "string" && typeof disk === "string" && disk.length > loaded.length && disk.startsWith(loaded)) return "merge";
+  if (disk !== text) return "conflict";
+  return "write";
+}
+
 // ---- export ----
 const stripInline = (s) => parseInline(s).filter((r) => r.t !== "mark").map((r) => r.s).join("");
 

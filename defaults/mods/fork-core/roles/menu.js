@@ -37,29 +37,29 @@ function items(p, git) {
       // Once they go to the program, Shift+right-click still opens this menu.
       const toProgram = term?.labels?.["herdr.right-click"] === "program";
       return [
-        ["Split right", "pane.split", { direction: "right", pane: tg.pane }],
-        ["Split down", "pane.split", { direction: "down", pane: tg.pane }],
-        ["Copy link to panel", "copy-link", { pane: tg.pane, terminal: tg.terminal }],
+        ["Split Right", "pane.split", { direction: "right", pane: tg.pane }],
+        ["Split Down", "pane.split", { direction: "down", pane: tg.pane }],
+        ["Copy Link to Panel", "copy-link", { pane: tg.pane, terminal: tg.terminal }],
         ["Zoom", "pane.zoom", { pane: tg.pane }],
         ...(term
           ? [
               toProgram
-                ? ["Use Herdr right-click menu", "terminal.right_click", { terminal: term.address, to: "menu" }]
-                : ["Send right-clicks to pane", "terminal.right_click", { terminal: term.address, to: "program" }],
+                ? ["Use Herdr Right-Click Menu", "terminal.right_click", { terminal: term.address, to: "menu" }]
+                : ["Send Right-Clicks to Pane", "terminal.right_click", { terminal: term.address, to: "program" }],
             ]
           : []),
-        ...(parent ? [[`Send back to ${parent.name || parent.address}`, "terminal.park", { terminal: term.address }]] : []),
-        ["Close pane", "pane.close", { pane: tg.pane }],
+        ...(parent ? [[`Send Back to ${parent.name || parent.address}`, "terminal.park", { terminal: term.address }]] : []),
+        ["Close Pane", "pane.close", { pane: tg.pane }],
       ];
     }
     case "tab":
       return [
         // Splits act on the tab's focused pane (else its first).
         ...((() => { const ps = panes().filter((x) => x.tab === tg.id); const pn = (ps.find((x) => x.focused) ?? ps[0])?.pane;
-          return pn ? [["Split right", "pane.split", { direction: "right", pane: pn }], ["Split down", "pane.split", { direction: "down", pane: pn }]] : []; })()),
+          return pn ? [["Split Right", "pane.split", { direction: "right", pane: pn }], ["Split Down", "pane.split", { direction: "down", pane: pn }]] : []; })()),
         ["Rename", "tab.rename", { id: tg.id }],
-        ["New tab", "tab.new", { space: tg.space }],
-        ["Copy link to tab", "copy-tab-link", { id: tg.id, space: tg.space }],
+        ["New Tab", "tab.new", { space: tg.space }],
+        ["Copy Link to Tab", "copy-tab-link", { id: tg.id, space: tg.space }],
         ["Close", "tab.close", { id: tg.id }],
       ];
     case "space": {
@@ -72,14 +72,14 @@ function items(p, git) {
       return [
         ["Open", "space.select", { id: tg.id }],
         ["Rename…", "space.rename", { id: tg.id }],
-        ["Change color…", "space.color-menu", { id: tg.id }],
-        ["New tab here", "tab.new", { space: tg.id }],
-        ["Copy link to space", "copy-space-link", { id: tg.id }],
-        ...(up ? [["Move up", "space.move", { id: tg.id, index: at }]] : []),
-        ...(down ? [["Move down", "space.move", { id: tg.id, index: at + 2 }]] : []),
-        ...(git ? [["New worktree", "worktree", { space: tg.id, action: "new" }], ["Open worktree", "worktree", { space: tg.id, action: "open" }]] : []),
-        ...(git === "linked" ? [["Remove worktree", "worktree", { space: tg.id, action: "remove" }]] : []),
-        ["Close space…", "space.close", { id: tg.id }],
+        ["Change Color…", "space.color-menu", { id: tg.id }],
+        ["New Tab Here", "tab.new", { space: tg.id }],
+        ["Copy Link to Space", "copy-space-link", { id: tg.id }],
+        ...(up ? [["Move Up", "space.move", { id: tg.id, index: at }]] : []),
+        ...(down ? [["Move Down", "space.move", { id: tg.id, index: at + 2 }]] : []),
+        ...(git ? [["New Worktree", "worktree", { space: tg.id, action: "new" }], ["Open Worktree", "worktree", { space: tg.id, action: "open" }]] : []),
+        ...(git === "linked" ? [["Remove Worktree", "worktree", { space: tg.id, action: "remove" }]] : []),
+        ["Close Space…", "space.close", { id: tg.id }],
       ];
     }
     case "space-color":
@@ -91,17 +91,18 @@ function items(p, git) {
       const quiet = a && a.status !== "working" && a.status !== "blocked";
       return [
         ["Focus", "pane.focus", { pane: a?.pane ?? tg.pane }],
-        ["Copy link to agent", "copy-link", { terminal: tg.terminal }],
+        ["Copy Link to Agent", "copy-link", { terminal: tg.terminal }],
         ["Rename…", "tab.rename", { id: a?.tab ?? tg.tab }],
-        a?.pinned ? ["Unpin", "terminal.pin", { terminal: tg.terminal, pinned: false }] : ["Pin to top", "terminal.pin", { terminal: tg.terminal, pinned: true }],
+        a?.pinned ? ["Unpin", "terminal.pin", { terminal: tg.terminal, pinned: false }] : ["Pin to Top", "terminal.pin", { terminal: tg.terminal, pinned: true }],
         ...(quiet ? [["Close…", "agent.close", { terminal: tg.terminal }]] : []),
       ];
     }
     case "machine": {
       // Right-click on a machine heading in the Spaces list: tg = { key (fold key), machine (name | null | absent), online }.
+      // An offline machine keeps New space here as a disabled row (a 4th item field of false), same size; hosts have none.
       const folded = (shared("machines.folded") ?? []).includes(tg.key);
       return [
-        ...(tg.online && tg.machine !== undefined ? [["New space here", "space.new", tg.machine ? { machine: tg.machine } : {}]] : []),
+        ...(tg.machine !== undefined ? [["New Space Here", "space.new", tg.machine ? { machine: tg.machine } : {}, tg.online !== false]] : []),
         [folded ? "Expand" : "Collapse", "machine.fold", { key: tg.key }],
       ];
     }
@@ -110,15 +111,15 @@ function items(p, git) {
       return sideMenuItems(tg);
     case "sidebar":
       // Checkable toggles for the left sidebar's sections.
-      return [[isCollapsed() ? "Expand sidebar" : "Collapse sidebar", "sidebar.collapse", {}], ["Spaces", "sidebar.toggle", { key: "spaces" }], ["Agents", "sidebar.toggle", { key: "agents" }], ["Status bar", "sidebar.toggle", { key: "statusBar" }], ["Add machine…", "machine.add", {}]]   // an action, not a switch (Ethan: "add machine here should not be a toggle");
+      return [[isCollapsed() ? "Expand Sidebar" : "Collapse Sidebar", "sidebar.collapse", {}], ["Spaces", "sidebar.toggle", { key: "spaces" }], ["Agents", "sidebar.toggle", { key: "agents" }], ["Status Bar", "sidebar.toggle", { key: "statusBar" }], ["Add Machine…", "machine.add", {}]]   // an action, not a switch (Ethan: "add machine here should not be a toggle");
     default:
       return [
-        ["New space", "space.new", {}],
+        ["New Space", "space.new", {}],
         ["Keybinds", "app.help", {}],
-        ["Theme: graphite", "app.theme", { name: "graphite" }],
-        ["Theme: ink", "app.theme", { name: "ink" }],
-        ["Theme: moss", "app.theme", { name: "moss" }],
-        ["Theme: atom one dark", "app.theme", { name: "atom-one-dark" }],
+        ["Theme: Graphite", "app.theme", { name: "graphite" }],
+        ["Theme: Ink", "app.theme", { name: "ink" }],
+        ["Theme: Moss", "app.theme", { name: "moss" }],
+        ["Theme: Atom One Dark", "app.theme", { name: "atom-one-dark" }],
       ];
   }
 }
@@ -142,7 +143,6 @@ export const LABEL_H = 30;
 function menuIcon(command, args) {
   if (command === "pane.split") return icon(args?.direction === "down" ? "split-down" : "split-right");
   if (command === "pane.zoom") return icon("zoom");
-  if (command === "turn-into") return icon("turn-into");
   if (command === "copy-link" || command === "copy-tab-link" || command === "copy-space-link") return icon("link");
   if (command === "space.select" || command === "pane.focus") return icon("spaces");
   if (command === "space.color-menu") return icon("theme");
@@ -220,7 +220,7 @@ export default class Menu {
 
   choose(i, cx) {
     const it = items(props(), this.git)[i];
-    if (!it) return;
+    if (!it || it[3] === false) return;   // a disabled row does nothing
     // A switch flips in place and the menu stays open; the last list on can't be switched off (the click does nothing).
     if (it[1] === "sidebar.toggle") { toggleFromClick(it[2].key); return cx?.notify?.(); }
     if (it[1] === "sidebar.collapse") { closeOverlay(props()?.overlay); return toggleSidebar(); }
@@ -237,12 +237,11 @@ export default class Menu {
     }
     if (it[1] === "copy-space-link") return copySpaceLink(it[2]);
     if (it[1] === "worktree") openOverlay({ mod: "worktree", kind: "dialog", ...(it[2].action === "open" ? { width: 560, height: 480 } : { width: 440, height: 260 }), props: it[2] });
-    // Splits open their new pane as the New panel; Turn into opens one beside the pane, which replaces it.
+    // Splits open their new pane as the New panel.
     else if (it[1] === "pane.split") run("pane.split", { ...it[2], mod: SELF, props: { role: "new-panel", direction: it[2].direction } });
     else if (it[1].startsWith("side.")) runSideAction(it[1], it[2]);
     else if (it[1] === "copy-link") copyLink(it[2]);
     else if (it[1] === "copy-tab-link") copyTabLink(it[2]);
-    else if (it[1] === "turn-into") run("pane.split", { direction: "right", pane: it[2].pane, mod: SELF, props: { role: "new-panel", direction: "right", replace: it[2].pane } });
     else run(it[1], it[2]);
   }
 
@@ -250,6 +249,10 @@ export default class Menu {
     const t = theme();
     const list = items(props(), this.git);
     if (this.at >= list.length) this.at = 0;
+    // The highlight never rests on a disabled row (arrows step over it).
+    const live = (i) => list[i]?.[3] !== false;
+    if (!live(this.at)) { const k = list.findIndex((_, i) => live(i)); if (k >= 0) this.at = k; }
+    const step = (d) => { for (let n = 1; n <= list.length; n++) { const k = (this.at + d * n + list.length * n) % list.length; if (live(k)) return k; } return this.at; };
     const breaks = list.filter((_, i) => breaksBefore(list, i)).length;
     const label = props()?.tab === "sidebar" ? "Show" : null;   // the + menu's small group label, for the toggles menu
     // Same look as the + menu: 32px rows, 16px line icon, name, faint shortcut; one highlight that follows
@@ -262,8 +265,8 @@ export default class Menu {
       .p(4)
       .bg(t.popover)
       .on_key_down((e, cx) => {
-        if (e.key === "down") this.at = (this.at + 1) % list.length;
-        else if (e.key === "up") this.at = (this.at + list.length - 1) % list.length;
+        if (e.key === "down") this.at = step(1);
+        else if (e.key === "up") this.at = step(-1);
         else if (e.key === "enter") this.choose(this.at, cx);
         else if (e.key === "escape") closeOverlay(props().overlay);
         else return;
@@ -278,8 +281,8 @@ export default class Menu {
               t, id: `mi-${i}`,
               // Show / hide rows (shadcn DropdownMenuCheckboxItem, no switches in menus): a clear check on the right when
               // on, the row's icon dimmed when off.
-              icon: it[1] === "space.color" ? div().size(12).rounded(6).bg(SPACE_COLORS[it[2].color][1]) : svg(menuIcon(it[1], it[2])).size(16).when(it[1] === "sidebar.toggle" && !sections()[it[2].key], (el) => el.text_color(t.dim)),
-              name: it[0], active: i === this.at,
+              icon: it[1] === "space.color" ? div().size(12).rounded(6).bg(SPACE_COLORS[it[2].color][1]) : svg(menuIcon(it[1], it[2])).size(16).when((it[1] === "sidebar.toggle" && !sections()[it[2].key]) || !live(i), (el) => el.text_color(t.dim)),
+              name: it[0], active: i === this.at && live(i), enabled: live(i),
               // A toggle shows its state as a check on the right, where other menus show a shortcut.
               hint: it[1] === "space.color" ? (((shared("space.colors") ?? {})[it[2].id] ?? "ansi6") === it[2].color ? svg(icon("check")).size(14).text_color(t.foreground) : "") : it[1] === "sidebar.collapse" ? shortcut(`${SELF}.toggle-sidebar`) : it[1] === "sidebar.toggle" ? (sections()[it[2].key] ? svg(icon("check")).size(14).text_color(t.foreground).when(sectionLocked(sections(), it[2].key), (el) => el.tooltip("At least one list stays on")) : "") : shortcut(it[1], it[2]),
               onClick: (_e, cx) => this.choose(i, cx),

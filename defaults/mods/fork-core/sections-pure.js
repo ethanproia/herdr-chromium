@@ -1,4 +1,7 @@
 // Pure helpers for the left sidebar's sections (no host imports; tested by test-sections.mjs).
+// A drag reports a live width while the layout file still holds the pre-drag size. layout.set of that tree
+// snaps the sidebar back. True once the file has caught up (or it has no px to be stale).
+export const sidebarWidthSettled = (filePx, livePx) => typeof filePx !== "number" || Math.abs(filePx - livePx) <= 1;
 // menuHeight is pure.js's: 8 + rows * 32 + breaks * 9.
 export const menuHeight = (rows, breaks) => 8 + rows * 32 + breaks * 9;
 
@@ -50,4 +53,28 @@ export function sectionsPlan(sections, state) {
     if (state.footerPx !== px) cmds.push(["layout.resize", { id: "sidebar-footer", px }]);
   }
   return cmds;
+}
+
+// The rail is 44px (min = max); the open sidebar drags 200–480, with a 46px top row and resizable lists.
+// Pending means the width has crossed into a state whose other rules are not applied yet. A width change that
+// already wrote min/max (the rail's Expand) is still pending until lists, the top row, and a pixel Spaces split match.
+const RAIL_PX = 44, OPEN_MIN = 200, OPEN_MAX = 480, BRAND_OPEN = 46;
+function findNode(node, id) {
+  if (node?.id === id) return node;
+  for (const child of node?.children ?? []) { const f = findNode(child, id); if (f) return f; }
+  return null;
+}
+export function sidebarRulesPending(tree, collapsed) {
+  const bar = findNode(tree, "sidebar");
+  if (!bar) return false;
+  const lists = findNode(tree, "sidebar-lists"), brand = findNode(tree, "brand"), sp = findNode(tree, "spaces");
+  if (collapsed) {
+    return bar.min !== RAIL_PX || bar.max !== RAIL_PX
+      || (lists != null && lists.resizable !== false)
+      || (brand != null && brand.size?.px !== RAIL_PX);
+  }
+  return bar.min !== OPEN_MIN || bar.max !== OPEN_MAX
+    || (lists != null && lists.resizable !== true)
+    || (brand != null && brand.size?.px !== BRAND_OPEN)
+    || Boolean(sp?.size?.px);
 }

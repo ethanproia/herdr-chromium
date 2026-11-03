@@ -4837,8 +4837,34 @@ function resizeHandleBox(box, handle, p3, lock, min = MIN_IMAGE) {
 var rotateAbout = (p3, c3, a2) => ({ x: c3.x + (p3.x - c3.x) * Math.cos(a2) - (p3.y - c3.y) * Math.sin(a2), y: c3.y + (p3.x - c3.x) * Math.sin(a2) + (p3.y - c3.y) * Math.cos(a2) });
 function elementCenter(el, elementsMap) {
   if (el.center) return el.center;
+  if ((el.type === "arrow" || el.type === "line") && el.roundness && el.points?.length >= 2 && !be2.get(el)) {
+    try {
+      be2.generateElementShape(el, null);
+    } catch {
+    }
+  }
   const [, , , , cx, cy] = H(el, elementsMap);
   return { x: cx, y: cy };
+}
+function handleSnap(el, elementsMap) {
+  return {
+    x: el.x,
+    y: el.y,
+    width: el.width,
+    height: el.height,
+    angle: el.angle ?? 0,
+    type: el.type,
+    points: el.points?.map((q3) => [...q3]),
+    customData: el.customData,
+    center: elementCenter(el, elementsMap),
+    roundness: el.roundness,
+    roughness: el.roughness,
+    seed: el.seed,
+    strokeStyle: el.strokeStyle,
+    strokeColor: el.strokeColor,
+    backgroundColor: el.backgroundColor,
+    fillStyle: el.fillStyle
+  };
 }
 function rotateElement(el, pivot, angle, elementsMap) {
   const c3 = elementCenter(el, elementsMap);
@@ -6952,7 +6978,7 @@ var Board = class extends View {
     const map = this.map();
     const snap = new Map(ids.map((id) => {
       const el = map.get(id);
-      return [id, { x: el.x, y: el.y, width: el.width, height: el.height, angle: el.angle ?? 0, type: el.type, points: el.points?.map((q3) => [...q3]), customData: el.customData, center: elementCenter(el, map) }];
+      return [id, handleSnap(el, map)];
     }));
     if (hd2.kind === "rotate") {
       const b2 = hd2.sb.box, center = { x: b2.x + b2.width / 2, y: b2.y + b2.height / 2 };

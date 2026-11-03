@@ -5,12 +5,12 @@
 // (registry). Props from the app: { pane, terminal }. Click: focus the pane.
 import { div, svg, image } from "gpui-kit";
 import { h_flex } from "gpui-base";
-import { panes, agents, props, run, theme, home, shared, setShared, openOverlay, watchFolder, appHome } from "herdr";
+import { panes, agents, props, run, theme, home, shared, openOverlay } from "herdr";
 import { SELF } from "../self.js";
 import { fadeLabel, over } from "../scroll.js";
-import { icon, registryIO, runCopy, openRegistry } from "../look.js";
-import { createRegistry, normalizeTool } from "../registry.js";
-import { copyPlan } from "../pure.js";
+import { icon, runCopy, runHeaderAction, openRegistry, watchRegistry, REGISTRY_WAKE } from "../look.js";
+import { normalizeTool, FALLBACKS } from "../registry.js";
+import { copyPlan, copySpecFor, headerDirPath, headerMenuEntries, menuHeight, toolHeaderElId } from "../pure.js";
 
 // "remote-desktop" -> "Remote desktop", "fork-browser" -> "Browser".
 export const properName = (mod) => { const m = String(mod).replace(/^fork-/, "").replace(/[-_]+/g, " ").trim(); return m.charAt(0).toUpperCase() + m.slice(1); };
@@ -20,28 +20,14 @@ function progIcon(p, size, color) {
   return p.tint ? svg(p.icon).size(size).flex_none().text_color(color) : image(p.icon).size(size).flex_none();
 }
 
-// The Notepad as it was before it shipped its own tool.json: used only while no descriptor names that folder.
-// (Keys are plain folder names; the fork's rename "fork-" prefix is covered.)
-const NOTEPAD_BUILTIN = {
-  id: "notepad", name: "Notepad", icon: "note.svg",
-  open: { mod: "." }, places: ["tab", "split", "pane", "side"],
-  header: [
-    { id: "md", icon: "md.svg", label: "Markdown", action: { toggleShared: "notepad.md" } },
-    { id: "export", icon: "export.svg", label: "Export…", action: { openPopup: { props: { export: true }, width: 220, height: 176 } } },
-  ],
-  copy: { copyFile: { dirShared: "notepad.dir", file: "notepad.md", stripFrontmatter: true } },
-};
-const builtinFor = (mod) => (/^(?:fork-)?notepad$/.test(mod ?? "") ? normalizeTool(NOTEPAD_BUILTIN, mod, { self: SELF }) : null);
+// Same stand-in the registry uses (FALLBACKS), so header buttons match before and after the scan.
+// Folder names only: the fork's "fork-" prefix is covered; other mods get no stand-in.
+const builtinFor = (mod) => (/^(?:fork-)?notepad$/.test(mod ?? "") ? normalizeTool(FALLBACKS.notepad, mod, { self: SELF }) : null);
 
 function folder(cwd) {
   if (!cwd) return "";
   const h = home();
   return cwd === h ? "~" : cwd.startsWith(h + "/") ? "~" + cwd.slice(h.length) : cwd;
-}
-
-function parentDir(path) {
-  const i = path.lastIndexOf("/");
-  return i > 0 ? path.slice(0, i) : "";
 }
 
 // A file viewer is the notepad-view mod. PaneInfo has no props, so the path comes from
@@ -60,21 +46,10 @@ export default class PaneHeader {
   init(_p, cx) {
     this.hovered = false; this.w = 9999; this.copied = false;
     this.reg = openRegistry();
-    const reload = (cx) => cx.spawn(async (cx) => {
-      if (await this.reg.refresh()) {
-        if (this.reg.errors.length) console.log(`core pane-header: skipped ${this.reg.errors.join("; ")}`);
-        cx.notify();
-      }
-    });
-    reload(cx);
-    cx.timer.every(30000, reload);   // fallback; the folder watch below is the fast path
-    cx.spawn(async (cx) => {
-      for (;;) {
-        try { await watchFolder(`${appHome()}/mods`); } catch { return; }
-        reload(cx);
-      }
-    });
+    this.stopRegistry = watchRegistry(cx);
   }
+
+  close() { this.stopRegistry?.(); this.stopRegistry = null; }
 
   me() {
     return panes().find((p) => p.pane === props()?.pane);
@@ -117,18 +92,17 @@ export default class PaneHeader {
       .child(svg(ico.includes("/") ? ico : icon(ico)).size(14));
   }
 
-  // One of a tool's own header buttons (typed actions only).
+  // One of a tool's own header buttons (typed actions only). The narrow menu runs this same helper.
   toolButton(t, tool, h, pane) {
     const a = h.action;
     const lit = a.toggleShared && shared(a.toggleShared) === true;
-    const act = a.toggleShared ? () => setShared(a.toggleShared, shared(a.toggleShared) !== true)
-      : a.runCommand ? () => run(a.runCommand.name, { pane, ...a.runCommand.args })
-      : () => openOverlay({ mod: tool.open.mod, kind: "popup", props: a.openPopup.props, width: a.openPopup.width ?? 220, height: a.openPopup.height });
-    return this.button(t, `ph-${h.id}-${pane}`, h.icon ?? icon("plus"), null, null, act).when(lit, (b) => b.text_color(t.foreground));
+    return this.button(t, toolHeaderElId(h.id, pane), h.icon ?? icon("plus"), null, null,
+      () => runHeaderAction(a, { pane, mod: tool.open?.mod })).when(lit, (b) => b.text_color(t.foreground));
   }
 
   render(cx) {
     const t = theme();
+    shared(REGISTRY_WAKE);   // the shared registry watcher bumps this; every header redraws from the one copy
     const p = this.me();
     if (!p) return div();
     const clean = (p.title || "").replace(/^[^\p{L}\p{N}]+/u, "").trim();
@@ -144,11 +118,14 @@ export default class PaneHeader {
       : p.mod === SELF ? { name: "New panel", icon: icon("panel"), folder: "" }
       : tool ? { name: tool.name, icon: tool.icon }
       : p.mod ? { name: properName(p.mod), icon: icon("panel") } : null;   // a mod with no descriptor: still named + iconed
-    const isNote = Boolean(tool?.header.length);     // a tool with its own header buttons (the Notepad)
-    const notesDir = tool?.copy?.copyFile?.dirShared ? shared(tool.copy.copyFile.dirShared) : null;
-    const dirLabel = isViewer ? folder(viewPath ? parentDir(viewPath) : "")
-      : isNote ? folder(typeof notesDir === "string" ? notesDir : "")
-      : (head?.folder ?? folder(p.cwd));
+    // The notes folder comes from copyFile.dirShared. Header buttons do not make a pane a Notepad,
+    // so a plugin with buttons and no shared dir still shows the pane's cwd.
+    const dirKey = tool?.copy?.copyFile?.dirShared;
+    const dirLabel = folder(headerDirPath({
+      isViewer, viewPath, dirShared: dirKey,
+      sharedDir: typeof dirKey === "string" && dirKey ? shared(dirKey) : undefined,
+      explicit: head?.folder, cwd: p.cwd,
+    }));
     const links = shared("notepad.links");
     const backlinks = Array.isArray(links) ? links.filter((h) => (p.terminal && h === `herdr:agent/${p.terminal}`) || h === `herdr:tab/${p.tab}`) : [];
     const noteMod = this.reg.tools.find((x) => x.id === "notepad")?.open.mod ?? builtinFor("notepad").open.mod;
@@ -160,9 +137,12 @@ export default class PaneHeader {
     // Narrow panes: the title shrinks, fading out at its edge (min 48px) and the folder text goes first; a mod's own buttons
     // fold into one ••• button; only then stock buttons drop, close last. Nothing overlaps.
     const BTN = 20, GAP = 8;
-    const copySrc = copyPlan({ terminal: p.terminal, copy: tool?.copy, viewPath }, shared);
-    const own = isNote ? tool.header : [];
-    const extras = own.length + (copySrc ? 1 : 0);
+    // A mod tool's copy spec (copyFile or copyTerminal) wins. A bare terminal uses the terminal
+    // tool's copyTerminal when the registry has one; with no spec, copyPlan still copies the address.
+    const copySrc = copyPlan({ terminal: p.terminal, copy: copySpecFor(p, tool?.copy, this.reg.tools), viewPath }, shared);
+    const own = tool?.header?.length ? tool.header : [];
+    const folded = headerMenuEntries(own, copySrc);
+    const extras = folded.length;
     const room = this.w - 20 - (pic ? 14 + GAP : 0) - 48 - GAP - (st && st !== "idle" ? 20 : 0);
     const fits = (n) => n * BTN + Math.max(0, n - 1) * GAP;
     const fold = extras > 0 && room < fits(4 + extras);
@@ -187,7 +167,7 @@ export default class PaneHeader {
       .on_hover((hovered, cx) => { this.hovered = hovered; cx.notify(); })
       .on_size_change((size, cx) => { if (Math.abs(size.width - this.w) > 1) { this.w = size.width; cx.notify(); } })
       .on_click(() => run("pane.focus", { pane }))
-      // Right-click the header: the pane menu (Split, Turn into, Copy link to panel, Zoom, Close). Inside a
+      // Right-click the header: the pane menu (Split, Copy link to panel, Zoom, Close). Inside a
       // terminal the program usually gets right-clicks, so the header is the reliable place for it.
       .on_mouse_down("right", (_e, cx) => {
         cx.stop_propagation();
@@ -204,9 +184,10 @@ export default class PaneHeader {
       .when(st === "working", (el) => el.child(svg("mods/workspace-chrome/spinner.svg").size(12).flex_none().text_color(t.working).spin(900)))
       .when(st === "blocked", (el) => el.child(div().flex_none().px(6).h(18).flex().items_center().rounded(5).bg(t.blocked + "26").text_size(10.5).font_semibold().text_color(t.blocked).child("Needs you")))
       .when(st === "done", (el) => el.child(div().size(7).flex_none().rounded(4).bg(t.done)))
-      // Narrow: the tool's own buttons fold into one ••• (the Notepad's header-menu popup gets { headerMenu, note, copy }).
+      // Narrow: Copy and the tool's own buttons fold into one •••. Core draws that menu and runs the
+      // same typed actions as the wide buttons (any tool, not only the Notepad).
       .when(this.hovered && fold, (el) => el.child(this.button(t, `ph-more-${pane}`, "more", null, null,
-        () => openOverlay({ mod: tool?.open.mod ?? noteMod, kind: "popup", props: { headerMenu: true, note: isNote, copy: copySrc }, width: 200, height: 8 + 32 * (own.length + (copySrc ? 1 : 0)) }))))
+        () => openOverlay({ mod: SELF, kind: "popup", props: { role: "header-menu", pane, mod: tool?.open?.mod, copy: copySrc, items: own }, width: 200, height: menuHeight(folded.length, 0) }))))
       // Copy the whole pane (a check shows for a moment after it lands, and only then).
       .when(this.hovered && !fold && Boolean(copySrc), (el) => el.child(this.button(t, `ph-cp-${pane}`, this.copied ? "check" : "copy", null, null, (cx) => this.copy(copySrc, cx))
         .when(this.copied, (b) => b.text_color(t.foreground))))

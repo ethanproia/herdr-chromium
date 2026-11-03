@@ -113,7 +113,7 @@ export function withSideStrip(tree, mod = "core") {
 export function sideMenuRows(id, pinned) {
   return [
     [pinned ? "Unpin" : "Pin", pinned ? "side.unpin" : "side.pin", { tool: id }],
-    ["Open as tab", "side.tab", { tool: id }],
+    ["Open as Tab", "side.tab", { tool: id }],
     ["Close", "side.close", { tool: id }],
   ];
 }

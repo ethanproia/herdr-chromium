@@ -7,6 +7,7 @@ import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { spaces, machines, panes, run, openOverlay, exec, hc, theme, shared, setShared, watchFolder, window, layout, settings } from "herdr";
 import { labelOf, groupByHost } from "./hosts.js";
+import { railFitPx } from "./rail.js";
 import { scroller, fadeLabel, over, tint } from "./scroll.js";
 // With the fork's "glass" setting the sidebar's layout background draws translucent over a blurred window; painting
 // our own opaque chrome here would hide it, so sidebar roots leave the background to the layout then.
@@ -37,14 +38,20 @@ function find(node, id) {
 }
 
 // The sidebar's rail goes by its width, not a flag: dragging its edge narrows it too.
-// Back to the width the sidebar had (core's sidebar-header does the same for its own button).
-// The rail is pinned min = max = 44 (core), so expanding also lifts the limits back to the open sidebar's 200-480;
-// core's sidebar-header finishes the rest of the open state when it sees the width change.
+// The whole open state in one layout.set, the same rules as core's applySidebarState(false): drag limits 200–480,
+// lists resizable, the top row 46px, and Spaces given back the split the rail replaced with a pixel height.
 function expandSidebar() {
-  setShared("sidebar.collapsed", false);
-  const tree = JSON.parse(JSON.stringify(layout())), bar = find(tree, "sidebar");
+  const tree = JSON.parse(JSON.stringify(layout()));
+  const bar = find(tree, "sidebar"), lists = find(tree, "sidebar-lists"), brand = find(tree, "brand"), sp = find(tree, "spaces");
   if (!bar) return;
-  bar.min = 200; bar.max = 480; bar.size = { px: Math.min(480, Math.max(200, shared("sidebar.width") ?? 268)) };
+  const px = Math.min(480, Math.max(200, bar.size?.px >= 200 ? bar.size.px : (shared("sidebar.width") ?? 268)));
+  bar.size = { px };
+  bar.min = 200;
+  bar.max = 480;
+  if (lists) lists.resizable = true;
+  if (brand) brand.size = { px: 46 };
+  if (sp && sp.size?.px) sp.size = shared("sidebar.spacesSize") ?? { weight: 1 };
+  setShared("sidebar.collapsed", false);
   run("layout.set", { layout: tree });
 }
 const narrow = () => (find(layout(), "sidebar")?.size?.px ?? Infinity) < 160;
@@ -114,14 +121,19 @@ export default class Spaces extends View {
 
   // Looks for work after a change: git to refresh, colors to assign, and when a new space may be shown.
   // Redraws only for a deadline (below); a changed git answer redraws through refreshGit.
-  // Rail: the Spaces section is as tall as its tiles (Ethan: "this is still scrollable in rail view"), Agents gets the
-  // rest. Only while Agents is shown; the open sidebar gets its own sizes back from the core (sidebar-header).
+  // Rail: the Spaces section is as tall as its tiles plus any row stacked in that same section (the Expand
+  // button on windowed macOS). Tiles alone leave the scroller short by that row, so the rail still scrolls
+  // (Ethan: "this is still scrollable in rail view"). Agents gets the rest. Only while Agents is shown; the
+  // open sidebar gets its own sizes back from the core (sidebar-header).
   fitRail() {
     const l = layout(), sp = find(l, "spaces"), ag = find(l, "agents");
     if (!narrow() || !sp || !ag || ag.hidden) return;
-    const content = this._scroll?.rail?.content;
-    if (!(content > 0)) return;
-    const want = Math.ceil(content);
+    const want = railFitPx({
+      content: this._scroll?.rail?.content,
+      chrome: this._railChrome,
+      macWindowed: window()?.platform === "macos" && !window()?.fullscreen,
+    });
+    if (want == null) return;
     if (sp.size?.px !== want) run("layout.resize", { id: "spaces", px: want });
   }
 
@@ -335,15 +347,19 @@ export default class Spaces extends View {
   }
 
   // The right-hand controls column: four fixed slots, right-aligned, always all four wide (an absent one is blank), so
-  // it lines up on every heading. o = { id, remote (machine name or null), add (machine name | null | undefined = none), dot, folded, chevron }
+  // it lines up on every heading. o = { id, remote (machine name or null), add (machine name | null | undefined = none),
+  // addOff (the machine is offline: + shows disabled), dot, folded, chevron }
   controls(t, o) {
     const slot = (w, el) => div().w(w).h(20).flex_none().flex().items_center().justify_center().child(el ?? "");
     const btn = (id, w, label, action) => div().id(id).w(w).h(20).flex_none().flex().items_center().justify_center().rounded(4).text_color(t.dim)
       .hover(s => s.bg(t.raised).text_color(t.foreground)).on_click((_e, cx) => { cx.stop_propagation(); action(); }).child(label);
-    // A disconnected machine has no > or +: those slots stay blank (the heading dims instead of saying why).
+    // A disconnected machine has no >; its + stays in the slot but disabled (Ethan: "the new space option should also be
+    // disabled/greyed out"): faded, no hover, no action, "Offline" on hover. The click stops here so it doesn't fold.
     return h_flex().flex_none().items_center()
       .child(o.remote ? btn(`machine-remote-${o.remote}`, SLOT.remote, ">", () => run("tab.new", { name: `${o.remote} desktop`, mod: "remote-desktop", props: { id: `rd${Date.now().toString(36)}`, machine: o.remote } })) : slot(SLOT.remote))
-      .child(o.add !== undefined ? btn(`machine-add-${o.add ?? "local"}`, SLOT.add, "+", () => run("space.new", o.add ? { machine: o.add } : {})) : slot(SLOT.add))
+      .child(o.add !== undefined && o.addOff ? div().id(`machine-add-${o.add ?? "local"}`).w(SLOT.add).h(20).flex_none().flex().items_center().justify_center()
+        .text_color(t.dim).opacity(0.4).tooltip("Offline").on_click((_e, cx) => cx.stop_propagation()).child("+")
+        : o.add !== undefined ? btn(`machine-add-${o.add ?? "local"}`, SLOT.add, "+", () => run("space.new", o.add ? { machine: o.add } : {})) : slot(SLOT.add))
       .child(slot(SLOT.dot, o.dot ? div().size(6).rounded(3).bg(o.dot) : null))
       .child(slot(SLOT.chev, svg(`mods/workspace-chrome/chevron-${o.folded ? "right" : "down"}.svg`).size(11).flex_none().text_color(t.dim)));
   }
@@ -385,7 +401,7 @@ export default class Spaces extends View {
     const empty = m => h_flex().id(`machine-new-${m ?? "local"}`).h(28).flex_none().px(8).gap(7).items_center().rounded(7)
       .text_size(12).text_color(t.dim).hover(s => s.bg(t.hover).text_color(t.foreground))
       .on_click(() => run("space.new", m ? { machine: m } : {}))
-      .child(svg("mods/workspace-chrome/plus.svg").size(12)).when(!collapsed, el => el.child("New space there"));
+      .child(svg("mods/workspace-chrome/plus.svg").size(12)).when(!collapsed, el => el.child("New Space There"));
     const out = [];
     let nest = null;   // the open host box: its heading's key, and the rows collected into it
     const flush = () => { if (nest && !nest.skip) { out.push(this.nest(t, `host-box-${nest.h}`, IND.host, nest.kids)); } nest = null; };
@@ -406,7 +422,7 @@ export default class Spaces extends View {
       const connected = !m || machine?.state === "connected";
       const folded = this.folded.has(m);
       const tip = connected ? null : offlineTip(machine);
-      const ctl = this.controls(t, { remote: connected && m ? m : null, add: connected ? (m ?? null) : undefined, dot: connected ? t.ansi2 : t.dim, folded });
+      const ctl = this.controls(t, { remote: connected && m ? m : null, add: m ?? null, addOff: !connected, dot: connected ? t.ansi2 : t.dim, folded });
       if (host) {
         // A host's user: under its host's guide, its spaces under its own (hidden with a folded host heading).
         if (!nest || nest.h !== host) { flush(); nest = { h: host, kids: [] }; }
@@ -562,7 +578,9 @@ export default class Spaces extends View {
         .child(svg(`mods/workspace-chrome/${ic}.svg`).size(15));
       return v_flex().size_full().min_h(0).when(!glassOn(), (el) => el.bg(t.chrome)).items_center().text_size(13)
         // The sidebar button lives in the top bar; only a windowed macOS (traffic lights in that row) shows it here.
-        .when(window()?.platform === "macos" && !window()?.fullscreen, (el) => el.child(div().pt(2).pb(4).flex_none().child(ctl("rail-expand", "sidebar", "Expand sidebar", () => expandSidebar()))))
+        .when(window()?.platform === "macos" && !window()?.fullscreen, (el) => el.child(div().pt(2).pb(4).flex_none()
+          .on_size_change((z, cx) => { if (z.height !== this._railChrome) { this._railChrome = z.height; cx.notify(); } })
+          .child(ctl("rail-expand", "sidebar", "Expand Sidebar", () => expandSidebar()))))
         .child(scroller(this, "rail", { id: "spaces-rail", bg: t.chrome, children: this.rail(t),   // just the spaces; search and settings are the sidebar footer (core), the true bottom
           outer: (el) => el.flex_1().min_h(0).w_full()
             .on_mouse_down("right", () => openSectionsMenu())
