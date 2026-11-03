@@ -43,6 +43,23 @@ impl Blitter {
         Ok(())
     }
 
+    /// Copy `src` into every surface in `dsts` (all BGRA, `w` x `h`) in one command buffer and wait
+    /// once: a page frame needs both the kept view and the outgoing pool surface, and two
+    /// separately awaited copies of a 6K frame cost two GPU round trips on CEF's thread.
+    pub fn copy_to_all(&self, src: *mut c_void, dsts: &[*mut c_void], w: usize, h: usize) -> Result<(), String> {
+        let s = self.texture(src, w, h).ok_or("cannot wrap CEF's IOSurface as a texture")?;
+        let cmd = self.queue.commandBuffer().ok_or("no command buffer")?;
+        let enc = cmd.blitCommandEncoder().ok_or("no blit encoder")?;
+        for &dst in dsts {
+            let d = self.texture(dst, w, h).ok_or("cannot wrap a destination IOSurface as a texture")?;
+            unsafe { enc.copyFromTexture_toTexture(&s, &d) };
+        }
+        enc.endEncoding();
+        cmd.commit();
+        cmd.waitUntilCompleted();
+        Ok(())
+    }
+
     /// Copy the `w` x `h` region at `from` in `src` (`ss` pixels) to `to` in `dst` (`ds` pixels).
     /// The caller clips the region to both surfaces.
     pub fn copy_region(&self, src: *mut c_void, ss: (usize, usize), from: (usize, usize), dst: *mut c_void, ds: (usize, usize), to: (usize, usize), w: usize, h: usize) -> Result<(), String> {
