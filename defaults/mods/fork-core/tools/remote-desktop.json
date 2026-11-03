@@ -1,0 +1,2 @@
+{ "id": "remote-desktop", "name": "Remote desktop", "group": "Tools", "icon": "remote.svg", "order": 4,
+  "open": { "mod": "remote-desktop", "props": { "id": "$unique:rd" } }, "places": ["tab"] }

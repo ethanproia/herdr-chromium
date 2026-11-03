@@ -50,8 +50,8 @@ out=$(R do mod.open --name fork-board)
 grep -q "turned off" <<<"$out" && ok "mod.open says turned off" || bad "mod.open when off: $out"
 out=$(R do tab.new '{"mod":"fork-board"}')
 grep -q "turned off" <<<"$out" && ok "tab.new says turned off" || bad "tab.new when off: $out"
-R do layout.switch --name fork >/dev/null
-R status | grep -q '"errors": \[\]' && ok "fork layout loads with board off" || bad "fork layout with board off"
+R do layout.switch --name labs >/dev/null
+R status | grep -q '"errors": \[\]' && ok "labs layout loads with board off" || bad "labs layout with board off"
 R shot /tmp/msk3-off.png >/dev/null
 python3 - "$root/home/settings.json" <<'E'
 import json, sys
