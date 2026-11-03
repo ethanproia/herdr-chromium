@@ -153,20 +153,22 @@ essexlabs/labs `projects/herdr-mods`; `defaults/bundled-mods.lock.json` pins
 each to a labs branch and commit (`"ship": false` holds one back). To update:
 re-pin the commit, run `scripts/sync-bundled-mods.py` (any labs clone with the
 commit: `LABS_GIT=<clone>`), commit `defaults/`. `--check` fails if
-`defaults/mods/fork-*` or `defaults/layouts/fork.json` drifted from the pins.
+`defaults/mods/fork-*` or `defaults/layouts/labs.json` drifted from the pins.
 
-The sync also writes the `fork` layout: `main` with Ethan's pane header
-(`fork-pane-browser`: split buttons open `fork-split-chooser`, Notepad's
-header menu) and his right-click menu (`"terminal_menu": "fork-menu-browser"`).
-Without pane-browser in the lockfile it derives `fork-pane` from the shipped
-`pane` instead. Pick it
-with `layout.switch fork`; `main` is unchanged.
+The sync also writes the `labs` layout (and its preview `labs.svg`) from the
+labs layout pinned under `"layout"` (Ethan's, `clones/mac/layouts/Labs.json`), with
+each bundled mod under its `fork-` name: `fork-core` serves the tab strip,
+pane header, right-click menu (`"terminal_menu": "fork-core"`), sidebar header
+and footer, side panel strip and status bar (hidden to start). It is the fork's
+default layout; a home still on the old name `fork` opens `labs`, and
+`layout.switch fork` reaches it too. `main` is unchanged.
 
-Bundled now: `fork-pane-browser`, `fork-menu-browser` (from labs
-`clones/mac/`), `fork-split-chooser`, `fork-notepad` (a tab; notes live in
+Bundled now: `fork-core` (with its tool descriptors in `tools/`),
+`fork-spaces-browser` and `fork-agents-named` (the sidebar, from labs
+`clones/mac/`), `fork-notepad` (a tab; notes live in
 `~/Notes`, the real home folder, not the Herdr home), `fork-board` (an
 overlay; `cmd-shift-y`, `ctrl-shift-y` elsewhere; runs `cp`, `mkdir`, `open`,
-`osascript`, `qlmanage`, `rm`, `sips`; cache in `data/herdr-board`). The new
+`osascript`, `qlmanage`, `rm`, `sh` (ffmpeg), `sips`; cache in `data/herdr-board`). The new
 menu has Notepad and Board rows. Their keys are in `defaults/keys*.json`, so
 only homes without a keys.json get them (existing homes add them by hand).
 `remote-desktop` is pinned but not shipped (it duplicates `browser.remote`).
