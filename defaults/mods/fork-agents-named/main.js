@@ -68,6 +68,9 @@ function icon(p, size, color) {
   return p.tint ? svg(p.icon).size(size).flex_none().text_color(color) : image(p.icon).w(size).h(size).flex_none();
 }
 
+// Sub-row geometry (px, inside the row): sub icon x, step per deeper level, level-1 guide x. NAME_MIN: a parent name keeps this much before its machine tag yields.
+const SUB_X = 33, SUB_STEP = 22, GUIDE_X = 16, NAME_MIN = 96;
+
 export default class Agents extends View {
   init(_props, cx) {
     if (props()?.sortMenu) return;
@@ -166,15 +169,9 @@ export default class Agents extends View {
   }
 
   // Live sub-agents of `addr`, depth first, each with the tree lines in front of it.
-  tree(all, addr, lead = []) {
+  tree(all, addr, depth = 1) {
     const kids = all.filter((k) => k.parent === addr && k.state === "live");
-    return kids.flatMap((k, i) => {
-      const last = i === kids.length - 1;
-      return [
-        { t: k, lines: [...lead, last ? "└" : "├"] },
-        ...this.tree(all, k.address, [...lead, last ? "" : "│"]),
-      ];
-    });
+    return kids.flatMap((k) => [{ t: k, depth }, ...this.tree(all, k.address, depth + 1)]);
   }
 
   subRow(t, s, shown, compact) {
@@ -182,9 +179,15 @@ export default class Agents extends View {
     const st = kidStatus(k, this.listed);
     const pic = icon(k.program, 14, t.foreground);
     const on = k.address === shown;
+    // shadcn SidebarMenuSub: one 1px guide (the divider token) per level. Level 1 sits at the parent icon's centre
+    // (row px 8 + icon 16 / 2 = 16) and its icon at the parent's name (8 + 16 + 9 = 33). Deeper levels step in by the
+    // sub icon + gap (14 + 8 = 22): guide at the parent sub icon's centre, icon at the parent sub name.
+    const iconX = (d) => SUB_X + SUB_STEP * (d - 1);
+    const guideX = (d) => (d === 1 ? GUIDE_X : iconX(d - 1) + 7);
     return h_flex()
       .id(`sub-${k.address}`)
-      .pl(39)
+      .relative()
+      .pl(iconX(s.depth))
       .pr(8)
       .rounded(8)
       .h(26)
@@ -200,9 +203,7 @@ export default class Agents extends View {
         cx.notify();
       })
       .on_click(() => this.peek(k.address))
-      .children(s.lines.map(l => div().self_start().mt(-4).w(9).h(17).mr(4).flex_none()
-        .when(Boolean(l), el => el.border_l(1.5).border_color(t.input))
-        .when(l === "└" || l === "├", el => el.border_b(1.5).rounded_bl(6))))
+      .children(Array.from({ length: s.depth }, (_, i) => div().absolute().top(0).bottom(0).left(guideX(i + 1)).w(1).bg(t.border)))
       .when(Boolean(pic), el => el.child(div().mr(8).child(pic)))
       .child(fadeLabel(this, `sub-${k.address}`, { text: k.name || k.template || k.program?.name || k.address,
         bg: over(t.chrome, this.hovered === k.address ? t.hover : on ? t.raised : null),   // what the row shows: hover wins over selected, as the host's hover style does
@@ -336,6 +337,7 @@ export default class Agents extends View {
       // Without a space header above (priority, pinned) the row names its space.
       const full = byPriority || isPinned;
       const name = full ? a.space_name || label(a) : more ?? (/^\d+$/.test(label(a)) ? a.program?.name || label(a) : label(a));
+      const rowBg = over(t.chrome, this.hovered === a.address ? t.hover : a.focused ? t.selected : null);
       return h_flex()
         .id(`ag-${a.address}`)
         .px(8)
@@ -364,9 +366,13 @@ export default class Agents extends View {
         // no "·" is ever left dangling; the machine tag, time and status keep fixed room and never overlap it
         // (Ethan: "this is not truncating properly").
         .child(fadeLabel(this, `ag-${a.address}`, { text: full && more ? `${name} \u00b7 ${more}` : name,
-          bg: over(t.chrome, this.hovered === a.address ? t.hover : a.focused ? t.selected : null),
-          style: (el) => el.text_color(idle ? t.muted : t.foreground) }))
-        .when(Boolean(machine), el => el.child(div().flex_none().text_size(10).text_color(t.dim).child(machine)))
+          bg: rowBg,
+          style: (el) => el.text_color(idle ? t.muted : t.foreground),
+          outer: (el) => el.flex_1().min_w(NAME_MIN) }))   // name takes all spare room and keeps NAME_MIN before anything else yields
+        // The machine tag is the first to give way: it may shrink (min 0) and fades out on its own when squeezed.
+        .when(Boolean(machine), el => el.child(fadeLabel(this, `mc-${a.address}`, { text: machine, bg: rowBg,
+          style: (el) => el.text_size(10).text_color(t.dim),
+          outer: (el) => el.flex_shrink(1).min_w(0) })))
         .when(subs.length > 0, el => el.child(fold(a, subs)))
         .when(this.hovered === a.address, el => el.child(pin))
         .when(this.hovered !== a.address && Boolean(when), el => el.child(div().flex_none().text_size(11).text_color(t.dim).child(duration(now - when))))
