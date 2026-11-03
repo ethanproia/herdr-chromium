@@ -204,6 +204,11 @@ impl BrowserInput {
         std::mem::take(&mut self.comment).text
     }
 
+    // HERDR: a pin's Edit (A9) opens the field holding its comment; marked text and undo start fresh.
+    pub fn set_comment(&mut self, text: &str) {
+        self.comment = CommentField { text: text.to_owned(), ..CommentField::default() };
+    }
+
     /// Everything the overlay owners were sent since the last call.
     pub fn take_overlay(&mut self) -> Vec<OverlayEvent> {
         std::mem::take(&mut self.overlay)
@@ -1109,6 +1114,18 @@ mod tests {
         with(cx, &block, |i| i.escape());
         cx.simulate_keystrokes("up");
         assert_eq!(rec.inputs().len(), 1, "in Browse the page gets its arrow");
+    }
+
+    #[test]
+    fn set_comment_opens_the_field_with_a_pins_text() {
+        let mut i = BrowserInput::new("b1".into(), Arc::new(Recording::default()));
+        assert!(i.enter(Owner::Pick) && i.enter(Owner::Comment));
+        i.set_comment("make it bigger");
+        assert_eq!(i.comment().text, "make it bigger");
+        i.comment.undo();
+        assert_eq!(i.comment().text, "make it bigger", "nothing to undo past the opened text");
+        i.comment.commit("!");
+        assert_eq!(i.take_comment(), "make it bigger!");
     }
 
     #[test]
