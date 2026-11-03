@@ -30,7 +30,7 @@ export default class SplitChooser extends View {
     return [
       ["terminal", svg("icons/shell.svg").size(16), "Terminal", {}],
       ["browser", svg("mods/browser/globe.svg").size(16), "Browser", { mod: "browser", props: { id: `b${Date.now().toString(36)}` } }],
-      ["notepad", svg("mods/notepad/note.svg").size(16), "Notepad", { mod: "notepad" }],
+      ["fork-notepad", svg("mods/fork-notepad/note.svg").size(16), "Notepad", { mod: "fork-notepad" }],
       ...this.agents.filter(a => a.installed).map(a =>
         [a.key, a.tint ? svg(a.icon).size(16).text_color(t.foreground) : image(a.icon).size(16), a.name, { argv: a.run }]),
     ];

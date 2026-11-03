@@ -1,0 +1,5 @@
+{
+  "mod:fork-notepad": {
+    "cmd-a": "fork-notepad.select-all"
+  }
+}

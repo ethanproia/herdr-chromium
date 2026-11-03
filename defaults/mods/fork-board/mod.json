@@ -1,0 +1,18 @@
+{
+  "place": "none",
+  "title": "Board",
+  "overlay": {
+    "kind": "popup",
+    "at": "top",
+    "offset": 40,
+    "width": 560,
+    "height": 0.7
+  },
+  "version": "0.1.0",
+  "source": {
+    "repo": "essexlabs/labs",
+    "branch": "ethan/herdr-board-mod",
+    "commit": "7cdbd7b14a4a2e7b7ae1de34856d9b32ef0521c4",
+    "path": "projects/herdr-mods/board/mods/board"
+  }
+}

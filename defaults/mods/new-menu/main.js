@@ -53,6 +53,8 @@ export default class NewMenu extends View {
       })
       .child(this.row("terminal", svg("icons/shell.svg").size(14), "Terminal", () => run("tab.new", { space: space?.id }), shortcut("tab.new")))
       .child(this.row("browser", div().w(14).child("◎"), "Browser", () => run("browser.new"), shortcut("browser.new")))
+      .child(this.row("fork-notepad", svg("mods/fork-notepad/note.svg").size(14), "Notepad", () => run("tab.new", { name: "Notepad", space: space?.id, mod: "fork-notepad" })))
+      .child(this.row("fork-board", svg("mods/fork-board/icons/rectangle.svg").size(14), "Board", () => run("mod.open", { name: "fork-board" }), shortcut("mod.open:fork-board")))
       .child(div().px(9).pt(8).pb(4).text_size(11).text_color(t.dim).child("Start an agent"))
       .child(v_flex().flex_1().min_h(0).overflow_y_scrollbar()
         .children(choices.map((a, i) => this.row(a.key, a.tint ? svg(a.icon).size(14).text_color(t.foreground) : image(a.icon).size(14), a.name,

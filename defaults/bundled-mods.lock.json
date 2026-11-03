@@ -1,19 +1,41 @@
 {
   "repo": "essexlabs/labs",
   "mods": {
-    "split-chooser": {
+    "board": {
+      "branch": "ethan/herdr-board-mod",
+      "commit": "7cdbd7b14a4a2e7b7ae1de34856d9b32ef0521c4",
+      "path": "projects/herdr-mods/board/mods/board",
+      "version": "0.1.0",
+      "pr": "essexlabs/labs#1280",
+      "exec": [
+        "cp",
+        "mkdir",
+        "open",
+        "osascript",
+        "qlmanage",
+        "rm",
+        "sips"
+      ]
+    },
+    "notepad": {
       "branch": "ethan/herdr-mods-notepad",
-      "commit": "20a397f64a3081cda546d9ef177ff160da1f7813",
-      "path": "projects/herdr-mods/split-chooser",
+      "commit": "2ae45e0063346b56f98e47211a9d3d7cc24da981",
+      "path": "projects/herdr-mods/notepad",
       "version": "0.1.0"
     },
     "remote-desktop": {
       "branch": "ethan/herdr-mods-notepad",
-      "commit": "20a397f64a3081cda546d9ef177ff160da1f7813",
+      "commit": "2ae45e0063346b56f98e47211a9d3d7cc24da981",
       "path": "projects/herdr-mods/remote-desktop/mod",
       "version": "0.1.0",
       "ship": false,
       "why": "duplicates the native browser.remote entry; held until Ethan picks one"
+    },
+    "split-chooser": {
+      "branch": "ethan/herdr-mods-notepad",
+      "commit": "2ae45e0063346b56f98e47211a9d3d7cc24da981",
+      "path": "projects/herdr-mods/split-chooser",
+      "version": "0.1.0"
     }
   }
 }
