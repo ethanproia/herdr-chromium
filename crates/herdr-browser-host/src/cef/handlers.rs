@@ -596,10 +596,46 @@ wrap_find_handler! {
     }
 
     impl FindHandler {
-        fn on_find_result(&self, _browser: Option<&mut Browser>, _identifier: ::std::os::raw::c_int, count: ::std::os::raw::c_int, _selection_rect: Option<&Rect>, active_match_ordinal: ::std::os::raw::c_int, final_update: ::std::os::raw::c_int) {
+        fn on_find_result(&self, _browser: Option<&mut Browser>, identifier: ::std::os::raw::c_int, count: ::std::os::raw::c_int, _selection_rect: Option<&Rect>, active_match_ordinal: ::std::os::raw::c_int, final_update: ::std::os::raw::c_int) {
+            if !FINDS.with_borrow_mut(|f| f.entry(self.id.clone()).or_default().current(identifier)) {
+                return;
+            }
             send(HostToApp::FindResult { id: self.id.clone(), count: count.max(0) as u32, active: active_match_ordinal.max(0) as u32, final_update: final_update != 0 });
         }
     }
+}
+
+thread_local! {
+    /// Per browser: which find results still belong to the search the app asked for.
+    static FINDS: std::cell::RefCell<std::collections::HashMap<String, FindState>> = Default::default();
+}
+
+/// CEF numbers each new search higher (`find_next` keeps the number) but `find()` does not return
+/// it, so results are matched by order: one from an older search, or any after StopFind, is stale.
+#[derive(Debug, Default)]
+pub(crate) struct FindState {
+    latest: i32,
+    stopped: bool,
+}
+
+impl FindState {
+    fn current(&mut self, identifier: i32) -> bool {
+        if self.stopped || identifier < self.latest {
+            return false;
+        }
+        self.latest = identifier;
+        true
+    }
+}
+
+/// The app started or continued a search in browser `id`: its results count again.
+pub(crate) fn find_started(id: &str) {
+    FINDS.with_borrow_mut(|f| f.entry(id.to_string()).or_default().stopped = false);
+}
+
+/// The app stopped searching in browser `id`: results still in flight are dropped.
+pub(crate) fn find_stopped(id: &str) {
+    FINDS.with_borrow_mut(|f| f.entry(id.to_string()).or_default().stopped = true);
 }
 
 /// App-handled menu extras (CEF's MENU_ID_USER_FIRST and up): the app acts, then answers None.
@@ -891,6 +927,19 @@ pub fn client(id: &str) -> Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn find_results_from_an_older_or_stopped_search_are_dropped() {
+        let mut f = FindState::default();
+        assert!(f.current(1));
+        assert!(f.current(1), "find_next keeps the number");
+        assert!(f.current(2), "a new search");
+        assert!(!f.current(1), "late result of the older search");
+        f.stopped = true;
+        assert!(!f.current(2), "in flight after StopFind");
+        f.stopped = false;
+        assert!(f.current(3));
+    }
 
     #[test]
     fn eval_outcomes() {

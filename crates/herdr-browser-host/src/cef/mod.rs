@@ -1061,9 +1061,13 @@ fn browser_msg(m: AppToHost) {
             }
         }
         M::Find { text, forward, match_case, find_next, .. } => {
+            handlers::find_started(&id);
             host.find(Some(&CefString::from(text.as_str())), forward as i32, match_case as i32, find_next as i32)
         }
-        M::StopFind { clear_selection, .. } => host.stop_finding(clear_selection as i32),
+        M::StopFind { clear_selection, .. } => {
+            handlers::find_stopped(&id);
+            host.stop_finding(clear_selection as i32)
+        }
         M::DevTools { .. } => send(HostToApp::Error {
             id: Some(id),
             message: "unsupported: the DevTools window is not available in the headless browser host; inspect will come from a built-in panel driven through the app's CDP broker".into(),
