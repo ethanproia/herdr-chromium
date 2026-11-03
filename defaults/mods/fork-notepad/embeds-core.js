@@ -164,3 +164,55 @@ export function clampText(s, cpl, lines) {
   const sp = cut.lastIndexOf(" ");
   return (sp > max * 0.6 ? cut.slice(0, sp) : cut).replace(/[\s,.;:]+$/, "") + "…";
 }
+
+// Only fetch public web pages: http(s) only, and never this machine or the local network (a note could hold
+// file:///…/.ssh/id_rsa or http://127.0.0.1:<port>/…). Redirects are checked hop by hop (fetchHops). Literal
+// hosts only: a public name that resolves to a private address (DNS rebinding) is not caught here.
+export function isSafeFetchUrl(url) {
+  let u;
+  try { u = new URL(String(url ?? "")); } catch { return false; }
+  if (u.protocol !== "http:" && u.protocol !== "https:") return false;
+  if (u.username || u.password) return false;
+  const h = u.hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
+  if (!h || h === "localhost" || h.endsWith(".localhost") || h.endsWith(".local") || h.endsWith(".internal") || !h.includes(".") && !h.includes(":")) return false;
+  const v4 = /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/.exec(h);
+  if (v4) {
+    const [a, b] = [Number(v4[1]), Number(v4[2])];
+    if (a === 0 || a === 10 || a === 127 || a >= 224) return false;
+    if (a === 169 && b === 254) return false;
+    if (a === 172 && b >= 16 && b <= 31) return false;
+    if (a === 192 && b === 168) return false;
+    if (a === 100 && b >= 64 && b <= 127) return false;   // CGNAT, Tailscale
+    return true;
+  }
+  if (/^[\d.]+$/.test(h) || /^0x/.test(h)) return false;   // odd IPv4 spellings (2130706433, 0x7f.1)
+  if (h.includes(":")) {
+    if (h === "::" || h === "::1") return false;
+    if (/^(fe[89ab]|fc|fd|ff)/.test(h)) return false;     // link-local, unique-local, multicast
+    if (h.startsWith("::ffff:")) return false;            // IPv4-mapped: refuse rather than decode
+    return true;
+  }
+  return true;
+}
+
+// curl flags for every embed fetch: web protocols only, and curl never follows a redirect itself (no -L);
+// fetchHops follows them so each hop passes isSafeFetchUrl.
+export const CURL_SAFE = ["--proto", "=http,https", "--max-redirs", "0"];
+export const MAX_HOPS = 3;
+
+// Fetch `url`, following at most MAX_HOPS redirects, each checked before it is fetched. `once(url)` runs one
+// curl and resolves to { redirect, result } (redirect = curl's %{redirect_url}, "" when there is none).
+// Resolves to { url, result } for the final page, or null when a hop is refused or there are too many.
+export async function fetchHops(url, once, maxHops = MAX_HOPS) {
+  let cur = url;
+  for (let hop = 0; hop <= maxHops; hop++) {
+    if (!isSafeFetchUrl(cur)) return null;
+    const r = await once(cur);
+    const next = String(r?.redirect ?? "").trim();
+    if (!next) return { url: cur, result: r?.result };
+    let abs;
+    try { abs = new URL(next, cur).href; } catch { return null; }
+    cur = abs;
+  }
+  return null;
+}

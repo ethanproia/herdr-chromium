@@ -3,7 +3,7 @@
   "mods": {
     "agents-named": {
       "branch": "ethan/herdr-core-retire",
-      "commit": "59bde8f7e60e813bd2cca6749a8cf1f4980cc962",
+      "commit": "c254604b8036db14c04685cbfdea1f293f2947eb",
       "version": "0.1.0",
       "pr": "essexlabs/labs#1303 (on #1298)",
       "path": "projects/herdr-mods/clones/mac/agents-named"
@@ -27,7 +27,7 @@
     },
     "core": {
       "branch": "ethan/herdr-core-retire",
-      "commit": "59bde8f7e60e813bd2cca6749a8cf1f4980cc962",
+      "commit": "c254604b8036db14c04685cbfdea1f293f2947eb",
       "version": "0.1.0",
       "pr": "essexlabs/labs#1303 (on #1298)",
       "path": "projects/herdr-mods/core",
@@ -35,17 +35,17 @@
     },
     "notepad": {
       "branch": "ethan/herdr-mods",
-      "commit": "beeb3c485415dcadd2d72aee0f6d5b17509496c2",
+      "commit": "06cb848eb980cf99fc4c4f238c75141bee540cf4",
       "path": "projects/herdr-mods/notepad",
       "version": "0.1.0",
-      "pr": "essexlabs/labs#1284 (merged)"
+      "pr": "essexlabs/labs#1294 (merged)"
     },
     "notepad-view": {
       "path": "projects/herdr-mods/notepad-view",
       "version": "0.1.0",
       "branch": "ethan/herdr-mods",
-      "commit": "beeb3c485415dcadd2d72aee0f6d5b17509496c2",
-      "pr": "essexlabs/labs#1284 (merged)"
+      "commit": "06cb848eb980cf99fc4c4f238c75141bee540cf4",
+      "pr": "essexlabs/labs#1294 (merged)"
     },
     "remote-desktop": {
       "branch": "ethan/herdr-mods-notepad",
@@ -57,7 +57,7 @@
     },
     "spaces-browser": {
       "branch": "ethan/herdr-core-retire",
-      "commit": "59bde8f7e60e813bd2cca6749a8cf1f4980cc962",
+      "commit": "c254604b8036db14c04685cbfdea1f293f2947eb",
       "version": "0.1.0",
       "pr": "essexlabs/labs#1303 (on #1298)",
       "path": "projects/herdr-mods/clones/mac/spaces-browser"
@@ -65,7 +65,7 @@
   },
   "layout": {
     "branch": "ethan/herdr-core-retire",
-    "commit": "59bde8f7e60e813bd2cca6749a8cf1f4980cc962",
+    "commit": "c254604b8036db14c04685cbfdea1f293f2947eb",
     "version": "0.1.0",
     "pr": "essexlabs/labs#1303 (on #1298)",
     "path": "projects/herdr-mods/clones/mac/layouts/Labs.json",

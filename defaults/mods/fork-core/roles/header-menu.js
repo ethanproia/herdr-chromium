@@ -5,8 +5,8 @@
 import { div, svg } from "gpui-kit";
 import { v_flex } from "gpui-base";
 import { theme, props, closeOverlay, shared, notify } from "herdr";
-import { menuRow, icon, runCopy, runHeaderAction } from "../look.js";
-import { menuHeight, headerMenuEntries, headerMenuElId } from "../pure.js";
+import { menuRow, icon, runCopy, runPaneCopy, runHeaderAction } from "../look.js";
+import { menuHeight, headerMenuEntries, headerMenuElId, COPY_FILE_STRIPPED } from "../pure.js";
 
 export default class HeaderMenu {
   init(_p, cx) {
@@ -20,8 +20,16 @@ export default class HeaderMenu {
     return headerMenuEntries(p.items, p.copy);
   }
 
-  choose(entry) {
+  choose(entry, cx) {
     const p = props() ?? {};
+    // A note copy flushes the open note first, so this view has to stay up until that handshake finishes.
+    if (entry.kind === "copy" && entry.copy?.[0] === COPY_FILE_STRIPPED) {
+      runPaneCopy(entry.copy[0], entry.copy[1], p.mod, cx).then((ok) => {
+        if (ok) notify({ title: "Copied", timeout: 1500 });
+        closeOverlay(p.overlay);
+      });
+      return;
+    }
     closeOverlay(p.overlay);
     if (entry.kind === "copy") {
       runCopy(entry.copy[0], entry.copy[1]).then((ok) => { if (ok) notify({ title: "Copied", timeout: 1500 }); });
@@ -51,7 +59,7 @@ export default class HeaderMenu {
         if (!list.length) return;
         if (e.key === "down") this.at = (this.at + 1) % list.length;
         else if (e.key === "up") this.at = (this.at + list.length - 1) % list.length;
-        else if (e.key === "enter") this.choose(list[this.at]);
+        else if (e.key === "enter") this.choose(list[this.at], cx);
         else return;
         cx.notify();
       })
@@ -63,7 +71,7 @@ export default class HeaderMenu {
           name: entry.label,
           hint: hint(entry),
           active: i === this.at,
-          onClick: () => this.choose(entry),
+          onClick: (_e, cx) => this.choose(entry, cx),
           onHover: (cx) => { if (this.at !== i) { this.at = i; cx.notify(); } },
         })),
       );

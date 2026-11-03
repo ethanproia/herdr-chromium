@@ -4,7 +4,7 @@ import { div, svg } from "gpui-kit";
 import { h_flex } from "gpui-base";
 import { exec, appHome, readTextFile, settings, notify, run, watchFolder, shared, setShared, openOverlay } from "herdr";
 import { SELF, icon } from "./self.js";
-import { keysym, COPY_TEXT, watchMembership, registryWatchRelevant, headerActionPlan, registryNotice, runRegistryWatch, registryWatchFailure } from "./pure.js";
+import { keysym, COPY_TEXT, COPY_FILE_STRIPPED, watchMembership, registryWatchRelevant, headerActionPlan, registryNotice, runRegistryWatch, registryWatchFailure } from "./pure.js";
 import { resolveOpen, createRegistry, readRegistryCache, toolsFromCache, publishRegistryChanges, REGISTRY_CACHE_KEY } from "./registry.js";
 
 export { keysym, registryNotice, icon };
@@ -21,9 +21,10 @@ export function groupLabel(t, text, top = 6) {
 // o = { t, id, icon (an element), name, hint, active, enabled, onClick(e, cx), onHover(cx) }
 export function menuRow(o) {
   const { t, enabled = true, active = false } = o;
-  return h_flex().id(o.id).h(32).px(8).gap(10).rounded(6).items_center().flex_none().cursor_pointer()
+  // A disabled row never lights up and shows no pointer (Ethan: "if it's unavailable, it shouldnt light up when i hover").
+  return h_flex().id(o.id).h(32).px(8).gap(10).rounded(6).items_center().flex_none().when(enabled, (el) => el.cursor_pointer())
     .text_color(enabled ? t.foreground : t.dim)
-    .when(active, (el) => el.bg(t.hover))
+    .when(active && enabled, (el) => el.bg(t.hover))
     .on_hover((h, cx) => { if (h && enabled && o.onHover) o.onHover(cx); })
     .on_click((e, cx) => { if (enabled && o.onClick) o.onClick(e, cx); })
     .child(div().size(16).flex_none().flex().items_center().justify_center().text_color(active ? t.foreground : t.muted).child(o.icon))
@@ -49,6 +50,41 @@ export function runCopy(script, arg) {
 
 export function copyText(text, doneTitle = "Link copied") {
   runCopy(COPY_TEXT, text).then((ok) => { if (ok) notify({ title: doneTitle, body: text, timeout: 2000 }); });
+}
+
+// The Notepad saves 400 ms after typing. A note copy asks that mod to write first (the same handshake
+// Export uses) so the clipboard gets the latest text. A timeout (nothing answered) copies the file as
+// it stands. An error answer does not copy. `mod` is the note's own mod name.
+export function flushNoteCopy(mod, cx) {
+  const req = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  setShared("notepad.flushReq", req);
+  run(`${mod || "notepad"}.flush`);
+  return (async () => {
+    for (let i = 0; i < 30; i++) {
+      const a = shared("notepad.flushAck");
+      if (a && a.req === req) {
+        await cx.sleep(150);
+        const z = shared("notepad.flushAck");
+        return z && z.ok ? null : ((z && z.error) || "The note could not be saved");
+      }
+      await cx.sleep(100);
+    }
+    return null;
+  })();
+}
+
+// Pane-header Copy. A stripped note file flushes first; every other script is the guarded copy as-is.
+export function runPaneCopy(script, arg, mod, cx) {
+  const start = () => runCopy(script, arg);
+  if (script !== COPY_FILE_STRIPPED) return start();
+  return flushNoteCopy(mod, cx).then((err) => {
+    if (!err) return start();
+    notify({ title: "Couldn't copy", body: String(err).trim().slice(0, 200), level: "error", timeout: 3000 });
+    return false;
+  }).catch((e) => {
+    notify({ title: "Couldn't copy", body: String(e?.message ?? e).slice(0, 200), level: "error", timeout: 3000 });
+    return false;
+  });
 }
 
 // The same typed actions the wide header buttons run. `mod` is the tool's own mod (openPopup only).
