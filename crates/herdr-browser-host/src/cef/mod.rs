@@ -250,6 +250,7 @@ fn paint(id: &str, layer: Option<(bool, *mut std::ffi::c_void, u32, u32)>) {
             if entry.hidden && entry.shots.is_empty() {
                 return Ok(Out(None));
             }
+            let mut direct = None;
             if let Some((popup, src, w, h)) = layer {
                 let px = PixelSize { w, h };
                 let slot = if popup { &mut entry.popup } else { &mut entry.view };
@@ -257,12 +258,26 @@ fn paint(id: &str, layer: Option<(bool, *mut std::ffi::c_void, u32, u32)>) {
                     *slot = Some(herdr_browser_surface::create_pixels(px).map_err(|e| format!("surface: {e}"))?);
                 }
                 let copy = slot.as_ref().expect("just made");
-                blitter.copy(src, copy.as_ptr(), w as usize, h as usize)?;
+                if popup || entry.popup_shown {
+                    blitter.copy(src, copy.as_ptr(), w as usize, h as usize)?;
+                } else {
+                    // The common case, a page frame with no popup open: copy CEF's surface into the
+                    // kept view and the outgoing frame in one GPU pass with one wait.
+                    let dst = entry.pool.acquire(px).map_err(|e| format!("surface: {e}"))?;
+                    blitter.copy_to_all(src, &[copy.as_ptr(), dst.as_ptr()], w as usize, h as usize)?;
+                    direct = Some(dst);
+                }
             }
             let Some(view) = entry.view.as_ref() else { return Ok(Out(None)) };
             let vs = view.size();
-            let dst = entry.pool.acquire(vs).map_err(|e| format!("surface: {e}"))?;
-            blitter.copy(view.as_ptr(), dst.as_ptr(), vs.w as usize, vs.h as usize)?;
+            let dst = match direct {
+                Some(dst) => dst,
+                None => {
+                    let dst = entry.pool.acquire(vs).map_err(|e| format!("surface: {e}"))?;
+                    blitter.copy(view.as_ptr(), dst.as_ptr(), vs.w as usize, vs.h as usize)?;
+                    dst
+                }
+            };
             if let (true, Some(popup), Some(rect)) = (entry.popup_shown, entry.popup.as_ref(), entry.popup_rect) {
                 let ps = popup.size();
                 let place = popup_place(rect, entry.scale, (ps.w, ps.h), (vs.w, vs.h));
@@ -848,6 +863,7 @@ fn handle(m: AppToHost) {
         | M::SetZoom { .. }
         | M::Overlay { .. }
         | M::PickInfo { .. }
+        | M::PickRelative { .. }
         | M::Styles { .. }
         | M::SetStyle { .. }
         | M::RevertStyle { .. }
@@ -897,7 +913,7 @@ fn browser_msg(m: AppToHost) {
     let id = match &m {
         M::Navigate { id, .. } | M::Back { id } | M::Forward { id } | M::Reload { id, .. } | M::Stop { id } | M::Resize { id, .. }
         | M::Focus { id, .. } | M::SetZoom { id, .. } | M::Input { id, .. } | M::Edit { id, .. } | M::Find { id, .. } | M::StopFind { id, .. }
-        | M::DevTools { id, .. } | M::Eval { id, .. } | M::Overlay { id, .. } | M::PickInfo { id, .. } | M::Styles { id, .. } | M::SetStyle { id, .. } | M::RevertStyle { id, .. } | M::SetVisible { id, .. } => id.clone(),
+        | M::DevTools { id, .. } | M::Eval { id, .. } | M::Overlay { id, .. } | M::PickInfo { id, .. } | M::PickRelative { id, .. } | M::Styles { id, .. } | M::SetStyle { id, .. } | M::RevertStyle { id, .. } | M::SetVisible { id, .. } => id.clone(),
         other => {
             debug(format_args!("not a browser message, dropped: {}", encode(&other)));
             return;
@@ -1014,6 +1030,14 @@ fn browser_msg(m: AppToHost) {
         // Pick payload (S4): fork-host implements; until then "nothing there".
         M::PickInfo { req, x, y, .. } => {
             let call = handlers::pick_message(&id, req, x, y);
+            if host.send_dev_tools_message(Some(&call)) == 0 {
+                handlers::eval_unsent(&id);
+                send(HostToApp::PickInfoResult { id, req, ok: false, selector: String::new(), label: String::new(), rect: herdr_browser_protocol::CssRect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 } });
+            }
+        }
+        // HERDR: arrow keys while picking (parent, first child, siblings).
+        M::PickRelative { req, ref from, step, .. } => {
+            let call = handlers::pick_relative_message(&id, req, from, step);
             if host.send_dev_tools_message(Some(&call)) == 0 {
                 handlers::eval_unsent(&id);
                 send(HostToApp::PickInfoResult { id, req, ok: false, selector: String::new(), label: String::new(), rect: herdr_browser_protocol::CssRect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 } });

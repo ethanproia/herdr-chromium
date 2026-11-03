@@ -24,7 +24,7 @@ runs on its own home (`~/.herdr-fork-home/visible`), its own core and its own br
 | 5 | | right-click in the page | Herdr's menu (Back, Forward, Reload, Copy, Paste…), Esc closes it |
 | 6 | | cmd-F, type `row`… (on scroll.html) | a find bar under the address bar, "n of m", Enter steps |
 | 7 | | cmd-plus twice, cmd-0 | the page grows (label 125 %), then back to 100 % |
-| 8 | | cmd-shift-C, hover elements, click one; 💬 on, pick again, type a note, Enter | a blue highlight follows the pointer; a comment field under the element; a numbered red pin; the badge "1 · Send" |
+| 8 | | Design (or cmd-shift-C), hover elements, arrow keys, click one; Comment on in the strip, pick again, type a note, Enter; click the pin | a blue highlight with a label chip follows the pointer, arrows step to parent/child/siblings; a comment field under the element; a numbered red pin and "1 · Send" in the strip; the pin opens Edit / Delete |
 | 9 | | cmd-shift-M, drag a rectangle, cmd-Z, Done | a red rectangle over the page, then gone |
 | 10 | `$F do browser.navigate '{"url":"http://127.0.0.1:8765/video.html?src=test-60-vp9.webm"}'` | watch 5 s | the test pattern plays smoothly |
 | 11 | `$F do browser.navigate '{"url":"http://127.0.0.1:8765/links.html"}'` | cmd-click "plain link" | a second browser opens beside the first |

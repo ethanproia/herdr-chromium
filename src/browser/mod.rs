@@ -15,11 +15,15 @@ pub mod broker;
 pub mod cdp;
 // HERDR: part 4, design slice S7.
 pub mod annotate;
+// HERDR: part 4, design mode chrome (A1, A2, A9).
+pub mod design_bar;
 pub mod dialogs;
 // HERDR: part 4, design slice S11.
 pub mod edits;
 pub mod frame;
 pub mod geometry;
+// HERDR: part 4, the S27 inbox formatter.
+pub mod handoff;
 pub mod input;
 // HERDR: part 4, design slice S9.
 pub mod markup;
@@ -53,6 +57,8 @@ pub struct BrowserState {
     pub cursor: String,
     /// The page's icon url (`Favicon`), empty until the page names one.
     pub favicon: String,
+    /// The page's failed load: (kind, net error code) only, never page text ("dns", -105).
+    pub load_error: Option<(String, i32)>,
     /// The block's profile ("agent": an agent opened it; "default": the person's).
     pub profile: String,
 }

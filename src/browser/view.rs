@@ -30,7 +30,7 @@ use super::dialogs::{DialogsEvent, Downloads, PageDialogs};
 use super::markup::{self, Markup, Tool};
 use super::zoom;
 use super::styles::StylePanelView;
-use super::{annotate, region};
+use super::{annotate, design_bar, region};
 
 /// `url` without its `token` query parameter (what a document may keep of a launch url).
 pub fn without_token(url: &str) -> String {
@@ -100,6 +100,10 @@ enum PageAsk {
     StyleTarget,
     /// The element under a region's corner, to anchor it (S6).
     RegionAnchor(region::Rect),
+    /// A2: the hovered element's label, for the chip on the hover box.
+    Hover,
+    /// A3: an arrow key's step from the current pick (PickRelative).
+    Step,
 }
 
 use super::{BrowserRegistry, BrowserState, FrameSink, FrameView, HostLink};
@@ -107,7 +111,7 @@ use crate::layout::BrowserBlock;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_base::input::{Input, InputEvent, InputState};
-use herdr_browser_protocol::{self as protocol, DownloadState, MouseKind, OverlayQuery, AppToHost, BrowserId, HostToApp, PixelSize, Size as Dips};
+use herdr_browser_protocol::{self as protocol, PickStep, DownloadState, MouseKind, OverlayQuery, AppToHost, BrowserId, HostToApp, PixelSize, Size as Dips};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -512,6 +516,7 @@ fn target(msg: &HostToApp) -> Option<&BrowserId> {
         | H::Loading { id, .. }
         | H::Cursor { id, .. }
         | H::Favicon { id, .. }
+        | H::LoadError { id, .. }
         | H::NewWindow { id, .. }
         | H::Download { id, .. }
         | H::FileChooser { id, .. }
@@ -583,6 +588,8 @@ pub struct BrowserView {
     pub state: BrowserState,
     /// The host or the page died; the block shows a reload card until clicked.
     crashed: Option<String>,
+    /// The main frame's failed load (kind, code, url): an error card over the page until the next load.
+    load_error: Option<(String, i32, String)>,
     /// Size and scale the host was last told; None: no page made yet.
     sized: Option<(Dips, f32)>,
     /// The newest frame from the host, painted into the page area (part 3).
@@ -629,6 +636,18 @@ pub struct BrowserView {
     annotations: annotate::Annotations,
     comment_on_pick: bool,
     comment_target: Option<annotate::Target>,
+    /// A2/A3: the element the pick is on (its label for the chip). `stepped`: an arrow key chose it,
+    /// so the highlight and the next click use it, not the pointer's element.
+    hovered: Option<annotate::Target>,
+    stepped: bool,
+    /// A2: the hover label request in flight, and the newest point waiting behind it.
+    hover_ask: Option<u64>,
+    hover_next: Option<Pt>,
+    /// A9: each pin's scroll (page DIPs) when it was made, so pins follow the page; the pin whose
+    /// popover is open; the pin a reopened comment field edits.
+    pin_scroll: HashMap<u32, (f32, f32)>,
+    open_pin: Option<u32>,
+    editing_pin: Option<u32>,
     /// Page questions in flight (view-owned PickInfo reqs >= VIEW_REQ_BASE).
     asks: HashMap<u64, PageAsk>,
     next_ask: u64,
@@ -828,6 +847,7 @@ impl BrowserView {
             link,
             state,
             crashed: None,
+            load_error: None,
             sized: None,
             frames: FrameView::new(),
             acked: None,
@@ -858,6 +878,13 @@ impl BrowserView {
             annotations: Default::default(),
             comment_on_pick: false,
             comment_target: None,
+            hovered: None,
+            stepped: false,
+            hover_ask: None,
+            hover_next: None,
+            pin_scroll: HashMap::new(),
+            open_pin: None,
+            editing_pin: None,
             asks: HashMap::new(),
             next_ask: 0,
             styles_on_pick: false,
@@ -979,7 +1006,16 @@ impl BrowserView {
                     cx.emit(BrowserEvent::PageInfo);
                 }
             }
+            // The card shows from the failed load until the next load starts.
+            H::LoadError { url, code, kind, .. } => {
+                self.state.load_error = Some((kind.clone(), code));
+                self.load_error = Some((kind, code, url));
+            }
             H::Loading { loading, can_back, can_forward, .. } => {
+                if loading {
+                    self.load_error = None;
+                    self.state.load_error = None;
+                }
                 (self.state.loading, self.state.can_back, self.state.can_forward) = (loading, can_back, can_forward);
             }
             H::Cursor { name, .. } => self.state.cursor = name,
@@ -1110,6 +1146,42 @@ impl BrowserView {
     }
 
     /// The reload card's button: a new page at the last url (starting the host again if needed).
+    /// The failed load's card: plain text only (the url is page-chosen), the url capped, Back and Reload.
+    fn load_error_card(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (kind, code, url) = self.load_error.as_ref()?;
+        let (title, hint) = load_error_words(kind, url);
+        let id = self.id.clone();
+        let button = |name: &'static str| div().id(name).px_3().py_1().rounded_md().bg(rgb(0x3a3a3a)).cursor_pointer().child(name);
+        Some(
+            div()
+                .id("load-error")
+                .absolute()
+                .size_full()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .items_center()
+                .justify_center()
+                .bg(rgb(0x202020))
+                .text_color(rgb(0xe0e0e0))
+                .text_sm()
+                .child(div().text_base().child(title))
+                .child(div().text_xs().opacity(0.7).child(hint))
+                .child(div().text_xs().opacity(0.5).child(format!("{} · error {code}", capped(url, 120))))
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .when(self.state.can_back, |d| {
+                            let id = id.clone();
+                            d.child(button("Back").on_click(cx.listener(move |v, _, _, _| v.link.send(AppToHost::Back { id: id.clone() }))))
+                        })
+                        .child(button("Reload").on_click(cx.listener(move |v, _, _, _| v.link.send(AppToHost::Reload { id: id.clone(), ignore_cache: false })))),
+                )
+                .into_any_element(),
+        )
+    }
+
     pub fn reload(&mut self, cx: &mut Context<Self>) {
         self.crashed = None;
         self.sized = None;
@@ -1329,10 +1401,15 @@ impl BrowserView {
                     // never gets a stray button-up). Comment-on-pick keeps pick open for the field.
                     region::Outcome::Click(cx_, cy) => {
                         self.hover_overlay(Pt { x: cx_, y: cy });
+                        // A stepped pick (arrow keys) is what the click picks, wherever the pointer is.
+                        let (cx_, cy) = match self.hovered.as_ref().filter(|_| self.stepped) {
+                            Some(t) => (t.rect.0 + t.rect.2 / 2.0, t.rect.1 + t.rect.3 / 2.0),
+                            None => (cx_, cy),
+                        };
                         if self.comment_on_pick {
-                            self.ask_target(PageAsk::CommentTarget, cx_, cy);
+                            self.click_target(PageAsk::CommentTarget, cx_, cy, cx);
                         } else if self.styles_on_pick {
-                            self.ask_target(PageAsk::StyleTarget, cx_, cy);
+                            self.click_target(PageAsk::StyleTarget, cx_, cy, cx);
                             self.input.update(cx, |i, _| {
                                 i.escape();
                             });
@@ -1346,6 +1423,7 @@ impl BrowserView {
                     region::Outcome::None => {
                         if matches!(kind, MouseKind::Move | MouseKind::Down) {
                             self.hover_overlay(Pt { x: *x, y: *y });
+                            self.hover_label(Pt { x: *x, y: *y });
                         }
                     }
                 },
@@ -1353,6 +1431,9 @@ impl BrowserView {
                     self.region_drag.on_event(ev);
                     if *o != Owner::Pick {
                         self.rubber = None;
+                    }
+                    if !matches!(o, Owner::Pick | Owner::Comment) {
+                        (self.hovered, self.stepped) = (None, false);
                     }
                     // The comment field closed (Esc, a lease): its target goes with it.
                     if *o != Owner::Comment {
@@ -1363,6 +1444,7 @@ impl BrowserView {
                     self.markup.update(cx, |m, _| m.on_event(ev));
                 }
                 OverlayEvent::Refused => self.refused_at = Some(std::time::Instant::now()),
+                OverlayEvent::PickStep(step) => self.pick_step(*step),
                 _ => {}
             }
         }
@@ -1377,12 +1459,42 @@ impl BrowserView {
     }
 
     /// Ask the page what element is at (x, y) page DIPs: selector, label and rect (CSS px).
-    fn ask_target(&mut self, ask: PageAsk, x: f32, y: f32) {
+    fn ask_target(&mut self, ask: PageAsk, x: f32, y: f32) -> u64 {
         let css = self.geometry().page_to_viewport(Pt { x, y });
         self.next_ask += 1;
         let req = VIEW_REQ_BASE + self.next_ask;
         self.asks.insert(req, ask);
         self.link.send(AppToHost::PickInfo { id: self.id.clone(), req, x: css.x, y: css.y });
+        req
+    }
+
+    /// A click's target: the element an arrow key stepped to, else the one under (x, y).
+    fn click_target(&mut self, ask: PageAsk, x: f32, y: f32, cx: &mut Context<Self>) {
+        match self.hovered.clone().filter(|_| self.stepped) {
+            Some(t) => self.resolved(ask, Some(t), cx),
+            None => {
+                self.ask_target(ask, x, y);
+            }
+        }
+    }
+
+    /// A2: ask the hovered element's label; one request in flight, the newest point waits behind it.
+    fn hover_label(&mut self, at: Pt) {
+        self.stepped = false;
+        if self.hover_ask.is_some() {
+            self.hover_next = Some(at);
+        } else {
+            self.hover_ask = Some(self.ask_target(PageAsk::Hover, at.x, at.y));
+        }
+    }
+
+    /// A3: an arrow key steps from the current pick to its parent, first child or a sibling.
+    fn pick_step(&mut self, step: PickStep) {
+        let Some(from) = self.hovered.as_ref().map(|t| t.selector.clone()) else { return };
+        self.next_ask += 1;
+        let req = VIEW_REQ_BASE + self.next_ask;
+        self.asks.insert(req, PageAsk::Step);
+        self.link.send(AppToHost::PickRelative { id: self.id.clone(), req, from, step });
     }
 
     /// The page answered `ask_target`.
@@ -1393,7 +1505,29 @@ impl BrowserView {
             let (a, b) = (geo.viewport_to_page(Pt { x: r.x, y: r.y }), geo.viewport_to_page(Pt { x: r.x + r.w, y: r.y + r.h }));
             annotate::Target { selector, label, rect: (a.x, a.y, b.x - a.x, b.y - a.y) }
         });
+        self.resolved(ask, target, cx);
+    }
+
+    /// What an ask resolved to (the page's answer, or the stepped pick).
+    fn resolved(&mut self, ask: PageAsk, target: Option<annotate::Target>, cx: &mut Context<Self>) {
+        let geo = self.geometry();
         match ask {
+            PageAsk::Hover => {
+                self.hover_ask = None;
+                if !self.stepped {
+                    self.hovered = target;
+                }
+                if let Some(at) = self.hover_next.take() {
+                    self.hover_label(at);
+                }
+            }
+            // ok false keeps the current pick.
+            PageAsk::Step => {
+                if let Some(t) = target {
+                    self.hovered = Some(t);
+                    self.stepped = true;
+                }
+            }
             PageAsk::RegionAnchor(r) => {
                 let anchor = target.map(|t| (t.selector, region::Rect { x: t.rect.0, y: t.rect.1, w: t.rect.2, h: t.rect.3 }));
                 let scroll = geo.viewport_to_page(Pt { x: self.scroll.0, y: self.scroll.1 });
@@ -1437,7 +1571,16 @@ impl BrowserView {
     pub fn save_comment(&mut self, cx: &mut Context<Self>) {
         let Some(target) = self.comment_target.take() else { return };
         let text = self.input.update(cx, |i, _| i.take_comment());
-        self.annotations.add(target, &text);
+        match self.editing_pin.take() {
+            Some(n) => {
+                self.annotations.set_comment(n, &text);
+            }
+            None => {
+                let n = self.annotations.add(target, &text);
+                let s = self.geometry().viewport_to_page(Pt { x: self.scroll.0, y: self.scroll.1 });
+                self.pin_scroll.insert(n, (s.x, s.y));
+            }
+        }
         self.input.update(cx, |i, _| {
             i.escape(); // Comment -> Pick
             i.escape(); // Pick -> Browse
@@ -1560,8 +1703,10 @@ impl BrowserView {
             .annotations
             .visible()
             .map(|a| {
-                let (x, y, _, _) = a.target.rect;
+                let (x, y, _, _) = self.pin_rect(a);
+                let n = a.n;
                 div()
+                    .id(("pin", n as usize))
                     .absolute()
                     .left(px(x - 9.))
                     .top(px(y - 9.))
@@ -1573,10 +1718,51 @@ impl BrowserView {
                     .flex()
                     .items_center()
                     .justify_center()
+                    .cursor_pointer()
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, cx.listener(move |v, _, _, cx| {
+                        cx.stop_propagation();
+                        v.open_pin = if v.open_pin == Some(n) { None } else { Some(n) };
+                        cx.notify();
+                    }))
                     .child(a.n.to_string())
                     .into_any_element()
             })
             .collect();
+        // A9: the open pin's popover beside it.
+        if let Some(pin) = self.open_pin.and_then(|n| self.annotations.visible().find(|p| p.n == n).cloned()) {
+            let (x, y, _, _) = self.pin_rect(&pin);
+            let popover = design_bar::pin_popover(pin.n, &pin.comment, cx, |v, a, _, cx| v.pin_action(a, cx));
+            out.push(
+                div()
+                    .id("pin-popover-at")
+                    .absolute()
+                    .left(px(x + 12.))
+                    .top(px(y + 12.))
+                    .occlude()
+                    .on_mouse_down_out(cx.listener(|v, _, _, cx| {
+                        v.open_pin = None;
+                        cx.notify();
+                    }))
+                    .child(popover)
+                    .into_any_element(),
+            );
+        }
+        // A9: pins scrolled out of view, as markers on the page area's edges (a click does nothing in v1).
+        if let Some((size, _)) = self.sized {
+            let pins: Vec<(u32, (f32, f32, f32, f32))> = self.annotations.visible().map(|a| (a.n, self.pin_rect(a))).collect();
+            let o = design_bar::offscreen(&pins, (size.w, size.h));
+            for (id, text) in design_bar::offscreen_labels(&o) {
+                let m = div().id(id).absolute().px_1().rounded_full().text_xs().bg(rgb(0xff3b30)).text_color(rgb(0xffffff)).child(text);
+                let m = match id {
+                    "pins-above" => m.top(px(4.)).left(px(size.w / 2. - 20.)),
+                    "pins-below" => m.bottom(px(4.)).left(px(size.w / 2. - 20.)),
+                    "pins-left" => m.left(px(4.)).top(px(size.h / 2. - 9.)),
+                    _ => m.right(px(4.)).top(px(size.h / 2. - 9.)),
+                };
+                out.push(m.into_any_element());
+            }
+        }
         if let Some(r) = self.rubber {
             out.push(div().absolute().left(px(r.x)).top(px(r.y)).w(px(r.w)).h(px(r.h)).border_1().border_color(rgb(0x3b82f6)).bg(hsla(0.6, 0.9, 0.6, 0.12)).into_any_element());
         }
@@ -1660,46 +1846,71 @@ impl BrowserView {
                     .into_any_element(),
             );
         }
-        if owner != Owner::Markup {
-            return None;
+        let state = design_bar::StripState { owner, tool: self.markup.read(cx).tool, styles_on: self.styles_on_pick, comment_on: self.comment_on_pick, count: self.annotations.count() };
+        design_bar::strip(&state, FIND_HEIGHT, cx, |v, a, _, cx| v.design_action(a, cx))
+    }
+
+    /// A1: what a strip control asks.
+    pub fn design_action(&mut self, a: design_bar::StripAction, cx: &mut Context<Self>) {
+        use design_bar::StripAction as A;
+        match a {
+            A::Select => {
+                if self.owner(cx) != Owner::Pick {
+                    self.toggle_mode(Owner::Pick, cx);
+                }
+            }
+            A::Draw => self.toggle_mode(Owner::Markup, cx),
+            A::Tool(t) => self.markup.update(cx, |m, _| m.tool = t),
+            A::Undo => self.markup.update(cx, |m, _| { m.undo(); }),
+            A::ToggleStyles => {
+                let on = !self.styles_on_pick;
+                self.set_styles_on_pick(on, cx);
+            }
+            A::ToggleComment => {
+                let on = !self.comment_on_pick;
+                self.set_comment_on_pick(on, cx);
+            }
+            A::Send => self.send_annotations(cx),
+            A::Done => {
+                self.input.update(cx, |i, _| while i.owner() != Owner::Browse && i.escape() {});
+                self.drain_overlay(cx);
+            }
         }
-        let tool = self.markup.read(cx).tool;
-        let tool_button = |id: &'static str, label: &'static str, t: Tool| {
-            div()
-                .id(id)
-                .px_1()
-                .rounded_sm()
-                .cursor_pointer()
-                .when(tool == t, |d| d.bg(hsla(0., 0., 0.5, 0.3)))
-                .child(label)
-                .on_click(cx.listener(move |v, _, _, cx| {
-                    v.markup.update(cx, |m, _| m.tool = t);
-                    cx.notify();
-                }))
-        };
-        Some(
-            div()
-                .id("markup-strip")
-                .flex()
-                .flex_none()
-                .items_center()
-                .gap_1()
-                .h(px(FIND_HEIGHT))
-                .px_2()
-                .text_xs()
-                .bg(hsla(0.0, 0.9, 0.55, 0.15))
-                .child("Markup")
-                .child(tool_button("tool-pen", "Pen", Tool::Pen))
-                .child(tool_button("tool-rect", "Rect", Tool::Rect))
-                .child(tool_button("tool-ellipse", "Ellipse", Tool::Ellipse))
-                .child(tool_button("tool-arrow", "Arrow", Tool::Arrow))
-                .child(div().id("markup-undo").px_1().cursor_pointer().child("Undo").on_click(cx.listener(|v, _, _, cx| {
-                    v.markup.update(cx, |m, _| m.undo());
-                    cx.notify();
-                })))
-                .child(div().id("markup-done").px_1().cursor_pointer().child("Done").on_click(cx.listener(|v, _, _, cx| v.toggle_mode(Owner::Markup, cx))))
-                .into_any_element(),
-        )
+        cx.notify();
+    }
+
+    /// A9: a pin's box now, in page DIPs (it follows the page's scroll since it was made).
+    fn pin_rect(&self, a: &annotate::Annotation) -> (f32, f32, f32, f32) {
+        let (x, y, w, h) = a.target.rect;
+        let Some(&(sx, sy)) = self.pin_scroll.get(&a.n) else { return (x, y, w, h) };
+        let now = self.geometry().viewport_to_page(Pt { x: self.scroll.0, y: self.scroll.1 });
+        (x - (now.x - sx), y - (now.y - sy), w, h)
+    }
+
+    /// A9: a pin's popover asked to edit or delete it.
+    fn pin_action(&mut self, a: design_bar::PinAction, cx: &mut Context<Self>) {
+        self.open_pin = None;
+        match a {
+            design_bar::PinAction::Edit(n) => {
+                let Some(pin) = self.annotations.visible().find(|p| p.n == n).cloned() else { return };
+                let rect = self.pin_rect(&pin);
+                // enter(Comment) empties the field: its text goes in after.
+                let entered = self.input.update(cx, |i, _| i.enter(Owner::Comment) && {
+                    i.set_comment(&pin.comment);
+                    true
+                });
+                if entered {
+                    self.editing_pin = Some(n);
+                    self.comment_target = Some(annotate::Target { rect, ..pin.target });
+                }
+            }
+            design_bar::PinAction::Delete(n) => {
+                self.annotations.remove(n);
+                self.pin_scroll.remove(&n);
+            }
+        }
+        self.drain_overlay(cx);
+        cx.notify();
     }
 
     /// Where the page area starts under the bars, in DIPs from the block's top.
@@ -1970,21 +2181,8 @@ impl BrowserView {
             })
             .child(div().flex_1().min_w_0().overflow_hidden().child(Input::new(&self.address)))
             .when(self.state.loading, |d| d.child("loading"))
-            // Modes (part 4's owners): pick an element, mark up the page.
-            .child(button("⌖", true).on_click(cx.listener(|v, _, _, cx| v.toggle_mode(Owner::Pick, cx))))
-            .child(button("✎", true).on_click(cx.listener(|v, _, _, cx| v.toggle_mode(Owner::Markup, cx))))
-            .child(button("🎨", true).when(self.styles_on_pick, |d| d.bg(hsla(0., 0., 0.5, 0.3))).on_click(cx.listener(|v, _, _, cx| {
-                let on = !v.styles_on_pick;
-                v.set_styles_on_pick(on, cx);
-            })))
-            .child(button("💬", true).when(self.comment_on_pick, |d| d.bg(hsla(0., 0., 0.5, 0.3))).on_click(cx.listener(|v, _, _, cx| {
-                let on = !v.comment_on_pick;
-                v.set_comment_on_pick(on, cx);
-            })))
-            // The annotation badge (every page's pending pins); a click sends them.
-            .when(self.annotations.count() > 0, |d| {
-                d.child(div().id("annotations-badge").px_1().rounded_full().bg(rgb(0xff3b30)).text_color(rgb(0xffffff)).cursor_pointer().child(format!("{} · Send", self.annotations.count())).on_click(cx.listener(|v, _, _, cx| v.send_annotations(cx))))
-            })
+            // A1: one Design button; the strip under the bar holds every design control.
+            .child(button("Design", true).on_click(cx.listener(|v, _, _, cx| v.toggle_mode(Owner::Pick, cx))))
             // The zoom label shows only off 100 %; a click resets it.
             .when(self.zoom_level.abs() > 1e-6, |d| {
                 d.child(div().id("zoom-label").px_1().rounded_sm().cursor_pointer().bg(hsla(0., 0., 0.5, 0.15)).child(zoom::percent(self.zoom_level)).on_click(cx.listener(|v, _, _, cx| v.set_zoom(0.0, cx))))
@@ -2082,7 +2280,7 @@ impl Render for BrowserView {
             });
         }
         let page = match (&self.crashed, frame) {
-            (None, Some(frame)) => page.child(div().absolute().size_full().child(frame)),
+            (None, Some(frame)) => page.child(div().absolute().size_full().child(frame)).children(self.load_error_card(cx)),
             (None, None) => page.child(
                 div().absolute().size_full().flex().items_center().justify_center().text_color(rgb(0x606060)).text_sm().child(self.shown_url()),
             ),
@@ -2114,9 +2312,22 @@ impl Render for BrowserView {
             ),
         };
         // Current overlay rects (stale ones are already gone), outlined over the frame.
-        let page = page.children(self.overlay.shown().iter().map(|r| {
+        // A3: a stepped pick draws its own box (the pointer's hit test is not it).
+        let stepped = self.hovered.as_ref().filter(|_| self.stepped).map(|t| Rect { x: t.rect.0, y: t.rect.1, w: t.rect.2, h: t.rect.3 });
+        let boxes: Vec<Rect> = match stepped {
+            Some(r) => vec![r],
+            None => self.overlay.shown().to_vec(),
+        };
+        let page = page.children(boxes.iter().map(|r| {
             div().absolute().left(px(r.x)).top(px(r.y)).w(px(r.w)).h(px(r.h)).border_2().border_color(rgb(0x3b82f6)).bg(hsla(0.6, 0.9, 0.6, 0.15))
         }));
+        // A2: the label chip on the hover box while picking ("element · W×H" until the label comes).
+        let chip = (self.owner(cx) == Owner::Pick).then(|| boxes.first().copied()).flatten().map(|r| {
+            let label = self.hovered.as_ref().map(|t| t.label.as_str()).unwrap_or("");
+            let (x, y) = design_bar::chip_origin((r.x, r.y, r.w, r.h));
+            div().absolute().left(px(x)).top(px(y)).child(design_bar::chip(design_bar::chip_text(label, r.w, r.h)))
+        });
+        let page = page.children(chip);
         // S6/S7: pins, the rubber band and the comment field over the frame.
         let layer = self.annotation_layer(cx);
         let page = page.children(layer);
@@ -2388,6 +2599,26 @@ impl BrowserRegistry for Browsers {
     }
 }
 
+/// A failed load's title and hint, by kind (`url` names a dead localhost).
+pub fn load_error_words(kind: &str, url: &str) -> (String, String) {
+    let host = url.split_once("://").map_or(url, |(_, r)| r).split(['/', '?', '#']).next().unwrap_or("");
+    let local = host.starts_with("127.0.0.1") || host.starts_with("localhost") || host.starts_with("[::1]");
+    match kind {
+        "dns" => ("This site can't be found".into(), format!("{} doesn't resolve. Check the address.", capped(host, 80))),
+        "offline" => ("You're offline".into(), "Check your connection, then reload.".into()),
+        "refused" if local => (format!("Nothing is running at {}", capped(host, 80)), "Start the server, then reload.".into()),
+        "refused" => ("The site refused to connect".into(), format!("{} isn't accepting connections.", capped(host, 80))),
+        "timeout" => ("The site took too long".into(), "It didn't answer in time. Try again.".into()),
+        "certificate" => ("This connection isn't private".into(), "The site's certificate isn't valid, so it wasn't opened.".into()),
+        _ => ("This page couldn't load".into(), "Reload to try again.".into()),
+    }
+}
+
+/// At most `n` characters, with an ellipsis when cut.
+fn capped(s: &str, n: usize) -> String {
+    if s.chars().count() <= n { s.to_string() } else { s.chars().take(n).collect::<String>() + "…" }
+}
+
 /// Socket path checks for tests and `herdr-app doctor`-style reports.
 pub fn socket_of(dir: &Path) -> PathBuf {
     dir.join("host.sock")
@@ -2397,6 +2628,17 @@ pub fn socket_of(dir: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use herdr_browser_protocol::Size;
+
+    #[::core::prelude::v1::test]
+    fn load_error_cards_name_the_kind_and_cap_the_url() {
+        assert_eq!(load_error_words("refused", "http://127.0.0.1:3000/x").0, "Nothing is running at 127.0.0.1:3000");
+        assert_eq!(load_error_words("refused", "https://a.test/").0, "The site refused to connect");
+        assert_eq!(load_error_words("certificate", "https://self.test/").0, "This connection isn't private");
+        assert_eq!(load_error_words("dns", "http://nope.invalid/").1, "nope.invalid doesn't resolve. Check the address.");
+        assert_eq!(load_error_words("weird", "x").0, "This page couldn't load");
+        let long = format!("https://a.test/{}", "x".repeat(300));
+        assert_eq!(capped(&long, 120).chars().count(), 121);
+    }
 
     fn tmp(name: &str) -> PathBuf {
         // Short: macOS socket paths stop at 104 bytes.

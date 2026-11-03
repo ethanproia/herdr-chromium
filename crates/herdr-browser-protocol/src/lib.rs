@@ -210,6 +210,11 @@ pub enum AppToHost {
     /// Describe the element at page point (x, y) CSS px for a pick (S4); answered by `PickInfoResult`
     /// with the same `req`. Typed on purpose: the app never evaluates page JS for this.
     PickInfo { id: BrowserId, req: u64, x: f32, y: f32 },
+    /// Step from the element `from` (a selector a `PickInfoResult` gave) to a relative in the DOM
+    /// (arrow keys while picking); answered by `PickInfoResult` with the same `req`, describing the
+    /// element stepped to. `ok` false: no such relative (top of the document, no children, no
+    /// sibling) or `from` no longer matches; the app keeps the current pick then.
+    PickRelative { id: BrowserId, req: u64, from: String, step: PickStep },
     /// Read the style panel rows for the element `node` (a CSS selector, as `Picked` reports it) for
     /// `props`; answered by `StylesResult` with the same `req`. Driven by the user's panel, so no
     /// agent grant applies; answers carry CSS values only, never input values or page text.
@@ -246,6 +251,18 @@ pub enum AppToHost {
     Shutdown,
 }
 
+/// A step from a picked element to a relative (`PickRelative`). Element nodes only: text and
+/// comment nodes are skipped; a shadow host's children are its shadow root's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PickStep {
+    Parent,
+    /// The first element child.
+    Child,
+    Prev,
+    Next,
+}
+
 /// Host to app.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -258,6 +275,9 @@ pub enum HostToApp {
     Title { id: BrowserId, title: String },
     Url { id: BrowserId, url: String },
     Loading { id: BrowserId, loading: bool, can_back: bool, can_forward: bool },
+    /// The main frame failed to load (not an abort). `kind`: "dns" | "offline" | "refused" | "timeout" | "certificate" | "other";
+    /// `code` is the net error (ERR_NAME_NOT_RESOLVED = -105, ...). A certificate error is cancelled, never proceeded.
+    LoadError { id: BrowserId, url: String, code: i32, kind: String },
     /// CSS cursor name: "default", "pointer", "text", "grab", ...
     Cursor { id: BrowserId, name: String },
     Favicon { id: BrowserId, url: String },
@@ -350,6 +370,9 @@ mod tests {
         roundtrip_app(AppToHost::SetStyle { id: "b1".into(), req: 11, node: "#a".into(), prop: "margin".into(), value: None });
         roundtrip_app(AppToHost::RevertStyle { id: "b1".into(), req: 12, node: "#a".into() });
         roundtrip_app(AppToHost::PickInfo { id: "b1".into(), req: 13, x: 210.0, y: 130.5 });
+        for step in [PickStep::Parent, PickStep::Child, PickStep::Prev, PickStep::Next] {
+            roundtrip_app(AppToHost::PickRelative { id: "b1".into(), req: 14, from: "#go".into(), step });
+        }
         roundtrip_app(AppToHost::Shutdown);
     }
 
@@ -359,6 +382,7 @@ mod tests {
         roundtrip_host(HostToApp::Frame { id: "b1".into(), seq: 1, surface: SurfaceRef::GlobalId { id: 42 }, size: PixelSize { w: 1600, h: 1200 }, scale: 2.0 });
         roundtrip_host(HostToApp::Frame { id: "b1".into(), seq: 2, surface: SurfaceRef::MachPort { name: "com.herdr.s".into() }, size: PixelSize { w: 2, h: 2 }, scale: 1.0 });
         roundtrip_host(HostToApp::Loading { id: "b1".into(), loading: true, can_back: false, can_forward: false });
+        roundtrip_host(HostToApp::LoadError { id: "b1".into(), url: "http://127.0.0.1:9/".into(), code: -102, kind: "refused".into() });
         roundtrip_host(HostToApp::ImeCaret { id: "b1".into(), x: 1.0, y: 2.0, w: 1.0, h: 16.0 });
         roundtrip_host(HostToApp::EvalResult { id: "b1".into(), req: 1, ok: true, value: serde_json::json!({"n": 2}) });
         roundtrip_host(HostToApp::CdpTarget { id: "b1".into(), target_id: "T1".into() });

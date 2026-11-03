@@ -377,6 +377,9 @@ struct Behavior {
     /// script had no way to.
     on_mouse_down_out: Option<CallbackId>,
     on_drop: Option<CallbackId>,
+    /// HERDR: an OS file drag moved into / out of this element (plain elements only).
+    on_drag_enter: Option<CallbackId>,
+    on_drag_leave: Option<CallbackId>,
     /// Wheel and trackpad scrolling over this element.
     on_scroll_wheel: Option<CallbackId>,
     /// Handlers for named actions, one entry per action listened for.
@@ -598,6 +601,8 @@ impl Behavior {
             || self.on_hover.is_some()
             || self.on_key_down.is_some()
             || self.on_drop.is_some()
+            || self.on_drag_enter.is_some()
+            || self.on_drag_leave.is_some()
             || self.on_key_up.is_some()
             || self.on_modifiers_changed.is_some()
             || !self.on_mouse_down.is_empty()
@@ -2169,6 +2174,7 @@ fn flex_element(
     let stateful = element.id(identity.clone());
     let stateful = with_gpui_focus(stateful, &behavior, focus.as_ref());
     let stateful = with_input_handlers(stateful, &behavior, runtime);
+    let stateful = with_drag_hover(stateful, &identity, &behavior, runtime, window, cx);
     let stateful = components::dock::with_commands(stateful, &behavior, runtime, cx);
     let stateful = with_aria(stateful, &behavior);
     let mut stateful = with_active_and_focus(stateful, &states);
@@ -2236,6 +2242,49 @@ fn flex_element(
         (false, false) => stateful,
     };
     observe_size(finish(stateful, refinement, children), identity, behavior.on_size_change, runtime, window, cx)
+}
+
+// HERDR: `on_drag_enter` / `on_drag_leave` for OS file drags. GPUI turns an external drag into an
+// active `ExternalPaths` drag plus mouse moves, so a drag-move listener sees it cross the element.
+// The inside flag lives in keyed state so it survives re-renders; a drag that ends while inside
+// (dropped, or carried out of the window) leaves on the next render.
+fn with_drag_hover<E: StatefulInteractiveElement>(
+    element: E, identity: &gpui::ElementId, behavior: &Behavior,
+    runtime: &Rc<ShellRuntime>, window: &mut Window, cx: &mut App,
+) -> E {
+    let (enter, leave) = (behavior.on_drag_enter, behavior.on_drag_leave);
+    if (enter.is_none() && leave.is_none()) || checking() {
+        return element;
+    }
+    let inside = window.use_keyed_state((identity.clone(), "drag-hover"), cx, |_, _| Rc::new(Cell::new(false))).read(cx).clone();
+    if inside.get() && !cx.has_active_drag() {
+        inside.set(false);
+        if let Some(id) = leave {
+            let runtime = Rc::downgrade(runtime);
+            window.defer(cx, move |window, cx| {
+                if let Some(runtime) = runtime.upgrade() {
+                    runtime.dispatch_drag_leave(id, window, cx);
+                }
+            });
+        }
+    }
+    let runtime = Rc::downgrade(runtime);
+    element.on_drag_move::<gpui::ExternalPaths>(move |ev, window, cx| {
+        let now = ev.bounds.contains(&ev.event.position);
+        if now == inside.get() {
+            return;
+        }
+        inside.set(now);
+        let Some(runtime) = runtime.upgrade() else { return };
+        match (now, enter, leave) {
+            (true, Some(id), _) => {
+                let count = ev.drag(cx).paths().len();
+                runtime.dispatch_drag_enter(id, ev.event.position, count, window, cx);
+            }
+            (false, _, Some(id)) => runtime.dispatch_drag_leave(id, window, cx),
+            _ => {}
+        }
+    })
 }
 
 fn observe_size(
@@ -2709,6 +2758,8 @@ pub(in crate::materialize) fn resolve_ops(
                 "on_mouse_up_middle" => behavior.on_mouse_up.push((MouseButton::Middle, *id)),
                 "on_mouse_down_out" => behavior.on_mouse_down_out = Some(*id),
                 "on_drop" => behavior.on_drop = Some(*id),
+                "on_drag_enter" => behavior.on_drag_enter = Some(*id),
+                "on_drag_leave" => behavior.on_drag_leave = Some(*id),
                 "on_scroll_wheel" => behavior.on_scroll_wheel = Some(*id),
                 "on_resize" => behavior.on_resize = Some(*id),
                 "on_size_change" => behavior.on_size_change = Some(*id),

@@ -53,6 +53,11 @@ path = "tests/shot_pixels.rs"
 harness = false
 
 [[test]]
+name = "titlebar_fullscreen"
+path = "tests/titlebar_fullscreen.rs"
+harness = false
+
+[[test]]
 name = "browser_shot"
 path = "tests/browser_shot.rs"
 harness = false
@@ -60,6 +65,11 @@ harness = false
 [[test]]
 name = "browser_raw_chords"
 path = "tests/browser_raw_chords.rs"
+harness = false
+
+[[test]]
+name = "browser_load_errors"
+path = "tests/browser_load_errors.rs"
 harness = false
 
 [[test]]
@@ -156,6 +166,7 @@ gpui-shell = { path = "vendor/gpui-kit/crates/shell", features = ["render-test-s
 gpui_linux = { package = "gpui-pre-linux", version = "=0.3.8", features = ["render-to-image"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+raw-window-handle = "0.6"
 gpui_macos = { package = "gpui-pre-macos", version = "=0.3.8", features = ["render-to-image"] }
 libc = "0.2"
 core-video = "0.5.2"

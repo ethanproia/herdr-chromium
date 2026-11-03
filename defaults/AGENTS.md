@@ -581,7 +581,8 @@ The main ones:
   Add machine lists all named ssh-config hosts in a scrollable list. Setup
   prompts open above the picker; close the setup terminal to return to the
   updated list and any machine-specific guidance.
-- Window: `window.minimize`, `window.maximize` (or back), `window.close`.
+- Window: `window.minimize`, `window.maximize` (or back), `window.close`;
+  `window.native` (macOS) reports the title bar as the system sees it.
 - macOS: `app.quit`, `app.hide`, `app.hide_others`, `app.show_all`.
 
 When the user runs a command without a required name (a key, a click), Herdr
@@ -675,6 +676,9 @@ What's about the user, never a look:
   background; this is a threshold, not a guaranteed resulting ratio.
   Box/block, Powerline and sprite glyph colors are never adjusted.
   Changes apply immediately, including text already on screen.
+- `glass`: macOS only, `true` blurs what's behind the window through the
+  layout's own background colors (sidebar, canvas, shown at 60%); panes,
+  terminals and browser blocks stay opaque. Off by default.
 - `clipboard_write`: `false` blocks terminal programs from writing the local
   clipboard (default `true`, including remote terminals attached in this window).
   OSC 52 accepts base64 UTF-8 text up to 1 MiB: `c` writes the system clipboard,

@@ -16,7 +16,7 @@
 //! Printable keys send `Key` down and let the event continue, so the platform's text input
 //! (layouts, dead keys, IME) delivers the characters as `Text` through `replace_text_in_range`.
 
-use super::protocol::{self, AppToHost, BrowserId, EditCommand, ImeEvent, InputEvent, KeyKind, MouseKind};
+use super::protocol::{self, AppToHost, BrowserId, EditCommand, ImeEvent, InputEvent, KeyKind, MouseKind, PickStep};
 use super::HostLink;
 use gpui::{
     Bounds, Context, CursorStyle, Entity, EntityInputHandler, FocusHandle, KeyDownEvent, KeyUpEvent,
@@ -75,6 +75,8 @@ pub enum OverlayEvent {
     Refused,
     /// The owner changed (the view re-renders its mode chrome).
     Owner(Owner),
+    // HERDR: arrow keys while picking (A3): Up the parent, Down the first child, Left/Right siblings.
+    PickStep(PickStep),
 }
 
 /// The comment field's text: committed text, an open IME composition and undo history.
@@ -200,6 +202,11 @@ impl BrowserInput {
     /// The comment's text for saving; the field is left empty (text, composition and undo).
     pub fn take_comment(&mut self) -> String {
         std::mem::take(&mut self.comment).text
+    }
+
+    // HERDR: a pin's Edit (A9) opens the field holding its comment; marked text and undo start fresh.
+    pub fn set_comment(&mut self, text: &str) {
+        self.comment = CommentField { text: text.to_owned(), ..CommentField::default() };
     }
 
     /// Everything the overlay owners were sent since the last call.
@@ -508,6 +515,19 @@ impl BrowserInput {
                 _ => self.overlay.push(OverlayEvent::Edit { owner, command }),
             }
             return true;
+        }
+        if owner == Owner::Pick && !k.modifiers.modified() {
+            let step = match k.key.as_str() {
+                "up" => Some(PickStep::Parent),
+                "down" => Some(PickStep::Child),
+                "left" => Some(PickStep::Prev),
+                "right" => Some(PickStep::Next),
+                _ => None,
+            };
+            if let Some(step) = step {
+                self.overlay.push(OverlayEvent::PickStep(step));
+                return true;
+            }
         }
         match owner {
             Owner::Pick | Owner::Markup if k.key == "space" && !k.modifiers.modified() => {
@@ -1076,6 +1096,36 @@ mod tests {
         i.escape();
         assert!(i.enter(Owner::Comment));
         assert_eq!(i.comment().text, "", "a new comment does not start with the last one's text");
+    }
+
+    /// Arrow keys while picking walk the DOM (the view asks the host for the relative) and never
+    /// reach the page; in Browse they are the page's.
+    #[gpui::test]
+    fn arrows_in_pick_step_through_the_dom_not_the_page(cx: &mut TestAppContext) {
+        let (rec, block, cx) = setup(cx);
+        with(cx, &block, |i| {
+            i.enter(Owner::Pick);
+            i.take_overlay();
+        });
+        cx.simulate_keystrokes("up down left right shift-up");
+        assert!(rec.inputs().is_empty(), "the page saw no arrows while picking");
+        let steps: Vec<_> = with(cx, &block, |i| i.take_overlay()).into_iter().filter_map(|e| match e { OverlayEvent::PickStep(s) => Some(s), _ => None }).collect();
+        assert_eq!(steps, [PickStep::Parent, PickStep::Child, PickStep::Prev, PickStep::Next], "a modified arrow is not a step");
+        with(cx, &block, |i| i.escape());
+        cx.simulate_keystrokes("up");
+        assert_eq!(rec.inputs().len(), 1, "in Browse the page gets its arrow");
+    }
+
+    #[test]
+    fn set_comment_opens_the_field_with_a_pins_text() {
+        let mut i = BrowserInput::new("b1".into(), Arc::new(Recording::default()));
+        assert!(i.enter(Owner::Pick) && i.enter(Owner::Comment));
+        i.set_comment("make it bigger");
+        assert_eq!(i.comment().text, "make it bigger");
+        i.comment.undo();
+        assert_eq!(i.comment().text, "make it bigger", "nothing to undo past the opened text");
+        i.comment.commit("!");
+        assert_eq!(i.take_comment(), "make it bigger!");
     }
 
     #[test]
