@@ -28,16 +28,20 @@ fn load(dir: &Path) -> Decisions {
     }
 }
 
-/// The stored answer for every one of `kinds` at `origin`: Some(false) if any is blocked,
-/// Some(true) if all are allowed, None (ask) if any is undecided. Exact origin and kind only.
+/// The stored answer for `kinds` at `origin`: Some(false) if any is blocked (a stored denial wins,
+/// even bundled with an undecided kind), Some(true) if all are allowed, else None (ask). Exact
+/// origin and kind only.
 pub fn decided(dir: &Path, profile: &str, origin: &str, kinds: &[String]) -> Option<bool> {
     if profile != super::agent::PERSON_PROFILE || kinds.is_empty() {
         return None;
     }
     let d = load(dir);
     let site = d.get(origin)?;
-    let answers: Vec<bool> = kinds.iter().map(|k| site.get(k).copied()).collect::<Option<_>>()?;
-    Some(answers.iter().all(|a| *a))
+    let answers: Vec<Option<bool>> = kinds.iter().map(|k| site.get(k).copied()).collect();
+    if answers.contains(&Some(false)) {
+        return Some(false);
+    }
+    answers.iter().all(|a| *a == Some(true)).then_some(true)
 }
 
 /// "Remember for this site" (allow) or "Never on this site" (block), for the person's profile.
@@ -116,6 +120,11 @@ mod tests {
         assert_eq!(decided(d.path(), "default", "https://meet.test:8443", &kinds(&["camera"])), None, "another origin asks");
         remember(d.path(), "default", o, &kinds(&["microphone"]), false).unwrap();
         assert_eq!(decided(d.path(), "default", o, &kinds(&["camera", "microphone"])), Some(false), "a block is remembered too");
+        // A stored "never" wins over an undecided kind in the same request.
+        remember(d.path(), "default", "https://n.test", &kinds(&["camera"]), false).unwrap();
+        assert_eq!(decided(d.path(), "default", "https://n.test", &kinds(&["camera", "microphone"])), Some(false));
+        assert_eq!(decided(d.path(), "default", "https://n.test", &kinds(&["microphone", "camera"])), Some(false));
+        assert_eq!(decided(d.path(), "default", "https://n.test", &kinds(&["microphone"])), None);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
