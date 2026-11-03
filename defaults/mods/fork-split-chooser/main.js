@@ -47,11 +47,26 @@ export default class SplitChooser extends View {
     const pane = this.me();
     if (pane) run("pane.close", { pane });
   }
+  // Same look as the Notepad / menu: one label, 32px rows with a 16px icon, name and faint number key; one
+  // highlight that follows the pointer and the arrow keys; a hairline between Herdr's panels and the agents.
   render() {
     const t = theme();
     const list = this.choices();
     if (this.at >= list.length) this.at = 0;
+    const builtIn = 3;   // Terminal, Browser, Notepad
+    const rows = [];
+    list.forEach(([id, icon, name, extra], i) => {
+      if (i === builtIn) rows.push(div().h(1).mx(-4).my(4).bg(t.border));
+      rows.push(h_flex().id(`sc-${id}`).h(32).px(8).gap(10).rounded(6).items_center().flex_none().cursor_pointer()
+        .when(i === this.at, (el) => el.bg(t.hover))
+        .on_hover((h, cx) => { if (h && this.at !== i) { this.at = i; cx.notify(); } })
+        .on_click(() => this.pick(extra))
+        .child(div().size(16).flex_none().flex().items_center().justify_center().text_color(i === this.at ? t.foreground : t.muted).child(icon))
+        .child(div().flex_1().min_w(0).truncate().text_size(14).text_color(t.foreground).child(name))
+        .child(div().flex_none().text_size(12).text_color(t.dim).child(i < 9 ? String(i + 1) : "")));
+    });
     return v_flex().id("fork-split-chooser").track_focus(this.handle).size_full().bg(t.background).items_center().justify_center().p(16)
+      .font_family(".SystemUIFont")
       .on_mouse_down("left", () => this.handle.focus())
       .on_key_down((e, cx) => {
         const n = /^[1-9]$/.test(e.key) ? Number(e.key) - 1 : -1;
@@ -63,15 +78,8 @@ export default class SplitChooser extends View {
         else return;
         cx.notify();
       })
-      .child(v_flex().w_full().max_w(320).gap(2).text_size(13)
-        .child(div().px(10).pb(8).text_size(12).text_color(t.dim).child(props()?.replace ? "Turn this pane into" : "Open in this pane"))
-        .children(list.map(([id, icon, name, extra], i) =>
-          h_flex().id(`sc-${id}`).h(34).px(10).gap(10).rounded(7).items_center().flex_none().text_color(t.foreground)
-            .when(i === this.at, el => el.bg(t.selected))
-            .hover(s => s.bg(t.hover))
-            .on_click(() => this.pick(extra))
-            .child(icon).child(div().flex_1().child(name))
-            .child(div().text_size(11).text_color(t.dim).child(i < 9 ? String(i + 1) : ""))))
-        .child(div().px(10).pt(10).text_size(11).text_color(t.dim).child("↑↓ move · Enter or 1–9 pick · Esc close")));
+      .child(v_flex().w_full().max_w(300).p(4).rounded(8).border(1).border_color(t.border).bg(t.popover).shadow_md()
+        .child(div().px(8).pt(4).pb(6).text_size(12).font_weight(500).text_color(t.dim).child(props()?.replace ? "Turn this pane into" : "Open in this pane"))
+        .children(rows));
   }
 }

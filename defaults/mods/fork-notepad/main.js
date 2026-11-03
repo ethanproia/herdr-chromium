@@ -4,17 +4,27 @@
 // Save-with-check and the folder watch loop are adapted from herdsidian (MIT, (c) 2026 Andersson Quintero).
 import { View, div, svg } from "gpui-kit";
 import { h_flex, v_flex, Textarea, TextareaState, Popup, TextView, Editor, EditorState } from "gpui-base";
-import { theme, settings, home, exec, readTextFile, writeTextFile, watchFolder, nextCommand, props, shared, setShared,
-  closeOverlay, notify, pickFolder } from "herdr";
+import { theme, settings, home, appHome, exec, readTextFile, writeTextFile, watchFolder, nextCommand, props, shared, setShared,
+  closeOverlay, openOverlay, notify, pickFolder } from "herdr";
 import { splitRows, joinRows, isFence, parseRow, filterTypes, setType, continuePrefix, isEmptyItem, toggleTask,
   parseInline, titleOf, slugOf, toPlain, toHtml, splitFront, iconOf, withIcon, TYPES, linkSpans } from "./rows.js";
 import { IconPicker, iconElement } from "./iconpicker.js";
 import { loadItems, openHref, KIND_ICON } from "./mentions.js";
 import { filterItems, encodeLink, parseHref } from "./mentions-core.js";
 import { Embeds } from "./embeds.js";
+import { dateItems as dateRows, parseTyped, dateLabel, dateText } from "./dates.js";
+import { DatePicker } from "./datepicker.js";
 import { embedOf } from "./embeds-core.js";
 
-const NOTES_DIR = home() + "/Notes";
+// Where the note lives: settings.json "notepad_dir" (absolute, or relative to the app home), else a test home's
+// own data/notepad (any non-default HERDR_APP_HOME, so test runs never touch the real notes), else ~/Notes.
+function notesDir() {
+  const set = settings().notepad_dir;
+  if (typeof set === "string" && set) return set.startsWith("/") ? set : `${appHome()}/${set}`;
+  if (appHome() !== `${home()}/.config/herdr-app`) return `${appHome()}/data/notepad`;
+  return home() + "/Notes";
+}
+const NOTES_DIR = notesDir();
 const NOTE_PATH = NOTES_DIR + "/notepad.md";
 const LOCK = NOTE_PATH + ".lock";               // shared with bin/notepad: one writer at a time
 const DRAFT = NOTES_DIR + "/.notepad.draft.md";  // unsaved text kept when the pane closes mid-conflict
@@ -38,6 +48,13 @@ const words = (s) => s.split(/(?<=\s)/).filter(Boolean);
 const SLASH = /(^|\s)\/([\w-]*)$/;
 const AT = /(^|\s)@([^\s@]*)$/;
 const BY = /\s*<!-- by (.+?) -->$/;           // a line an agent added: shown as a faint "· name"
+// Snap sizes to whole pixels at the zoom a mod sees (Herdr reports zoom 1 to mods and scales afterwards, so on most
+// setups this is a no-op; the real line-switch fix is measure() / editFix below).
+const SCALE = 2;   // retina; FORK: no device scale factor exposed to mods
+// The text box also rounds its line height up to a whole point first, so a line height must be a whole number
+// that is also whole screen pixels after zoom (25 at zoom 1.1 = 27.5pt = 55px). Padding: whole screen pixels.
+const snap = (lh) => { const z = settings().zoom ?? 1; for (let v = Math.round(lh); v < lh + 12; v++) if (Number.isInteger(+(v * z * SCALE).toFixed(6))) return v; return Math.round(lh); };
+const snapPad = (v) => { const z = settings().zoom ?? 1; return Math.round(v * z * SCALE) / (z * SCALE); };
 const DROP = "#2383E2";                         // Notion's drop-line blue
 // The page font: macOS's system font, like Notion. Herdr's bundled UI font has no bold, so headings looked flat.
 const FONT = ".SystemUIFont";
@@ -58,6 +75,7 @@ export default class Notes extends View {
     this.handle = cx.focus_handle();
     if (props()?.export) { this.exporting = false; return; }   // opened by the header's Export button
     if (props()?.view) return this.initViewer(cx);              // a file mention opened beside the note
+    if (props()?.headerMenu || props()?.backlinks) return;       // small popups: no note, no file watch
     this.ta = TextareaState.new({});   // placeholders are drawn by renderActive (they change with the row type)
     this.titleTa = TextareaState.new({ placeholder: "Untitled" });
     this.titleTa.set_auto_grow(1, 8);
@@ -78,11 +96,14 @@ export default class Notes extends View {
     this.suffix = "";         // the active row's hidden "by" marker, kept out of the text box
     this.picker = new IconPicker();
     this.embeds = new Embeds();
+    this.datePicker = new DatePicker();
+    this.dateOpen = null;     // { id, href }: the date mention whose picker is open
     this.pickerOpen = false; this.pickerClosedAt = 0; this.titleHover = false;
     this.mentions = []; this.mentionsAt = 0;
     this.hoverRow = -1; this.hoverSeq = 0; this.drag = null;
     this.width = 800;      // pane width (on_size_change); FORK: panes have no min width a mod can set
-    this.rowH = {};        // measured row heights by state, for the line-switch jitter check (see measure()) this.dragMoved = false; this.blockMenu = -1;
+    this.rowH = {};        // measured row heights by state (see measure())
+    this.editFix = 0;      // px added above the text box so it matches the styled line this.dragMoved = false; this.blockMenu = -1;
 
     cx.spawn(async (cx) => {
       try { await exec("mkdir", ["-p", NOTES_DIR]); } catch (e) { this.error = `Cannot create ${NOTES_DIR}: ${e}`; }
@@ -373,7 +394,13 @@ export default class Notes extends View {
       cx.spawn(async (cx) => { this.mentions = await loadItems(); if (this.menu?.type === "at") { this.updateMenu(cx); cx.notify(); } });
     }
     const type = at ? "at" : "slash";
-    const items = at ? filterItems(this.mentions, at[2]) : filterTypes(m[2]);
+    let items;
+    if (at) {
+      const now = new Date();
+      const typed = at[2] ? parseTyped(at[2], now) : null;
+      const others = this.mentions.filter((x) => x.kind !== "date");
+      items = [...(typed ? [typed] : []), ...filterItems([...dateRows(now), ...others], at[2])];
+    } else items = filterTypes(m[2]);
     if (!items.length && type === "slash") { this.menu = null; return; }
     const opening = !this.menu;
     this.menu = { type, at: Math.max(0, Math.min(this.menu?.at ?? 0, items.length - 1)), items, query: (at ?? m)[2] };
@@ -481,6 +508,17 @@ export default class Notes extends View {
     cx.notify();
   }
 
+  // The date picker changed a date mention: rewrite that link (null = Clear: drop the mention).
+  changeDate(oldHref, newHref, cx) {
+    const at = this.rows.findIndex((row) => row.includes(`](${oldHref})`));
+    if (at < 0) return;
+    const re = new RegExp(`\\[[^\\]]*\\]\\(${oldHref.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\)`);
+    this.rows[at] = this.rows[at].replace(re, newHref ? `[${dateText(newHref)}](${newHref})` : "").replace(/ {2,}/g, " ");
+    if (!newHref) this.dateOpen = null; else this.dateOpen = { ...this.dateOpen, href: newHref };
+    this.edited(cx);
+    cx.notify();
+  }
+
   // Notion's +: a new row below with the / menu open.
   addBelow(i, cx) {
     i = Math.max(0, i);
@@ -499,7 +537,7 @@ export default class Notes extends View {
   onKey(e, cx) {
     const k = e.keystroke;
     if (k === "cmd-e" || k === "cmd-shift-m") return this.toggleMd();
-    if (k === "escape" && (this.pickerOpen || this.blockMenu >= 0)) { this.pickerOpen = false; this.blockMenu = -1; return cx.notify(); }
+    if (k === "escape" && (this.pickerOpen || this.blockMenu >= 0 || this.dateOpen)) { this.pickerOpen = false; this.blockMenu = -1; this.dateOpen = null; return cx.notify(); }
     if (this.active < 0) return;
     if (this.menu) return this.menuKey(e, cx);
     if (k === "escape") { this.commit(); this.handle.focus(); return cx.notify(); }
@@ -530,8 +568,23 @@ export default class Notes extends View {
       if (r.t === "mark" && !this.md) continue;
       if (r.t === "link" && !this.md) {
         const href = r.href;
-        row.child(this.badge(t, href, r.s, size, lh, opts.color).id(`lk-${this.linkSeq++}`)
-          .on_click((_e, cx) => { cx.stop_propagation(); openHref(href, cx); }));
+        const id = `lk-${this.linkSeq++}`;
+        const b = this.badge(t, href, r.s, size, lh, opts.color).id(id)
+          .on_click((_e, cx) => {
+            cx.stop_propagation();
+            if (parseHref(href).kind !== "date") return openHref(href, cx);
+            this.dateOpen = this.dateOpen?.id === id ? null : { id, href };
+            if (this.dateOpen) this.datePicker.open(href);
+            cx.notify();
+          });
+        row.child(this.dateOpen?.id === id
+          ? Popup.new(`dp-${id}`, b).anchor("top_left").content(div().mt(4)
+            .on_mouse_down_out((_e, cx) => { this.dateOpen = null; cx.notify(); })
+            .child(this.datePicker.render(t, {
+              onChange: (nh, cx) => this.changeDate(href, nh, cx),
+              onClose: (cx) => { this.dateOpen = null; cx.notify(); },
+            })))
+          : b);
         continue;
       }
       if (r.t === "code") {
@@ -555,6 +608,7 @@ export default class Notes extends View {
   // Used both in styled lines and as the text box's inline token, so a mention looks the same while typing.
   badge(t, href, label, size, lh, color, selected) {
     const kind = parseHref(href).kind;
+    if (kind === "date") label = "@" + dateLabel(href, new Date());   // Notion: relative, recomputed ("@Today 11:15 AM")
     return h_flex().px(2).gap(3).items_center().rounded(3).cursor_pointer().when(Boolean(selected), (b) => b.bg(t.selection))
       .hover((s) => s.bg(t.hover))
       .child(svg(`mods/fork-notepad/icons/${BADGE_ICON[kind] ?? "bookmark"}.svg`).size(Math.round(size * 0.85)).flex_none().text_color(t.muted))
@@ -564,8 +618,8 @@ export default class Notes extends View {
 
   // Size and weight a row's text uses, styled or in the text box.
   metrics(r) {
-    if (r.kind === "h") { const [size, lh, weight, top] = S.h[r.level]; return { size, lh, weight, top }; }
-    return { size: S.body, lh: S.lh, weight: 400, top: 0 };
+    if (r.kind === "h") { const [size, lh, weight, top] = S.h[r.level]; return { size, lh: snap(lh), weight, top }; }
+    return { size: S.body, lh: snap(S.lh), weight: 400, top: 0 };
   }
 
   checkbox(t, i, checked) {
@@ -586,7 +640,7 @@ export default class Notes extends View {
   }
 
   renderTitle(t, row) {
-    const [size, lh, weight] = S.title;
+    const [size, lh0, weight] = S.title; const lh = snap(lh0);
     const text = this.titleText(row);
     const wrap = div().id("row-0").w_full().pb(10).cursor_text().on_click((_e, cx) => this.activate(0, cx, true));
     if (!text) return wrap.child(div().text_size(size).line_height(`${lh}px`).font_weight(weight).text_color(t.dim).child("Untitled"));
@@ -603,7 +657,7 @@ export default class Notes extends View {
       .child(this.embeds.render(t, em, this.embeds.get(em, cx), S.width - 2 * this.pad));
     const r = parseRow(row);
     const { size, lh, weight, top } = this.metrics(r);
-    const wrap = div().id(`row-${i}`).w_full().pt(S.rowPad + top).pb(S.rowPad).cursor_text()
+    const wrap = div().id(`row-${i}`).w_full().pt(snapPad(S.rowPad + top)).pb(snapPad(S.rowPad)).cursor_text()
       .on_click((_e, cx) => this.activate(i, cx, true));
     if (r.kind === "hr") return wrap.py(9).child(this.md ? div().text_size(S.body).text_color(t.dim).child("---") : div().h(1).w_full().bg(t.border));
     if (r.kind === "code") {
@@ -635,7 +689,7 @@ export default class Notes extends View {
 
   renderActive(t, i) {
     if (i === 0) {
-      const [size, lh, weight] = S.title;
+      const [size, lh0, weight] = S.title; const lh = snap(lh0);
       // Size and weight sit on the wrapper too: text styles cascade, and the text box alone ignores weight.
       return div().id("row-0").w_full().pb(10).text_size(size).line_height(`${lh}px`).font_weight(weight).text_color(t.foreground)
         .child(Textarea.new(this.titleTa).w_full().p(0).border(0).bg(t.background).font_family(FONT)
@@ -643,7 +697,7 @@ export default class Notes extends View {
     }
     const row = this.rows[i];
     const r = parseRow(row);
-    const { size, lh, weight, top } = this.metrics(this.md ? { kind: "p" } : r);
+    const { size, lh, weight, top } = this.metrics(r);   // same metrics as the styled line, Markdown on or off
     const field = Textarea.new(this.ta)
       .token((tk) => this.badge(t, tk.token.id, tk.token.label ?? tk.token.text, size, lh, null, tk.selected))
       .on_token_click((e, cx) => openHref(e.token.id, cx))
@@ -661,7 +715,7 @@ export default class Notes extends View {
       const lead = this.lead(t, r, i, lh);
       body = h_flex().w_full().items_start().pl((r.indent?.length ?? 0) * S.indent).when(Boolean(lead), (el) => el.child(lead)).child(div().flex_1().min_w_0().child(box));
     }
-    const holder = div().id(`row-${i}`).w_full().pt(S.rowPad + (this.md ? 0 : top)).pb(S.rowPad).child(body);
+    const holder = div().id(`row-${i}`).w_full().pt(snapPad(S.rowPad + top) + this.editFix).pb(snapPad(S.rowPad)).child(body);
     const menu = this.menu && this.renderMenu(t);
     return Popup.new("slash", holder).anchor("top_left").when(Boolean(menu), (el) => el.content(menu));
   }
@@ -753,6 +807,19 @@ export default class Notes extends View {
       .when(this.blText !== null && !lines.length, (el) => el.child(div().px(8).py(6).text_size(13).text_color(t.dim).child("No mentions")));
   }
 
+  // The header's ••• menu in a narrow pane: the Notepad buttons that didn't fit.
+  renderHeaderMenu() {
+    const t = theme();
+    const item = (id, icon, label, on, action) => h_flex().id(`hm-${id}`).h(32).px(8).gap(8).items_center().rounded(6).cursor_pointer()
+      .hover((s) => s.bg(t.hover)).on_click((_e, cx) => { closeOverlay(props().overlay); action(cx); })
+      .child(svg(`mods/fork-notepad/${icon}.svg`).size(16).text_color(t.muted))
+      .child(div().flex_1().text_size(13).text_color(t.foreground).child(label))
+      .when(on !== null, (el) => el.child(div().text_size(12).text_color(t.dim).child(on ? "On" : "Off")));
+    return v_flex().id("header-menu").size_full().p(4).gap(1).bg(t.popover)
+      .child(item("md", "md", "Markdown", this.md, () => this.toggleMd()))
+      .child(item("ex", "export", "Export…", null, () => openOverlay({ mod: "fork-notepad", kind: "popup", props: { export: true }, width: 220, height: 176 })));
+  }
+
   renderExport() {
     const t = theme();
     const item = (id, label, hint) => h_flex().id(`ex-${id}`).h(32).px(8).gap(8).items_center().rounded(6).cursor_pointer()
@@ -803,19 +870,17 @@ export default class Notes extends View {
     });
   }
 
-  // Jitter check: a line's height when it's the text box vs styled must match. Records both and writes any
-  // mismatch to ~/work.noindex/herdr-notepad/jitter.json (temporary instrument; remove once both states match).
+  // Line-switch jitter: the text box lays a line out up to a screen pixel shorter than styled text (they round line
+  // height differently), so the line you move onto shrank and its text rose ~1px. Rows report their real heights in
+  // both states; the difference is added above the text box, which makes both the height and the text position match
+  // at any zoom. Measured 2026-11-03: 33.0 vs 33.5 at zoom 1.1 (proof in work.noindex/herdr-notepad/jitter/).
   measure(i, row, size, cx) {
     const state = i === this.active ? "edit" : "styled";
-    const k = row, prev = this.rowH[k] ?? {};
-    if (prev[state] === size.height) return;
-    this.rowH[k] = { ...prev, [state]: size.height };
-    const rec = this.rowH[k];
-    if (rec.edit !== undefined && rec.styled !== undefined) {
-      this.jitter = { ...(this.jitter ?? {}), [row.slice(0, 40)]: { kind: parseRow(row).kind, edit: rec.edit, styled: rec.styled, diff: +(rec.edit - rec.styled).toFixed(2) } };
-      const out = JSON.stringify({ at: new Date().toISOString(), width: this.width, rows: this.jitter }, null, 1);
-      exec("sh", ["-c", 'printf %s "$1" > "$2"', "sh", out, home() + "/work.noindex/herdr-notepad/jitter.json"]).catch(() => {});
-    }
+    const rec = (this.rowH[row] ??= {});
+    if (state === "edit") rec.edit = size.height - this.editFix; else rec.styled = size.height;
+    if (rec.edit === undefined || rec.styled === undefined) return;
+    const fix = Math.max(0, Math.min(3, rec.styled - rec.edit));
+    if (Math.abs(fix - this.editFix) > 0.01) { this.editFix = fix; cx.notify(); }
   }
 
   get pad() { return this.width < S.narrow ? S.padNarrow : S.padX; }
@@ -838,7 +903,7 @@ export default class Notes extends View {
       .child(div().h(1).mx(4).my(4).bg(t.border))
       .child(div().px(8).py(4).text_size(12).font_weight(500).text_color(t.muted).child("Turn into"))
       .children(TYPES.filter((x) => x.id !== "hr").map((x) => menuItem(x.id, x.name, x.id)));
-    const handles = h_flex().id(`handles-${i}`).absolute().left(this.pad - 24 * 2 - 2 - 4).top(S.rowPad + top + (lh - 24) / 2).gap(2)
+    const handles = h_flex().id(`handles-${i}`).absolute().left(this.pad - 24 * 2 - 2 - 4).top(snapPad(S.rowPad + top) + (lh - 24) / 2).gap(2)
       .on_hover((h, cx) => this.hoverAt(i, h, cx))
       .child(handle(`add-${i}`, svg("mods/fork-notepad/plus.svg").size(16)).on_click((e, cx) => this.addBelow(e.modifiers?.alt ? i - 1 : i, cx)))  // ⌥-click: above (Notion)
       .child(Popup.new(`bm-pop-${i}`, grip).anchor("top_left").when(this.blockMenu === i, (p) => p.content(menu)));
@@ -892,6 +957,7 @@ export default class Notes extends View {
   render(cx) {
     if (props()?.view) return this.renderViewer();
     if (props()?.export) return this.renderExport();
+    if (props()?.headerMenu) return this.renderHeaderMenu();
     if (props()?.backlinks) return this.renderBacklinks(cx);
     const t = theme();
     this.linkSeq = 0;

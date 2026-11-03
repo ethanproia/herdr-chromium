@@ -1,6 +1,7 @@
 // Data side of @ mentions: gathers dates, chats, tabs and files, and opens a clicked link.
 import { agents, terminals, spaces, panes, focused, exec, run, home } from "herdr";
-import { dateItems, parseHref } from "./mentions-core.js";
+import { parseHref } from "./mentions-core.js";
+import { dateItems } from "./dates.js";   // Notion's date rows: Today, Now, Tomorrow, Yesterday
 
 export const KIND_ICON = { date: "📅", agent: "💬", tab: "▤", file: "📄" };
 
