@@ -848,6 +848,7 @@ fn handle(m: AppToHost) {
         | M::SetZoom { .. }
         | M::Overlay { .. }
         | M::PickInfo { .. }
+        | M::PickRelative { .. }
         | M::Styles { .. }
         | M::SetStyle { .. }
         | M::RevertStyle { .. }
@@ -897,7 +898,7 @@ fn browser_msg(m: AppToHost) {
     let id = match &m {
         M::Navigate { id, .. } | M::Back { id } | M::Forward { id } | M::Reload { id, .. } | M::Stop { id } | M::Resize { id, .. }
         | M::Focus { id, .. } | M::SetZoom { id, .. } | M::Input { id, .. } | M::Edit { id, .. } | M::Find { id, .. } | M::StopFind { id, .. }
-        | M::DevTools { id, .. } | M::Eval { id, .. } | M::Overlay { id, .. } | M::PickInfo { id, .. } | M::Styles { id, .. } | M::SetStyle { id, .. } | M::RevertStyle { id, .. } | M::SetVisible { id, .. } => id.clone(),
+        | M::DevTools { id, .. } | M::Eval { id, .. } | M::Overlay { id, .. } | M::PickInfo { id, .. } | M::PickRelative { id, .. } | M::Styles { id, .. } | M::SetStyle { id, .. } | M::RevertStyle { id, .. } | M::SetVisible { id, .. } => id.clone(),
         other => {
             debug(format_args!("not a browser message, dropped: {}", encode(&other)));
             return;
@@ -1014,6 +1015,14 @@ fn browser_msg(m: AppToHost) {
         // Pick payload (S4): fork-host implements; until then "nothing there".
         M::PickInfo { req, x, y, .. } => {
             let call = handlers::pick_message(&id, req, x, y);
+            if host.send_dev_tools_message(Some(&call)) == 0 {
+                handlers::eval_unsent(&id);
+                send(HostToApp::PickInfoResult { id, req, ok: false, selector: String::new(), label: String::new(), rect: herdr_browser_protocol::CssRect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 } });
+            }
+        }
+        // HERDR: arrow keys while picking (parent, first child, siblings).
+        M::PickRelative { req, ref from, step, .. } => {
+            let call = handlers::pick_relative_message(&id, req, from, step);
             if host.send_dev_tools_message(Some(&call)) == 0 {
                 handlers::eval_unsent(&id);
                 send(HostToApp::PickInfoResult { id, req, ok: false, selector: String::new(), label: String::new(), rect: herdr_browser_protocol::CssRect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 } });

@@ -210,6 +210,11 @@ pub enum AppToHost {
     /// Describe the element at page point (x, y) CSS px for a pick (S4); answered by `PickInfoResult`
     /// with the same `req`. Typed on purpose: the app never evaluates page JS for this.
     PickInfo { id: BrowserId, req: u64, x: f32, y: f32 },
+    /// Step from the element `from` (a selector a `PickInfoResult` gave) to a relative in the DOM
+    /// (arrow keys while picking); answered by `PickInfoResult` with the same `req`, describing the
+    /// element stepped to. `ok` false: no such relative (top of the document, no children, no
+    /// sibling) or `from` no longer matches; the app keeps the current pick then.
+    PickRelative { id: BrowserId, req: u64, from: String, step: PickStep },
     /// Read the style panel rows for the element `node` (a CSS selector, as `Picked` reports it) for
     /// `props`; answered by `StylesResult` with the same `req`. Driven by the user's panel, so no
     /// agent grant applies; answers carry CSS values only, never input values or page text.
@@ -244,6 +249,18 @@ pub enum AppToHost {
     FileChooserResult { id: BrowserId, req: u64, paths: Vec<String> },
     DialogResult { id: BrowserId, req: u64, accept: bool, text: Option<String> },
     Shutdown,
+}
+
+/// A step from a picked element to a relative (`PickRelative`). Element nodes only: text and
+/// comment nodes are skipped; a shadow host's children are its shadow root's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PickStep {
+    Parent,
+    /// The first element child.
+    Child,
+    Prev,
+    Next,
 }
 
 /// Host to app.
@@ -350,6 +367,9 @@ mod tests {
         roundtrip_app(AppToHost::SetStyle { id: "b1".into(), req: 11, node: "#a".into(), prop: "margin".into(), value: None });
         roundtrip_app(AppToHost::RevertStyle { id: "b1".into(), req: 12, node: "#a".into() });
         roundtrip_app(AppToHost::PickInfo { id: "b1".into(), req: 13, x: 210.0, y: 130.5 });
+        for step in [PickStep::Parent, PickStep::Child, PickStep::Prev, PickStep::Next] {
+            roundtrip_app(AppToHost::PickRelative { id: "b1".into(), req: 14, from: "#go".into(), step });
+        }
         roundtrip_app(AppToHost::Shutdown);
     }
 
