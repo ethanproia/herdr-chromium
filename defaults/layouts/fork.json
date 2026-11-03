@@ -42,11 +42,12 @@
                 "mod": "fork-agents-named"
               },
               "size": {
-                "weight": 1
+                "weight": 0.9490220546722412
               },
               "min": 90
             }
-          ]
+          ],
+          "resizable": true
         },
         {
           "id": "sidebar-footer",
@@ -58,17 +59,17 @@
             }
           },
           "size": {
-            "px": 45
+            "px": 75
           }
         }
       ],
       "size": {
-        "px": 268
+        "px": 210
       },
-      "min": 44,
+      "min": 200,
       "max": 480,
       "background": "chrome",
-      "resizable": true
+      "resizable": false
     },
     {
       "id": "work",
@@ -164,7 +165,7 @@
                 }
               ],
               "size": {
-                "px": 368
+                "px": 343
               },
               "min": 280,
               "max": 4000,
@@ -193,6 +194,10 @@
     }
   ],
   "background": "canvas",
+  "theme": {
+    "light": "paper",
+    "dark": "moss"
+  },
   "terminal_padding": [
     14,
     12

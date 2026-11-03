@@ -25,6 +25,8 @@ export const sectionLocked = (cur, key) => toggleSection(cur, key) === null;
 // Footer block height: 1 border + 8 padding on every side + 28 per row.
 export const footerHeight = (rows) => 17 + 28 * rows;
 // Settings moved to the sidebar's top bar (Ethan 2026-11-03), so the footer holds only Add machine: 0 rows = hidden.
+// Rail footer: 1 border + 9 + buttons of 26 with 4 between + 9 (the same 9 px margin as the rail's top button).
+export const railFooterHeight = (sections) => { const n = 2 + (normalizeSections(sections).addMachine ? 1 : 0); return 1 + 9 + 26 * n + 4 * (n - 1) + 9; };
 export const footerRows = (sections) => (normalizeSections(sections).addMachine ? 1 : 0);
 // Commands that bring the layout to `sections`. `state` = { spacesHidden, agentsHidden, footerPx, footerHidden, statusHidden (undefined when the layout has no status block) }. Only differences.
 export function sectionsPlan(sections, state) {
@@ -33,6 +35,13 @@ export function sectionsPlan(sections, state) {
   if (Boolean(state.spacesHidden) === s.spaces) cmds.push([s.spaces ? "layout.show" : "layout.hide", { id: "spaces" }]);
   if (Boolean(state.agentsHidden) === s.agents) cmds.push([s.agents ? "layout.show" : "layout.hide", { id: "agents" }]);
   if (state.statusHidden !== undefined && Boolean(state.statusHidden) === s.statusBar) cmds.push([s.statusBar ? "layout.show" : "layout.hide", { id: "status" }]);
+  // Collapsed, the footer is the rail's bottom: search and settings (plus Add machine when on), always shown.
+  if (state.collapsed) {
+    if (state.footerHidden) cmds.push(["layout.show", { id: "sidebar-footer" }]);
+    const px = railFooterHeight(s);
+    if (state.footerPx !== px) cmds.push(["layout.resize", { id: "sidebar-footer", px }]);
+    return cmds;
+  }
   const rows = footerRows(s);
   if (!rows) { if (!state.footerHidden) cmds.push(["layout.hide", { id: "sidebar-footer" }]); }
   else {

@@ -1,6 +1,7 @@
 // Role "tabs": the tab strip (replaces the old tabs-browser). Tabs, + right after the last tab, the Files / Changes
 // panel buttons, window buttons. Key commands: `<this folder>.split-right`, `.split-down`, `.new-browser`.
 import { openInSide } from "./side-strip.js";
+import { toggleSidebar } from "./sections.js";
 import { div, svg, image } from "gpui-kit";
 import { h_flex } from "gpui-base";
 import { spaces, panes, run, openOverlay, theme, window, shared, setShared, layout, nextCommand } from "herdr";
@@ -31,6 +32,7 @@ export default class Tabs {
           const pane = panes().find((p) => p.focused)?.pane;
           if (pane) run("pane.split", { direction: split[1], pane, mod: SELF, props: { role: "new-panel", direction: split[1] } });
         } else if (c.endsWith("new-browser")) this.newBrowser();
+        else if (c.endsWith("toggle-sidebar")) toggleSidebar();   // cmd-b: rail <-> open sidebar
       }
     });
     this.pressed = null;
@@ -44,7 +46,7 @@ export default class Tabs {
   // A Browser tab in the current space (cmd-shift-b), through the registry's browser tool, else the plain mod.
   newBrowser() {
     const space = spaces().find((sp) => sp.active)?.id;
-    const tool = this.reg.tools.find((t) => t.id === "browser" && t.open.mod);
+    const tool = this.reg.tools.find((t) => t.id === "browser" || t.id === "browser-native");
     if (tool) return openInTab(tool, space);
     run("tab.new", { name: "Browser", space, mod: "browser", props: { id: `b${Date.now().toString(36)}` } });
   }

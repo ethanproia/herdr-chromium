@@ -9,7 +9,7 @@ import { icon, menuRow, keysym, copyText, groupLabel } from "../look.js";
 import { menuHeight } from "../pure.js";
 import { sectionLocked } from "../sections-pure.js";
 import { sideMenuItems, runSideAction } from "./side-strip.js";
-import { sections, toggleFromClick } from "./sections.js";
+import { sections, toggleFromClick, toggleSidebar, isCollapsed } from "./sections.js";
 
 // Where a space is now: its first terminal's live folder, else where it was made.
 function place(s) {
@@ -74,7 +74,7 @@ function items(p, git) {
       return sideMenuItems(tg);
     case "sidebar":
       // Checkable toggles for the left sidebar's sections.
-      return [["Spaces", "sidebar.toggle", { key: "spaces" }], ["Agents", "sidebar.toggle", { key: "agents" }], ["Add machine", "sidebar.toggle", { key: "addMachine" }], ["Status bar", "sidebar.toggle", { key: "statusBar" }]];
+      return [[isCollapsed() ? "Expand sidebar" : "Collapse sidebar", "sidebar.collapse", {}], ["Spaces", "sidebar.toggle", { key: "spaces" }], ["Agents", "sidebar.toggle", { key: "agents" }], ["Add machine", "sidebar.toggle", { key: "addMachine" }], ["Status bar", "sidebar.toggle", { key: "statusBar" }]];
     default:
       return [
         ["New space", "space.new", {}],
@@ -88,6 +88,15 @@ function items(p, git) {
 }
 
 // One 16px line icon per item (same grid and stroke as the pane header buttons).
+// A small switch (shadcn Switch proportions): 28x16 track, 12px knob; on = accent track, knob right.
+// Locked (the last list still on) looks the same as on, with a tooltip saying why it won't turn off.
+function toggleSwitch(t, on, locked) {
+  return div().id("sw").w(28).h(16).flex_none().rounded(8).p(2).flex().items_center()
+    .bg(on ? t.accent : t.border).when(on, (el) => el.justify_end())
+    .when(locked, (el) => el.tooltip("At least one list stays on"))
+    .child(div().size(12).rounded(6).bg(t.foreground));
+}
+
 // The height of a groupLabel (6 top + 12 text + 6 bottom, as the + menu counts it).
 export const LABEL_H = 30;
 
@@ -98,6 +107,7 @@ function menuIcon(command, args) {
   if (command === "copy-link" || command === "copy-tab-link") return icon("link");
   if (command === "terminal.right_click") return icon("mouse");
   if (command === "terminal.park") return icon("send-back");
+  if (command === "sidebar.collapse") return icon("sidebar");
   if (command === "sidebar.toggle") return icon({ spaces: "spaces", agents: "agents", addMachine: "plus", statusBar: "status-bar" }[args?.key] ?? "panel");
   if (command === "side.pin") return icon("pin");
   if (command === "side.unpin") return icon("unpin");
@@ -139,7 +149,7 @@ function shortcut(name, args) {
 }
 
 // A hairline sits before some items, which groups them.
-const breaksBefore = (list, i) => i > 0 && (list[i][1].endsWith(".close") || list[i][1] === "app.help" || list[i][1] === "terminal.right_click" || list[i][1] === "copy-link" || list[i][1] === "tab.rename" || (list[i][1] === "app.theme" && list[i - 1][1] !== "app.theme"));
+const breaksBefore = (list, i) => i > 0 && ((list[i][1] === "sidebar.toggle" && list[i - 1][1] === "sidebar.collapse") || list[i][1].endsWith(".close") || list[i][1] === "app.help" || list[i][1] === "terminal.right_click" || list[i][1] === "copy-link" || list[i][1] === "tab.rename" || (list[i][1] === "app.theme" && list[i - 1][1] !== "app.theme"));
 
 export default class Menu {
   init(_props, cx) {
@@ -160,11 +170,13 @@ export default class Menu {
   choose(i, cx) {
     const it = items(props(), this.git)[i];
     if (!it) return;
+    // A switch flips in place and the menu stays open; the last list on can't be switched off (the click does nothing).
+    if (it[1] === "sidebar.toggle") { toggleFromClick(it[2].key); return cx?.notify?.(); }
+    if (it[1] === "sidebar.collapse") { closeOverlay(props()?.overlay); return toggleSidebar(); }
     closeOverlay(props()?.overlay);
     if (it[1] === "worktree") openOverlay({ mod: "worktree", kind: "dialog", ...(it[2].action === "open" ? { width: 560, height: 480 } : { width: 440, height: 260 }), props: it[2] });
     // Splits open their new pane as the New panel; Turn into opens one beside the pane, which replaces it.
     else if (it[1] === "pane.split") run("pane.split", { ...it[2], mod: SELF, props: { role: "new-panel", direction: it[2].direction } });
-    else if (it[1] === "sidebar.toggle") toggleFromClick(it[2].key);
     else if (it[1].startsWith("side.")) runSideAction(it[1], it[2]);
     else if (it[1] === "copy-link") copyLink(it[2]);
     else if (it[1] === "copy-tab-link") copyTabLink(it[2]);
@@ -195,16 +207,16 @@ export default class Menu {
         else return;
         cx.notify();
       })
-      .when(Boolean(label), (el) => el.child(groupLabel(t, label)))
       .children(
         list.map((it, i) =>
           v_flex()
             .when(breaksBefore(list, i), (el) => el.child(div().mx(-4).my(4).h(1).bg(t.border)))
+            .when(Boolean(label) && it[1] === "sidebar.toggle" && list[i - 1]?.[1] !== "sidebar.toggle", (el) => el.child(groupLabel(t, label)))
             .child(menuRow({
-              t, id: `mi-${i}`, enabled: !(it[1] === "sidebar.toggle" && sectionLocked(sections(), it[2].key)),
+              t, id: `mi-${i}`,
               icon: svg(menuIcon(it[1], it[2])).size(16), name: it[0], active: i === this.at,
               // A toggle shows its state as a check on the right, where other menus show a shortcut.
-              hint: it[1] === "sidebar.toggle" ? (sections()[it[2].key] ? svg(icon("check")).size(14) : "") : shortcut(it[1], it[2]),
+              hint: it[1] === "sidebar.collapse" ? shortcut(`${SELF}.toggle-sidebar`) : it[1] === "sidebar.toggle" ? toggleSwitch(t, sections()[it[2].key], sectionLocked(sections(), it[2].key)) : shortcut(it[1], it[2]),
               onClick: (_e, cx) => this.choose(i, cx),
               onHover: (cx) => { if (this.at !== i) { this.at = i; cx.notify(); } },
             }))),

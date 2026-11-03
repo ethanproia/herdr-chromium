@@ -3,6 +3,7 @@
 
 import { View, div, image, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
+import { scroller } from "./scroll.js";
 import { agents, terminals, panes, focused, spaces, run, theme, shared, setShared, setAgentOrder, openOverlay, closeOverlay, props, window, layout } from "herdr";
 
 function find(node, id) {
@@ -294,18 +295,17 @@ export default class Agents extends View {
       const more = detail.get(a.address);
       // An agent on another machine (`vps/t7`) says which.
       const machine = a.address.includes("/") ? a.address.split("/")[0] : null;
+      // Rail: the agent's provider icon in a 28px tile like the space tiles, status as a small corner dot, name on hover
+      // (Ethan: "agents in the rail should be using the agent provider icon").
       if (collapsed) {
-        return h_flex()
-          .id(`ag-${a.address}`)
-          .h(26)
-          .px(8)
-          .flex_none()
-          .items_center()
-          .gap(4)
-          .hover((s) => s.bg(t.hover))
-          .on_click(() => run("pane.focus", { pane: a.pane }))
-          .child(div().flex_1().min_w(0).whitespace_nowrap().text_right().text_color(t.muted).child(String(i + 1)))
-          .child(h_flex().w(14).flex_none().items_center().justify_center().child(this.status(t, a, true)));
+        return h_flex().w_full().h(32).flex_none().items_center().justify_center().child(
+          div().id(`ag-${a.address}`).size(28).relative().flex().items_center().justify_center().rounded(7)
+            .when(a.focused, (el) => el.bg(t.hover))
+            .hover((s) => s.bg(t.hover)).cursor_pointer()
+            .tooltip(label(a))
+            .on_click(() => run("pane.focus", { pane: a.pane }))
+            .child(pic)
+            .when(a.status && a.status !== "idle", (el) => el.child(div().absolute().right(1).bottom(1).child(this.status(t, a, true)))));
       }
       const when = this.since(a);
       const idle = a.status === "idle" && !a.focused;
@@ -354,10 +354,11 @@ export default class Agents extends View {
             this.folded.has(a.address) ? this.folded.delete(a.address) : this.folded.add(a.address);
             cx.notify();
           })).child(pic)))
-        .child(h_flex().flex_1().min_w(0).gap(5).items_center()
-          .child(div().flex_none().max_w(full && more ? 120 : 200).truncate().text_color(idle ? t.muted : t.foreground).child(name))
-          .when(full && Boolean(more), el => el.child(div().flex_1().min_w(0).truncate().text_color(t.dim).child(`\u00b7 ${more}`))))
-        .when(Boolean(machine), el => el.child(div().text_size(10).text_color(t.dim).child(machine)))
+        // The name (and its space detail) is the one part that gives way: it truncates with an ellipsis as one line, so
+        // no "·" is ever left dangling; the machine tag, time and status keep fixed room and never overlap it
+        // (Ethan: "this is not truncating properly").
+        .child(div().flex_1().min_w(0).truncate().text_color(idle ? t.muted : t.foreground).child(full && more ? `${name} \u00b7 ${more}` : name))
+        .when(Boolean(machine), el => el.child(div().flex_none().text_size(10).text_color(t.dim).child(machine)))
         .when(subs.length > 0, el => el.child(fold(a, subs)))
         .when(this.hovered === a.address, el => el.child(pin))
         .when(this.hovered !== a.address && Boolean(when), el => el.child(div().flex_none().text_size(11).text_color(t.dim).child(duration(now - when))))
@@ -438,23 +439,8 @@ export default class Agents extends View {
       .when(list.length === 0 && !collapsed, (el) =>
         el.child(div().px(12).text_size(12).text_color(t.dim).child("No agent status yet. Agents show up here when they report their status. Older versions and agents inside tmux may not.")),
       )
-      .child(v_flex().id("ag-list").flex_1().min_h(0).px(collapsed ? 0 : 8).overflow_y_scrollbar().mode("always").children(rows))
-      .child(
-        h_flex()
-          .h(28)
-          .px(12)
-          .items_center()
-          .justify_end()
-          .when(collapsed, (el) => el.justify_center().px(0))
-          .child(
-            div()
-              .id("collapse")
-              .text_size(13)
-              .text_color(t.dim)
-              .hover((s) => s.text_color(t.foreground))
-              .on_click(toggleSidebar)
-              .child(collapsed ? "»" : ""),
-          ),
-      );
+      // The list runs to the window's bottom with normal padding (Ethan: "we don't need this bottom section at all").
+      .child(scroller(this, "list", { id: "ag-list", bg: t.chrome, children: rows,   // no scrollbar, no scrolling until it overflows, fades at the hidden edges
+        outer: (el) => el.flex_1().min_h(0), inner: (el) => el.px(collapsed ? 0 : 8).pb(8) }));
   }
 }

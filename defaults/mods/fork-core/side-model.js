@@ -30,7 +30,7 @@ export function contentFor(tool) {
 // the old one, else the first child (none when empty). Nothing outside
 // panel-body is touched; no panel-body means an unchanged copy.
 export function withSideTools(tree, tools, active) {
-  const out = structuredClone(tree);
+  const out = JSON.parse(JSON.stringify(tree));
   const body = find(out, BODY);
   if (!body) return out;
   const old = new Map((body.children ?? []).map((c) => [c.id, c]));
@@ -96,7 +96,7 @@ export const STRIP_HEIGHT = 34;
 // panel-body). Idempotent: an existing strip is left as it is. Nothing outside that column is touched; no panel-body
 // means an unchanged copy. `mod` is the folder the layout names for core (the shipped layouts say "core").
 export function withSideStrip(tree, mod = "core") {
-  const out = structuredClone(tree);
+  const out = JSON.parse(JSON.stringify(tree));
   const find2 = (n) => {
     if ((n?.children ?? []).some((c) => c.id === BODY)) return n;
     for (const c of n?.children ?? []) { const f = find2(c); if (f) return f; }

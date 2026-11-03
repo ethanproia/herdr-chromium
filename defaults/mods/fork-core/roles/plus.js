@@ -5,6 +5,7 @@ import { v_flex } from "gpui-base";
 import { theme, spaces, panes, knownAgents, run, openOverlay, closeOverlay, props, window } from "herdr";
 import { icon, groupLabel, menuRow, toolIcon, openInTab, registryIO, openRegistry, keepSelection } from "../look.js";
 import { createRegistry, toolsFor } from "../registry.js";
+import { scroller } from "../scroll.js";
 
 export default class Plus {
   init(_props, cx) {
@@ -56,21 +57,21 @@ export default class Plus {
     const rowsN = groups.reduce((n, [name, rows]) => n + (rows.length || (name === "Agents" ? 1 : 0)), 0);
     const skipped = this.reg.errors[0];
     const H = Math.min(560, 8 + groups.length * 30 + (groups.length - 1) * 6 + rowsN * 32 + (skipped ? 26 : 0));
-    const list = v_flex().id("new-menu-list").h(H - 8).overflow_y_scrollbar();
+    const list = [];
     groups.forEach(([name, rows], g) => {
-      if (g > 0) list.child(div().h(6));
-      list.child(groupLabel(t, name));
-      if (name === "Agents" && this.agents.length === 0) list.child(div().px(8).py(6).text_size(13).text_color(t.dim).child(this.failed ? "Could not load agents" : "Checking installed agents…"));
+      if (g > 0) list.push(div().h(6));
+      list.push(groupLabel(t, name));
+      if (name === "Agents" && this.agents.length === 0) list.push(div().px(8).py(6).text_size(13).text_color(t.dim).child(this.failed ? "Could not load agents" : "Checking installed agents…"));
       for (const r of rows) {
         const k = flat.indexOf(r);
-        list.child(menuRow({
+        list.push(menuRow({
           t, id: r[0], icon: r[1], name: r[2], hint: r[4], active: k === this.at, enabled: r[5],
           onClick: () => pick(r),
           onHover: (cx) => { if (this.at !== k) { this.at = k; cx.notify(); } },
         }));
       }
     });
-    if (skipped) list.child(div().px(8).pt(6).h(26).flex_none().truncate().text_size(11).text_color(t.dim).child(`Skipped ${skipped}`));
+    if (skipped) list.push(div().px(8).pt(6).h(26).flex_none().truncate().text_size(11).text_color(t.dim).child(`Skipped ${skipped}`));
     return v_flex().id("new-menu").track_focus(this.handle).w_full().h(H).bg(t.popover).p(4).font_family(".SystemUIFont")
       .on_key_down((e, cx) => {
         if (e.key === "down" || e.key === "up") { this.at = (this.at + (e.key === "down" ? 1 : flat.length - 1)) % flat.length; return cx.notify(); }
@@ -85,6 +86,6 @@ export default class Plus {
         else if (tool) openInTab(tool, space?.id);
         else run("space.new");
       })
-      .child(list);
+      .child(scroller(this, "list", { id: "new-menu-list", bg: t.popover, children: list, outer: (el) => el.h(H - 8) }));
   }
 }

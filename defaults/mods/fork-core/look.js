@@ -53,7 +53,7 @@ export function copyText(text, doneTitle = "Link copied") {
 export function openInTab(tool, space) {
   const o = resolveOpen(tool);
   if (o.kind === "terminal") run("tab.new", { space });
-  else if (o.kind === "command") run(o.name, { space });
+  else if (o.kind === "command") run(o.name, {});   // browser.new opens a tab in the current space (no space arg)
   else run("tab.new", { name: tool.name, space, mod: o.mod, ...(o.props ? { props: o.props } : {}) });
 }
 
@@ -69,7 +69,7 @@ export function splitExtra(tool) {
 export function openInSplit(tool, direction, pane) {
   const extra = splitExtra(tool);
   if (extra) run("pane.split", { direction, pane, ...extra });
-  else run(resolveOpen(tool).name, { direction, pane });
+  else run(resolveOpen(tool).name, { place: direction, pane });   // browser.new {place: "right" | "down", pane}
 }
 
 // ---- the host side of the registry (descriptors are read with the shell: one listing, plain file reads) -----------

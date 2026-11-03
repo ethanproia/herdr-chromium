@@ -124,6 +124,11 @@ def main():
     if missing:
         sys.exit(f"sync-bundled-mods: {git} lacks {', '.join(missing)}; set LABS_GIT to an essexlabs/labs clone and fetch")
     out = build(lock, git)
+    # Herdr's script engine has no structuredClone (node tests pass, the live mod throws).
+    clones = sorted(f"{name}/{rel}" for name, files in out.items() for rel, data in files.items()
+                    if rel.endswith((".js", ".mjs")) and b"structuredClone" in data)
+    if clones:
+        sys.exit("sync-bundled-mods: structuredClone isn't in Herdr's script engine: " + ", ".join(clones))
     if "--check" in sys.argv:
         bad = []
         for name, files in out.items():

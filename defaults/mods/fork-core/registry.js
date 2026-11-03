@@ -106,6 +106,7 @@ export function normalizeTool(raw, folder, opts = {}) {
     order: raw.order ?? 100,
     folder: home,
     bundled,
+    unlessInstalled: typeof raw.unlessInstalled === "string" ? raw.unlessInstalled : undefined,
   };
 }
 
@@ -163,7 +164,9 @@ export async function loadRegistry(io) {
   }
   // Bundled descriptors that open another mod show only while that mod is installed and not switched off.
   const inst = io.installed ? new Set(await io.installed()) : null;
-  const usable = (t) => !t.open.mod || t.open.mod === io.self || ((!inst || inst.has(t.open.mod)) && !disabled.has(t.open.mod));
+  // unlessInstalled: a stand-in that steps aside when that mod is there (the fork's native Browser vs the browser mod).
+  const usable = (t) => (!t.unlessInstalled || !inst || !inst.has(t.unlessInstalled))
+    && (!t.open.mod || t.open.mod === io.self || ((!inst || inst.has(t.open.mod)) && !disabled.has(t.open.mod)));
   const kept = bundled.filter(usable);
   // Stand-ins for tools that will ship their own tool.json: used while an installed folder has none.
   if (inst) for (const [id, raw] of Object.entries(FALLBACKS)) {

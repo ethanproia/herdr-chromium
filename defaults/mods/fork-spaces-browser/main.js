@@ -7,10 +7,11 @@ import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { spaces, machines, panes, run, openOverlay, exec, hc, theme, shared, setShared, watchFolder, window, layout, settings } from "herdr";
 import { labelOf, groupByHost } from "./hosts.js";
+import { scroller } from "./scroll.js";
 const MACHINE_ICONS = { null: "mods/fork-spaces-browser/laptop.svg", basis: "mods/fork-spaces-browser/laptop.svg", laptop: "mods/fork-spaces-browser/laptop.svg", studio: "mods/fork-spaces-browser/studio.svg", "studio-agent": "mods/fork-spaces-browser/studio.svg", "exe-labs": "mods/fork-spaces-browser/cloud.svg" };
 // Sidebar sections menu: core's menu role. Core's folder is "fork-core"; the fork's is "fork-core" (used when "fork-core" is switched off).
 const coreMod = () => { const off = settings()?.mods_disabled; return Array.isArray(off) && off.includes("fork-core") ? "fork-core" : "fork-core"; };
-const openSectionsMenu = () => openOverlay({ mod: coreMod(), kind: "popup", width: 260, height: 8 + 4 * 32 + 30, props: { role: "menu", tab: "sidebar" } });
+const openSectionsMenu = () => openOverlay({ mod: coreMod(), kind: "popup", width: 260, height: 8 + 5 * 32 + 9 + 30, props: { role: "menu", tab: "sidebar" } });
 const machineIcon = m => MACHINE_ICONS[m ?? null] ?? "mods/workspace-chrome/server.svg";
 
 function find(node, id) {
@@ -24,9 +25,14 @@ function find(node, id) {
 
 // The sidebar's rail goes by its width, not a flag: dragging its edge narrows it too.
 // Back to the width the sidebar had (core's sidebar-header does the same for its own button).
+// The rail is pinned min = max = 44 (core), so expanding also lifts the limits back to the open sidebar's 200-480;
+// core's sidebar-header finishes the rest of the open state when it sees the width change.
 function expandSidebar() {
   setShared("sidebar.collapsed", false);
-  run("layout.resize", { id: "sidebar", px: shared("sidebar.width") ?? 268 });
+  const tree = JSON.parse(JSON.stringify(layout())), bar = find(tree, "sidebar");
+  if (!bar) return;
+  bar.min = 200; bar.max = 480; bar.size = { px: Math.min(480, Math.max(200, shared("sidebar.width") ?? 268)) };
+  run("layout.set", { layout: tree });
 }
 const narrow = () => (find(layout(), "sidebar")?.size?.px ?? Infinity) < 160;
 
@@ -86,7 +92,19 @@ export default class Spaces extends View {
 
   // Looks for work after a change: git to refresh, colors to assign, and when a new space may be shown.
   // Redraws only for a deadline (below); a changed git answer redraws through refreshGit.
+  // Rail: the Spaces section is as tall as its tiles (Ethan: "this is still scrollable in rail view"), Agents gets the
+  // rest. Only while Agents is shown; the open sidebar gets its own sizes back from the core (sidebar-header).
+  fitRail() {
+    const l = layout(), sp = find(l, "spaces"), ag = find(l, "agents");
+    if (!narrow() || !sp || !ag || ag.hidden) return;
+    const content = this._scroll?.rail?.content;
+    if (!(content > 0)) return;
+    const want = Math.ceil(content);
+    if (sp.size?.px !== want) run("layout.resize", { id: "spaces", px: want });
+  }
+
   checkNew(cx) {
+    this.fitRail();
     const now = Date.now();
     const sp = spaces();
     for (const s of sp) if (!this.shown.has(s.id)) this.born[s.id] ??= now;
@@ -339,23 +357,41 @@ export default class Spaces extends View {
   // Only what's unusual, after the name: "herdr \u00b7 spike \u21912 \u21931". The repo or
   // branch goes when the name already says it (a worktree is named after its branch),
   // and master/main go: nearly every space is on one.
-  gitTail(g, tree, name, t) {
+  gitTail(g, tree, name, t, id) {
     const raw = g.branch ?? "detached";
     const same = (a) => a.toLowerCase() === name.toLowerCase();
     const branch = same(raw) || raw === "master" || raw === "main" ? "" : raw;
     const repo = tree || same(g.name) ? "" : g.name;
     const where = [repo, branch].filter(Boolean).join(" \u00b7 ");
-    return h_flex()
+    // The name is the only thing that truncates. The tail sits whole in the room left of it, or is not shown: it is
+    // measured at its natural width (inner) against the room it has (outer) and hidden, not clipped, when it won't fit.
+    // Hidden, not removed, so it keeps being measured and comes back when the sidebar widens. Until measured: hidden.
+    const fit = (this.tailFit ??= new Map());
+    const k = (fit.get(id) ?? { room: 0, need: Infinity });
+    const shows = k.need <= k.room;
+    const note = (patch, cx) => {
+      const was = (fit.get(id) ?? k), next = { ...was, ...patch };
+      fit.set(id, next);
+      if ((next.need <= next.room) !== (was.need <= was.room)) cx.notify();
+    };
+    return h_flex().id(`tail-${id}`)
       .flex_1()
       .min_w(0)
-      .gap(5)
+      .overflow_hidden()
       .justify_end()
       .items_center()
-      .text_size(11.5)
-      .text_color(t.dim)
-      .when(Boolean(where), (el) => el.child(div().min_w(0).truncate().child(where)))
-      .when(g.ahead > 0, (el) => el.child(div().flex_none().text_color(t.ansi2).child(`\u2191${g.ahead}`)))
-      .when(g.behind > 0, (el) => el.child(div().flex_none().text_color(t.ansi1).child(`\u2193${g.behind}`)));
+      .on_size_change((z, cx) => note({ room: z.width }, cx))
+      .child(h_flex().id(`tail-in-${id}`)
+        .flex_none()
+        .gap(5)
+        .items_center()
+        .text_size(11.5)
+        .text_color(t.dim)
+        .when(!shows, (el) => el.opacity(0))
+        .on_size_change((z, cx) => note({ need: z.width }, cx))
+        .when(Boolean(where), (el) => el.child(div().flex_none().child(where)))
+        .when(g.ahead > 0, (el) => el.child(div().flex_none().text_color(t.ansi2).child(`\u2191${g.ahead}`)))
+        .when(g.behind > 0, (el) => el.child(div().flex_none().text_color(t.ansi1).child(`\u2193${g.behind}`))));
   }
 
   row({ w, i, g, tree }, t) {
@@ -393,20 +429,23 @@ export default class Spaces extends View {
           .when(Boolean(tree), el => el.pl(22).child(svg("mods/workspace-chrome/branch.svg").size(13).text_color(t.dim)))
           .when(!tree, el => el.child(h_flex().size(18).flex_none().rounded(5).bg(fill).items_center().justify_center().text_size(10.5).font_bold().text_color("#ffffff").child([...w.name][0]?.toUpperCase() ?? "?")))
           .child(div().flex_shrink(0).max_w(150).truncate().text_color(t.foreground).child(w.name))
-          .child(g ? this.gitTail(g, tree, w.name, t) : div().flex_1()),
+          .child(g ? this.gitTail(g, tree, w.name, t, w.id) : div().flex_1()),
       );
   }
 
   // Collapsed sidebar: an icon rail. One colored letter tile per space, in the expanded order (worktrees right under
   // their checkout, a touch smaller), a thin line between machine groups, the space name as a hover tooltip.
-  tile({ w, i, tree }, t) {
+  // One rail tile (Discord-style, sized for a 44px rail): every space a 28px tile with 8px either side, 6px between
+  // tiles; the active space gets a rounded pill on the rail's left edge (inside the rail), hover a short one.
+  tile({ w, i }, t) {
     const on = w.active;
     const colors = shared("space.colors") ?? {};
     const color = colors[w.id] ?? "ansi6";
     const fill = color.startsWith("#") ? color : (MARK[color] ?? t[color]);
-    const px = tree ? 24 : 28;
-    return h_flex().id(`space-${w.id}`).relative().w_full().h(tree ? 34 : 38).flex_none().items_center().justify_center()
+    const hovered = this.hoverTile === w.id;
+    return h_flex().id(`space-${w.id}`).relative().w_full().h(34).flex_none().items_center().justify_center()
       .when(this.pressed !== null && this.over === i && this.pressed !== i, (el) => el.border_t(2).border_color(t.accent))
+      .on_hover((h, cx) => { const next = h ? w.id : (this.hoverTile === w.id ? null : this.hoverTile); if (next !== this.hoverTile) { this.hoverTile = next; cx.notify(); } })
       .on_mouse_down("left", () => { this.pressed = i; this.over = i; })
       .on_mouse_up("left", (_e, cx) => {
         const from = this.pressed;
@@ -417,12 +456,10 @@ export default class Spaces extends View {
       })
       .on_mouse_down("right", (_e, cx) => { cx.stop_propagation(); this.menu(w); })
       .tooltip(w.name)
-      .when(on, (el) => el.child(div().absolute().left(0).top(tree ? 9 : 11).w(3).h(tree ? 16 : 16).rounded(2).bg(t.accent)))
-      .child(h_flex().size(px + 6).rounded(10).flex_none().items_center().justify_center()
-        .when(on, (el) => el.bg(t.selected)).when(!on, (el) => el.hover((s) => s.bg(t.hover)))
-        .child(h_flex().size(px).rounded(tree ? 7 : 8).flex_none().bg(fill).items_center().justify_center().text_size(tree ? 10 : 12).font_bold().text_color("#ffffff")
-          .when(!on, (el) => el.opacity(0.82))
-          .child([...w.name][0]?.toUpperCase() ?? "?")));
+      .when(on || hovered, (el) => el.child(div().absolute().left(0).top(on ? 7 : 13).w(3).h(on ? 20 : 8).rounded_r(2).bg(on ? t.foreground : t.muted)))
+      .child(h_flex().size(28).rounded(8).flex_none().bg(fill).items_center().justify_center().text_size(12).font_bold().text_color("#ffffff")
+        .when(!on, (el) => el.opacity(hovered ? 0.95 : 0.78))
+        .child([...w.name][0]?.toUpperCase() ?? "?"));
   }
 
   rail(t) {
@@ -432,7 +469,7 @@ export default class Spaces extends View {
     const groups = order.filter((m) => !m?.startsWith("host:")).map((m) => rows.filter((r) => (r.w.machine ?? null) === m)).filter((g) => g.length);
     const out = [];
     groups.forEach((g, n) => {
-      if (n) out.push(div().id(`rail-sep-${n}`).w(20).h(1).my(6).flex_none().bg(t.border));
+      if (n) out.push(div().id(`rail-sep-${n}`).w(20).h(1).my(5).flex_none().bg(t.border));   // rows are 34 (28 + 6): 5 + 1 + 5 keeps the rhythm
       g.forEach((r) => out.push(this.tile(r, t)));
     });
     return out;
@@ -446,28 +483,27 @@ export default class Spaces extends View {
     if (collapsed) {
       // Spaces fill the rail; search, settings and expand sit stacked at the bottom (Ethan: "settings and other top
       // controls should move to bottom"), clear of the macOS traffic lights.
-      const ctl = (id, ic, tip, action) => div().id(id).size(28).flex_none().flex().items_center().justify_center().rounded(7)
+      const ctl = (id, ic, tip, action) => div().id(id).size(26).flex_none().flex().items_center().justify_center().rounded(7)
         .text_color(t.muted).hover((s) => s.bg(t.hover).text_color(t.foreground)).tooltip(tip)
         .on_mouse_down("left", (_e, cx) => cx.stop_propagation()).on_click(action)
         .child(svg(`mods/workspace-chrome/${ic}.svg`).size(15));
       return v_flex().size_full().min_h(0).bg(t.chrome).items_center().text_size(13)
         // The sidebar button lives in the top bar; only a windowed macOS (traffic lights in that row) shows it here.
         .when(window()?.platform === "macos" && !window()?.fullscreen, (el) => el.child(div().pt(2).pb(4).flex_none().child(ctl("rail-expand", "sidebar", "Expand sidebar", () => expandSidebar()))))
-        .child(v_flex().id("spaces-rail").flex_1().min_h(0).w_full().items_center().pb(8).pt(6).overflow_y_scrollbar()
-          .on_mouse_down("right", () => openSectionsMenu())
-          .on_mouse_up("left", (_e, cx) => { this.pressed = null; cx.notify(); })
-          .children(this.rail(t)))   // just the spaces (Ethan: "it should just be the icons of each space")
-        .child(v_flex().id("rail-controls").flex_none().items_center().gap(2).pt(6).pb(8).w_full().border_t(1).border_color(t.border)
-          .child(ctl("rail-search", "search", "Search", () => run("mod.open", { name: "picker" })))
-          .child(ctl("rail-settings", "settings", "Settings", () => run("app.settings"))));
+        .child(scroller(this, "rail", { id: "spaces-rail", bg: t.chrome, children: this.rail(t),   // just the spaces; search and settings are the sidebar footer (core), the true bottom
+          outer: (el) => el.flex_1().min_h(0).w_full()
+            .on_mouse_down("right", () => openSectionsMenu())
+            .on_mouse_up("left", (_e, cx) => { this.pressed = null; cx.notify(); }),
+          inner: (el) => el.items_center().pb(8).pt(3) }));
     }
     return v_flex().size_full().min_h(0).bg(t.chrome).text_size(13)
       .child(h_flex().id("spaces-title").on_mouse_down("right", () => openSectionsMenu()).h(31).pl(16).pr(10).items_center().justify_between().text_size(11.5).text_color(t.dim)
         .child("Spaces")
         .child(div().id("space-new").p(4).rounded(5).hover(s => s.bg(t.hover).text_color(t.foreground)).on_click(() => run("space.new")).child("+")))
-      .child(v_flex().flex_1().min_h(0).px(8).pb(14).overflow_y_scrollbar().mode("always")
-        .id("spaces-list").on_mouse_down("right", () => openSectionsMenu())
-        .on_mouse_up("left", (_e, cx) => { this.pressed = null; cx.notify(); })
-        .children(this.grouped(t, collapsed)));
+      .child(scroller(this, "list", { id: "spaces-scroll", bg: t.chrome, children: this.grouped(t, collapsed),   // no scrollbar, no scrolling until it overflows, fades at the hidden edges
+        outer: (el) => el.flex_1().min_h(0)
+          .on_mouse_down("right", () => openSectionsMenu())
+          .on_mouse_up("left", (_e, cx) => { this.pressed = null; cx.notify(); }),
+        inner: (el) => el.px(8).pb(14) }));
   }
 }
