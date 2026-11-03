@@ -1,0 +1,14 @@
+{
+  "place": "none",
+  "overlay": {
+    "width": 260,
+    "height": 272
+  },
+  "version": "0.1.0",
+  "source": {
+    "repo": "essexlabs/labs",
+    "branch": "ethan/herdr-mods-notepad",
+    "commit": "9bfdce0a9fbb95e66e70f289f1fed51bb9862171",
+    "path": "projects/herdr-mods/clones/mac/menu-browser"
+  }
+}

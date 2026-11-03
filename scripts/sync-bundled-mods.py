@@ -63,12 +63,15 @@ def build(lock, git):
                 data = rename_refs(data.decode(), names, rel.endswith("keys.json")).encode()
             files[rel] = data
         meta = json.loads(files["mod.json"])
+        # Shipped, not a person's clone: Herdr's own record of the original doesn't apply.
+        meta.pop("cloned_from", None)
         meta["version"] = m.get("version", "0.1.0")
         meta["source"] = {"repo": lock["repo"], "branch": m["branch"], "commit": m["commit"], "path": m["path"]}
         files["mod.json"] = (json.dumps(meta, indent=2) + "\n").encode()
         out[PREFIX + n] = files
-    # Derived from the shipped pane: its split buttons open the chooser.
-    if "split-chooser" in names:
+    # Derived from the shipped pane: its split buttons open the chooser
+    # (only while Ethan's own pane-browser, which does that itself, isn't bundled).
+    if "split-chooser" in names and "pane-browser" not in names:
         src = open(os.path.join(MODS, "pane", "main.js")).read()
         pane = src.replace(
             '"pane.split", { direction: "right", pane })',
@@ -91,9 +94,14 @@ def build(lock, git):
 
 def fork_layout():
     """defaults/layouts/fork.json: the shipped main layout with each bundled stand-in
-    (pane -> fork-pane) in its block."""
-    swap = {"pane": PREFIX + "pane"} if os.path.isdir(os.path.join(MODS, PREFIX + "pane")) else {}
+    in its block (pane -> fork-pane-browser, else fork-pane) and the bundled
+    right-click menu (terminal_menu: fork-menu-browser)."""
+    have = lambda n: os.path.isdir(os.path.join(MODS, PREFIX + n))
+    pane = next((PREFIX + n for n in ("pane-browser", "pane") if have(n)), None)
+    swap = {"pane": pane} if pane else {}
     layout = json.load(open(os.path.join(ROOT, "defaults", "layouts", "main.json")))
+    if have("menu-browser"):
+        layout["terminal_menu"] = PREFIX + "menu-browser"
 
     def walk(n):
         if isinstance(n, dict):

@@ -155,11 +155,15 @@ re-pin the commit, run `scripts/sync-bundled-mods.py` (any labs clone with the
 commit: `LABS_GIT=<clone>`), commit `defaults/`. `--check` fails if
 `defaults/mods/fork-*` or `defaults/layouts/fork.json` drifted from the pins.
 
-The sync also derives `fork-pane` (the shipped `pane` whose split buttons open
-`fork-split-chooser`) and the `fork` layout (`main` with `fork-pane`). Pick it
+The sync also writes the `fork` layout: `main` with Ethan's pane header
+(`fork-pane-browser`: split buttons open `fork-split-chooser`, Notepad's
+header menu) and his right-click menu (`"terminal_menu": "fork-menu-browser"`).
+Without pane-browser in the lockfile it derives `fork-pane` from the shipped
+`pane` instead. Pick it
 with `layout.switch fork`; `main` is unchanged.
 
-Bundled now: `fork-split-chooser`, `fork-notepad` (a tab; notes live in
+Bundled now: `fork-pane-browser`, `fork-menu-browser` (from labs
+`clones/mac/`), `fork-split-chooser`, `fork-notepad` (a tab; notes live in
 `~/Notes`, the real home folder, not the Herdr home), `fork-board` (an
 overlay; `cmd-shift-y`, `ctrl-shift-y` elsewhere; runs `cp`, `mkdir`, `open`,
 `osascript`, `qlmanage`, `rm`, `sips`; cache in `data/herdr-board`). The new
