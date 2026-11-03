@@ -52,11 +52,11 @@ struct Grid {
     scale: f32,
     /// The cell in device pixels the local screen was sized with.
     vt_cell: (u32, u32),
-    /// The cell in device pixels the core was last told.
-    told_cell: Option<(u32, u32)>,
+    /// The colors and device-pixel cell size the core was last told.
+    told_display: Option<DisplayFacts>,
     /// Top-left of the cell grid in window coordinates, from the last paint.
     origin: Point<Pixels>,
-    buttons_down: usize,
+    buttons_down: Vec<MouseButton>,
     /// Kitty images uploaded for drawing, by (image, generation, source rect).
     images: HashMap<(u32, u64, [u32; 4]), Arc<RenderImage>>,
     /// Where the pointer is over the pane.
@@ -83,16 +83,14 @@ pub struct TerminalView {
     pub lost: bool,
     /// A left-button selection drag is in progress.
     selecting: bool,
+    selection_pointer: Point<Pixels>,
+    selection_scroll: Option<Task<()>>,
     /// The terminal's folder, for links to relative paths.
     pub cwd: Option<PathBuf>,
     /// The link under the pointer while the link modifier is held.
     link: Option<LinkTarget>,
-    /// The press opened a link: its release isn't the program's.
-    link_click: bool,
     /// Right-clicks go to the program when it takes the mouse (Shift: the menu).
     pub right_click_to_program: bool,
-    /// The program got the right press: it gets the release too.
-    right_to_program: bool,
     grid: Rc<RefCell<Grid>>,
     focus: FocusHandle,
     was_focused: bool,
@@ -101,7 +99,7 @@ pub struct TerminalView {
     /// When the person last typed here: output right after is shown at once.
     typed_at: Cell<Option<Instant>>,
     /// Scrolled this gesture, in lines, toward the next whole one.
-    scrolled: f32,
+    scrolled: Point<f32>,
     _reader: Option<Task<()>>,
 }
 
@@ -119,17 +117,57 @@ pub fn next_frame() {
 
 impl EventEmitter<TerminalEvent> for TerminalView {}
 
-/// `cell`: in device pixels, what the core reports to programs (CSI 14t, 16t).
-fn display_facts(cell: (u32, u32)) -> serde_json::Value {
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct DisplayFacts {
+    fg: Rgb,
+    bg: Rgb,
+    cursor: Rgb,
+    /// In device pixels, what the core reports to programs (CSI 14t, 16t).
+    cell: (u32, u32),
+}
+
+/// Only send changed facts; a theme switch need not change the cell size.
+fn display_update(told: &mut Option<DisplayFacts>, theme: &vt::Theme, cell: (u32, u32)) -> Option<serde_json::Value> {
+    let facts = DisplayFacts { fg: theme.fg, bg: theme.bg, cursor: theme.cursor, cell };
+    if *told == Some(facts) {
+        return None;
+    }
+    *told = Some(facts);
     let hex = |c: Rgb| format!("#{:02x}{:02x}{:02x}", c.0, c.1, c.2);
-    let t = vt::theme();
-    json!({"fg": hex(t.fg), "bg": hex(t.bg), "cursor": hex(t.cursor), "cell": [cell.0, cell.1]})
+    Some(json!({"fg": hex(facts.fg), "bg": hex(facts.bg), "cursor": hex(facts.cursor), "cell": [cell.0, cell.1]}))
+}
+
+impl Grid {
+    fn refresh_theme(&mut self, theme: &vt::Theme, cell: (u32, u32)) {
+        self.vt.set_theme(theme.clone());
+        if let Some(chan) = self.channel
+            && let Some(facts) = display_update(&mut self.told_display, theme, cell)
+        {
+            self.core.facts(chan, &facts);
+        }
+    }
 }
 
 /// A cell in device pixels.
 fn device_cell(cell: Size<Pixels>, scale: f32) -> (u32, u32) {
     let px = |v: Pixels| (f32::from(v) * scale).round().max(1.0) as u32;
     (px(cell.width), px(cell.height))
+}
+
+// Held-button events belong to the pane that received the press.
+fn track_mouse_button(buttons: &mut Vec<MouseButton>, action: GhosttyMouseAction, button: Option<MouseButton>) -> bool {
+    if let Some(button) = button {
+        if action == GHOSTTY_MOUSE_ACTION_PRESS {
+            if !buttons.contains(&button) {
+                buttons.push(button);
+            }
+        } else if !buttons.contains(&button) {
+            return false;
+        } else if action == GHOSTTY_MOUSE_ACTION_RELEASE {
+            buttons.retain(|b| *b != button);
+        }
+    }
+    true
 }
 
 impl TerminalView {
@@ -142,11 +180,11 @@ impl TerminalView {
             ended: None,
             lost: false,
             selecting: false,
+            selection_pointer: Point::default(),
+            selection_scroll: None,
             cwd: None,
             link: None,
-            link_click: false,
             right_click_to_program: false,
-            right_to_program: false,
             grid: Rc::new(RefCell::new(Grid {
                 vt: Vt::new(size_hint.0.max(2), size_hint.1.max(1)),
                 core: core.clone(),
@@ -154,9 +192,9 @@ impl TerminalView {
                 cell: size(px(9.0), px(18.0)),
                 scale: 1.0,
                 vt_cell: (9, 18),
-                told_cell: None,
+                told_display: None,
                 origin: Point::default(),
-                buttons_down: 0,
+                buttons_down: Vec::new(),
                 images: HashMap::new(),
                 hover: None,
                 link_spans: Vec::new(),
@@ -169,7 +207,7 @@ impl TerminalView {
             was_focused: false,
             shown_in: Cell::new(0),
             typed_at: Cell::new(None),
-            scrolled: 0.0,
+            scrolled: point(0.0, 0.0),
             _reader: None,
         };
         view.connect(core, false, cx);
@@ -196,7 +234,7 @@ impl TerminalView {
     /// take seconds, and the window must keep drawing meanwhile.
     /// `announce_end`: emit Ended if the terminal turns out to be gone.
     fn connect(&mut self, core: Arc<Core>, announce_end: bool, cx: &mut Context<Self>) {
-        let (cols, rows, cell) = {
+        let (cols, rows, facts) = {
             let mut g = self.grid.borrow_mut();
             let (cols, rows) = (g.vt.cols, g.vt.rows);
             // The core repaints the whole screen (and history) on attach.
@@ -204,12 +242,13 @@ impl TerminalView {
             g.vt = Vt::new(cols, rows);
             g.vt.resize(cols, rows, cell.0, cell.1);
             g.vt_cell = cell;
-            g.told_cell = Some(cell);
+            g.told_display = None;
+            let facts = display_update(&mut g.told_display, &vt::theme(), cell).unwrap();
             g.core = core.clone();
             g.channel = None;
-            (cols, rows, cell)
+            (cols, rows, facts)
         };
-        let (address, facts) = (self.address.clone(), display_facts(cell));
+        let address = self.address.clone();
         // Replacing the task drops an attach still in flight for an older connection.
         self._reader = Some(cx.spawn(async move |this, cx| {
             let attached = cx.background_executor().spawn(async move { core.attach(&address, cols, rows, facts) }).await;
@@ -242,6 +281,9 @@ impl TerminalView {
                 self.lost = false;
                 let mut g = self.grid.borrow_mut();
                 g.channel = Some(attached.channel);
+                // The theme or cell may have changed while the attach was in flight.
+                let cell = device_cell(g.cell, g.scale);
+                g.refresh_theme(&vt::theme(), cell);
                 // The pane may have been laid out while the attach was in flight.
                 let now = (g.vt.cols, g.vt.rows);
                 if now != attached_size {
@@ -273,6 +315,13 @@ impl TerminalView {
                 None
             }
         }
+    }
+
+    /// Attached tabs follow the window's theme even when they are not drawn.
+    pub fn refresh_theme(&self) {
+        let mut g = self.grid.borrow_mut();
+        let cell = device_cell(g.cell, g.scale);
+        g.refresh_theme(&vt::theme(), cell);
     }
 
     /// Its title as shown (see `shown_title`); news only when that changed.
@@ -502,27 +551,20 @@ impl TerminalView {
     fn scroll(&mut self, ev: &ScrollWheelEvent, _w: &mut Window, cx: &mut Context<Self>) {
         cx.stop_propagation();
         let mut g = self.grid.borrow_mut();
-        let rows = g.vt.rows as f32;
-        let steps = match ev.delta {
-            ScrollDelta::Lines(p) if cfg!(target_os = "macos") => macos_wheel_steps(p.y),
-            ScrollDelta::Lines(p) => scroll_steps(&mut self.scrolled, ev.touch_phase, p.y, rows),
-            ScrollDelta::Pixels(p) => scroll_steps(&mut self.scrolled, ev.touch_phase, p.y / g.cell.height, rows),
-        };
-        let n = steps.unsigned_abs() as usize;
-        if n == 0 {
+        let steps = scroll_delta_steps(&mut self.scrolled, ev.delta, ev.touch_phase, g.cell, g.vt.cols, g.vt.rows);
+        let n = steps.y.unsigned_abs() as usize;
+        if steps.x == 0 && n == 0 {
             return;
         }
-        let up = steps > 0;
+        let up = steps.y > 0;
         if g.vt.mouse_tracking() {
             let ((x, y), size) = mouse_at(&g, ev.position);
-            let button = if up { GHOSTTY_MOUSE_BUTTON_FOUR } else { GHOSTTY_MOUSE_BUTTON_FIVE };
-            let mut out = Vec::new();
-            for _ in 0..n {
-                out.extend(g.vt.encode_mouse(GHOSTTY_MOUSE_ACTION_PRESS, Some(button), 0, x, y, size, false));
-            }
+            let out = scroll_mouse_bytes(&mut g.vt, steps, x, y, size);
             if let Some(ch) = g.channel {
                 g.core.input(ch, &out);
             }
+        } else if n == 0 {
+            return;
         } else if g.vt.alt_screen() {
             let key = if up { GHOSTTY_KEY_ARROW_UP } else { GHOSTTY_KEY_ARROW_DOWN };
             let mut out = Vec::new();
@@ -547,10 +589,8 @@ impl TerminalView {
     /// (shift keeps the mouse for Herdr: selecting, the menu).
     fn mouse(&mut self, action: GhosttyMouseAction, button: Option<MouseButton>, pos: Point<Pixels>, mods: Modifiers) -> bool {
         let mut g = self.grid.borrow_mut();
-        match action {
-            GHOSTTY_MOUSE_ACTION_PRESS => g.buttons_down += 1,
-            GHOSTTY_MOUSE_ACTION_RELEASE => g.buttons_down = g.buttons_down.saturating_sub(1),
-            _ => {}
+        if !track_mouse_button(&mut g.buttons_down, action, button) {
+            return false;
         }
         if !g.vt.mouse_tracking() || mods.shift {
             return false;
@@ -562,7 +602,7 @@ impl TerminalView {
             _ => GHOSTTY_MOUSE_BUTTON_UNKNOWN,
         });
         let ((x, y), size) = mouse_at(&g, pos);
-        let any = g.buttons_down > 0;
+        let any = !g.buttons_down.is_empty();
         let bytes = g.vt.encode_mouse(action, b, 0, x, y, size, any);
         if let Some(ch) = g.channel {
             g.core.input(ch, &bytes);
@@ -581,12 +621,17 @@ impl TerminalView {
         let (x, y) = local(&g, pos);
         let (col, row) = (x / f32::from(g.cell.width), y / f32::from(g.cell.height));
         let mut target = None;
-        let hit = g.vt.link_at(col as u16, row as u16, |text, at| {
+        let hit = g.vt.link_at(col as u16, row as u16, |text, at, joined| {
+            // In lines joined back together only a file that exists proves the join right.
             if let Some(range) = links::find(text, at)
                 && let Some(link) = links::resolve(&text[range.clone()], self.cwd.as_deref())
+                && (!joined || matches!(link, links::Target::File(_)))
             {
                 target = Some(LinkTarget::External(link));
                 return Some(range);
+            }
+            if joined {
+                return None;
             }
             let range = links::word(text, at)?;
             let address = crate::mods::terminal_address(&text[range.clone()], &self.address)?;
@@ -596,6 +641,47 @@ impl TerminalView {
         // OSC 8 links bypass text detection.
         let target = target.or_else(|| links::resolve(&hit.target, self.cwd.as_deref()).map(LinkTarget::External))?;
         Some((target, hit.spans))
+    }
+
+    fn start_selection(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
+        self.selecting = true;
+        self.selection_pointer = pos;
+        self.select(Select::Press, pos, cx);
+        self.selection_scroll = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_millis(50)).await;
+                let keep = this.update(cx, |this, cx| {
+                    if !this.selecting { return false; }
+                    if this.shown_in.get() != FRAME.load(Ordering::Relaxed) {
+                        this.finish_selection(None, cx);
+                        return false;
+                    }
+                    let mut g = this.grid.borrow_mut();
+                    let y = f32::from(this.selection_pointer.y - g.origin.y);
+                    let lines = selection_scroll_lines(y, f32::from(g.cell.height), g.vt.rows);
+                    if lines != 0 {
+                        g.vt.scroll_viewport(lines);
+                        drop(g);
+                        this.select(Select::Drag, this.selection_pointer, cx);
+                    }
+                    true
+                }).unwrap_or(false);
+                if !keep { break; }
+            }
+        }));
+    }
+
+    fn finish_selection(&mut self, pos: Option<Point<Pixels>>, cx: &mut Context<Self>) {
+        self.selecting = false;
+        let mut g = self.grid.borrow_mut();
+        g.buttons_down.retain(|b| *b != MouseButton::Left);
+        if let Some(pos) = pos {
+            drop(g);
+            self.select(Select::Release, pos, cx);
+        } else {
+            g.vt.clear_selection();
+            cx.notify();
+        }
     }
 
     /// Selecting with the mouse (when the program doesn't take it).
@@ -613,6 +699,12 @@ impl TerminalView {
         }
         cx.notify();
     }
+}
+
+fn selection_scroll_lines(y: f32, cell_height: f32, rows: u16) -> isize {
+    let height = cell_height * rows as f32;
+    let outside = if y < 0.0 { y } else if y >= height { y - height + 1.0 } else { return 0 };
+    (outside / cell_height).abs().ceil().clamp(1.0, 5.0) as isize * if outside < 0.0 { -1 } else { 1 }
 }
 
 /// A title as it's shown: an agent's spinner in front of it (`\u{2733} Fix the
@@ -693,6 +785,30 @@ fn local(g: &Grid, p: Point<Pixels>) -> (f32, f32) {
     (f32::from(p.x - g.origin.x).max(0.0), f32::from(p.y - g.origin.y).max(0.0))
 }
 
+fn scroll_delta_steps(scrolled: &mut Point<f32>, delta: ScrollDelta, phase: TouchPhase, cell: Size<Pixels>, cols: u16, rows: u16) -> Point<i32> {
+    let lines = match delta {
+        // As in Ghostty, a sideways notch moves one column; a vertical one, three lines.
+        ScrollDelta::Lines(p) if cfg!(target_os = "macos") => return point(macos_wheel_steps(p.x) / 3, macos_wheel_steps(p.y)),
+        ScrollDelta::Lines(p) => p,
+        ScrollDelta::Pixels(p) => point(p.x / cell.width, p.y / cell.height),
+    };
+    point(scroll_steps(&mut scrolled.x, phase, lines.x, cols as f32), scroll_steps(&mut scrolled.y, phase, lines.y, rows as f32))
+}
+
+fn scroll_mouse_bytes(vt: &mut Vt, steps: Point<i32>, x: f32, y: f32, size: (u32, u32, f32, f32)) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (steps, positive, negative) in [
+        (steps.y, GHOSTTY_MOUSE_BUTTON_FOUR, GHOSTTY_MOUSE_BUTTON_FIVE),
+        (steps.x, GHOSTTY_MOUSE_BUTTON_SIX, GHOSTTY_MOUSE_BUTTON_SEVEN),
+    ] {
+        let button = if steps > 0 { positive } else { negative };
+        for _ in 0..steps.unsigned_abs() {
+            out.extend(vt.encode_mouse(GHOSTTY_MOUSE_ACTION_PRESS, Some(button), 0, x, y, size, false));
+        }
+    }
+    out
+}
+
 /// Whole lines to scroll for one scroll event. A touchpad sends many small
 /// moves: they add up to a line before one scrolls (as in Zed), and each
 /// gesture starts from nothing. Kept under a screen, so turning back is quick.
@@ -758,11 +874,20 @@ fn icon_glyph(c: char) -> Option<IconGlyph> {
     })
 }
 
-/// A Nerd Font icon (Unicode private use areas). Drawn from the bundled
-/// symbols font and fitted to the cell, whatever the terminal font.
+/// A Nerd Font icon (Unicode private use areas).
 fn is_icon(text: &str) -> bool {
     let mut chars = text.chars();
     matches!((chars.next(), chars.next()), (Some(c), None) if matches!(c as u32, 0xE000..=0xF8FF | 0xF0000..=0x10FFFD))
+}
+
+/// Keep the configured font’s icon proportions; only fit bundled fallback glyphs.
+fn fallback_icon(text: &str, font: &Font, ts: &gpui::TextSystem) -> Option<IconGlyph> {
+    let c = text.chars().next().filter(|_| is_icon(text))?;
+    let id = ts.resolve_font(font);
+    if ts.advance(id, px(crate::settings::font_size()), c).is_ok() {
+        return None;
+    }
+    icon_glyph(c)
 }
 
 fn paste_image_fallback(vt: &mut vt::Vt, text: Option<&str>) -> Option<Vec<u8>> {
@@ -785,8 +910,14 @@ fn key_bytes(vt: &mut vt::Vt, ev: &KeyDownEvent) -> Option<Vec<u8>> {
     }
     let k = &ev.keystroke;
     let m = k.modifiers;
-    if k.key == "enter" && vt.win32.on && (m.shift || m.control || m.alt) && vt.kitty_keyboard_flags() == 0 {
-        return Some(crate::win32_keys::enter(m.shift, m.control, m.alt));
+    if vt.win32.on && vt.kitty_keyboard_flags() == 0 {
+        if k.key == "enter" && (m.shift || m.control || m.alt) {
+            return Some(crate::win32_keys::enter(m.shift, m.control, m.alt));
+        }
+        // ConPTY combines a bare Escape with the next key as an Alt chord.
+        if k.key == "escape" {
+            return Some(crate::win32_keys::escape(m.shift, m.control, m.alt));
+        }
     }
     let Some((key, shifted, unshifted)) = map_key(&k.key) else {
         return k.key_char.as_ref().map(|text| text.as_bytes().to_vec());
@@ -800,6 +931,12 @@ fn key_bytes(vt: &mut vt::Vt, ev: &KeyDownEvent) -> Option<Vec<u8>> {
     }
     if m.alt {
         mods |= GHOSTTY_MODS_ALT as GhosttyMods;
+        #[cfg(target_os = "macos")]
+        if k.option_side == Some(gpui::OptionSide::Right)
+            || (k.option_side == Some(gpui::OptionSide::Both) && gpui_macos::option_as_alt() == gpui_macos::OptionAsAlt::Right)
+        {
+            mods |= GHOSTTY_MODS_ALT_SIDE as GhosttyMods;
+        }
     }
     if m.platform {
         mods |= GHOSTTY_MODS_SUPER as GhosttyMods;
@@ -814,7 +951,7 @@ fn key_bytes(vt: &mut vt::Vt, ev: &KeyDownEvent) -> Option<Vec<u8>> {
     let mut consumed = mods & GHOSTTY_MODS_SHIFT as GhosttyMods;
     let option_as_alt = {
         #[cfg(target_os = "macos")]
-        { gpui_macos::option_as_alt() }
+        { gpui_macos::option_as_alt().uses_alt(k.option_side) }
         #[cfg(not(target_os = "macos"))]
         { false }
     };
@@ -948,8 +1085,9 @@ fn row_ops(row: &[vt::Cell], cell: Size<Pixels>, window: &mut Window) -> Vec<Row
             ops.push(RowOp::Sprite { x: start, text: c.text.clone(), color });
             continue;
         }
-        if let Some(icon) = c.text.chars().next().filter(|_| is_icon(&c.text)).and_then(icon_glyph) {
-            // Fitted to the cell by its real outline, as Ghostty does:
+        let text_font = cell_font(c.bold, c.italic);
+        if let Some(icon) = fallback_icon(&c.text, &text_font, window.text_system()) {
+            // Fit missing icons from the bundled font by their outlines:
             // centered, as tall as fits, two cells wide when a space
             // follows (prompts, statuslines, file trees).
             let room = if row.get(x).is_none_or(|d| d.text.trim().is_empty()) { 2.0 } else { 1.0 };
@@ -978,8 +1116,8 @@ fn row_ops(row: &[vt::Cell], cell: Size<Pixels>, window: &mut Window) -> Vec<Row
                     && d.faint == c.faint
                     && d.underline == c.underline
                     && d.strike == c.strike;
-                // A missing icon breaks the run too; the next outer pass draws it as text.
-                if !same || (d.text.is_empty() && !d.underline && !d.strike) || crate::sprites::is_sprite(&d.text) || is_icon(&d.text) {
+                // Bundled fallback icons are fitted separately from the text run.
+                if !same || (d.text.is_empty() && !d.underline && !d.strike) || crate::sprites::is_sprite(&d.text) || fallback_icon(&d.text, &text_font, window.text_system()).is_some() {
                     break;
                 }
                 text.push_str(if d.text.is_empty() { " " } else { &d.text });
@@ -991,7 +1129,7 @@ fn row_ops(row: &[vt::Cell], cell: Size<Pixels>, window: &mut Window) -> Vec<Row
         }
         let run = TextRun {
             len: text.len(),
-            font: cell_font(c.bold, c.italic),
+            font: text_font,
             color,
             background_color: None,
             underline: c.underline.then(|| UnderlineStyle { thickness: px(1.0), color: Some(color), wavy: false }),
@@ -1018,7 +1156,7 @@ fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, w
     g.origin = origin;
     let frame = g.vt.frame();
     let placements = g.vt.placements();
-    let mut images: Vec<(i32, Bounds<Pixels>, Arc<RenderImage>)> = Vec::new();
+    let mut images: Vec<(bool, Bounds<Pixels>, Arc<RenderImage>)> = Vec::new();
     let mut keep = std::collections::HashSet::new();
     for p in &placements {
         let key = (p.image, p.generation, p.source);
@@ -1030,10 +1168,16 @@ fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, w
             g.images.insert(key, Arc::new(RenderImage::new(smallvec::smallvec![image::Frame::new(buf)])));
         }
         if let Some(img) = g.images.get(&key) {
-            let pos = origin + point(cell.width * p.col as f32, cell.height * p.row as f32);
-            // Placements are in device pixels.
-            let shown = size(px(p.width as f32 / scale), px(p.height as f32 / scale));
-            images.push((p.z, Bounds::new(pos, shown), img.clone()));
+            let [x, y, mut width, mut height] = p.pixel_geometry(f32::from(cell.width), f32::from(cell.height));
+            if p.cell_pixels.is_none() {
+                // Direct placements are in device pixels.
+                width /= scale;
+                height /= scale;
+            }
+            let pos = origin + point(px(x), px(y));
+            // Placeholder runs contain no text and must cover explicit cell backgrounds.
+            let below = p.z < 0 && p.cell_pixels.is_none();
+            images.push((below, Bounds::new(pos, size(px(width), px(height))), img.clone()));
         }
     }
     g.images.retain(|k, _| keep.contains(k));
@@ -1050,8 +1194,8 @@ fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, w
         Bounds::new(point(x0, y0), size(x1 - x0, y1 - y0))
     };
     let paint_images = |below: bool, window: &mut Window| {
-        for (z, b, img) in &images {
-            if (*z < 0) == below {
+        for (image_below, b, img) in &images {
+            if *image_below == below {
                 let _ = window.paint_image(*b, *b, Corners::default(), img.clone(), 0, false);
             }
         }
@@ -1241,6 +1385,7 @@ impl Render for TerminalView {
         self.grid.borrow_mut().link_spans = spans.unwrap_or_default();
         let grid = self.grid.clone();
         let grid_paint = self.grid.clone();
+        let selection_view = cx.entity().downgrade();
         let (input_focus, input_view) = (self.focus.clone(), cx.entity());
         let ended = self.ended.clone().or_else(|| self.lost.then(|| "reconnecting to core…".to_owned()));
 
@@ -1280,12 +1425,10 @@ impl Render for TerminalView {
                         LinkTarget::External(target) => links::open(&target),
                         LinkTarget::Terminal(address) => cx.emit(TerminalEvent::Peek(address)),
                     }
-                    this.link_click = true;
                     return;
                 }
                 if !this.mouse(GHOSTTY_MOUSE_ACTION_PRESS, Some(ev.button), ev.position, ev.modifiers) {
-                    this.selecting = true;
-                    this.select(Select::Press, ev.position, cx);
+                    this.start_selection(ev.position, cx);
                 }
             }))
             // Right-click is Herdr's menu, even when the program tracks the mouse
@@ -1294,14 +1437,9 @@ impl Render for TerminalView {
             .on_mouse_down(MouseButton::Right, cx.listener(|this, ev: &MouseDownEvent, _, cx| {
                 cx.stop_propagation();
                 if this.right_click_to_program && this.takes_mouse(ev.modifiers) {
-                    this.right_to_program = this.mouse(GHOSTTY_MOUSE_ACTION_PRESS, Some(ev.button), ev.position, ev.modifiers);
+                    this.mouse(GHOSTTY_MOUSE_ACTION_PRESS, Some(ev.button), ev.position, ev.modifiers);
                 } else {
                     cx.emit(TerminalEvent::ContextMenu(ev.position));
-                }
-            }))
-            .on_mouse_up(MouseButton::Right, cx.listener(|this, ev: &MouseUpEvent, _, _| {
-                if std::mem::take(&mut this.right_to_program) {
-                    this.mouse(GHOSTTY_MOUSE_ACTION_RELEASE, Some(ev.button), ev.position, ev.modifiers);
                 }
             }))
             .on_mouse_down(MouseButton::Middle, cx.listener(|this, ev: &MouseDownEvent, _, cx| {
@@ -1309,41 +1447,24 @@ impl Render for TerminalView {
                     this.paste(cx);
                 }
             }))
-            .on_mouse_up(MouseButton::Left, cx.listener(|this, ev: &MouseUpEvent, _, cx| {
-                if std::mem::take(&mut this.link_click) {
-                    return;
-                }
-                if std::mem::take(&mut this.selecting) {
-                    this.select(Select::Release, ev.position, cx);
-                }
-                this.mouse(GHOSTTY_MOUSE_ACTION_RELEASE, Some(ev.button), ev.position, ev.modifiers);
-            }))
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
                 this.grid.borrow_mut().hover = Some(ev.position);
                 if link_mods(&ev.modifiers) || this.link.is_some() {
                     cx.notify();
                 }
-                if this.selecting && ev.pressed_button == Some(MouseButton::Left) {
-                    this.select(Select::Drag, ev.position, cx);
-                } else {
-                    this.mouse(GHOSTTY_MOUSE_ACTION_MOTION, ev.pressed_button, ev.position, ev.modifiers);
+                if !this.selecting && ev.pressed_button.is_none() {
+                    this.mouse(GHOSTTY_MOUSE_ACTION_MOTION, None, ev.position, ev.modifiers);
                 }
             }))
             .child(
                 canvas(
                     move |bounds, window, _cx| {
                         let mut g = grid.borrow_mut();
-                        g.vt.set_theme(vt::theme());
                         g.cell = cell;
                         g.scale = window.scale_factor();
                         let dev = device_cell(cell, g.scale);
                         // Before the size, so a program woken by it asks for the new cell.
-                        if let Some(chan) = g.channel
-                            && g.told_cell != Some(dev)
-                        {
-                            g.core.facts(chan, &display_facts(dev));
-                            g.told_cell = Some(dev);
-                        }
+                        g.refresh_theme(&vt::theme(), dev);
                         let (px_, py_) = pad();
                         let cols = ((f32::from(bounds.size.width) - 2.0 * px_) / f32::from(cell.width)).floor().max(2.0) as u16;
                         let rows = ((f32::from(bounds.size.height) - 2.0 * py_) / f32::from(cell.height)).floor().max(1.0) as u16;
@@ -1360,6 +1481,39 @@ impl Render for TerminalView {
                     },
                     move |bounds, _, window, cx| {
                         paint_grid(bounds, &grid_paint, focused, window, cx);
+                        let view = selection_view.clone();
+                        window.on_mouse_event(move |ev: &MouseMoveEvent, phase, _, cx| {
+                            if phase == DispatchPhase::Capture {
+                                let _ = view.update(cx, |this, cx| {
+                                    if !this.selecting && ev.pressed_button.is_some() && !this.grid.borrow().buttons_down.is_empty() {
+                                        this.mouse(GHOSTTY_MOUSE_ACTION_MOTION, ev.pressed_button, ev.position, ev.modifiers);
+                                    }
+                                    if this.selecting {
+                                        this.selection_pointer = ev.position;
+                                        if ev.pressed_button == Some(MouseButton::Left) {
+                                            this.select(Select::Drag, ev.position, cx);
+                                        } else {
+                                            this.selection_scroll = None;
+                                            this.finish_selection(Some(ev.position), cx);
+                                        }
+                                    }
+                                });
+                            }
+                        });
+                        window.on_mouse_event(move |ev: &MouseUpEvent, phase, _, cx| {
+                            if phase == DispatchPhase::Capture {
+                                let _ = selection_view.update(cx, |this, cx| {
+                                    if (!this.selecting || ev.button != MouseButton::Left) && this.grid.borrow().buttons_down.contains(&ev.button) {
+                                        this.mouse(GHOSTTY_MOUSE_ACTION_RELEASE, Some(ev.button), ev.position, ev.modifiers);
+                                    }
+                                    if this.selecting && ev.button == MouseButton::Left {
+                                        this.selection_scroll = None;
+                                        this.finish_selection(Some(ev.position), cx);
+                                        cx.stop_propagation();
+                                    }
+                                });
+                            }
+                        });
                         // While focused, the OS input methods (Pinyin, Japanese,
                         // dead keys) type into this terminal.
                         if focused {
@@ -1395,6 +1549,43 @@ impl Focusable for TerminalView {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mouse_buttons_only_follow_the_pane_that_took_each_press() {
+        use super::*;
+        let mut buttons = Vec::new();
+        let left = Some(MouseButton::Left);
+        let right = Some(MouseButton::Right);
+        assert!(track_mouse_button(&mut buttons, GHOSTTY_MOUSE_ACTION_MOTION, None));
+        assert!(!track_mouse_button(&mut buttons, GHOSTTY_MOUSE_ACTION_MOTION, left));
+        assert!(!track_mouse_button(&mut buttons, GHOSTTY_MOUSE_ACTION_RELEASE, left));
+        assert!(track_mouse_button(&mut buttons, GHOSTTY_MOUSE_ACTION_PRESS, left));
+        assert!(track_mouse_button(&mut buttons, GHOSTTY_MOUSE_ACTION_MOTION, left));
+        assert!(!track_mouse_button(&mut buttons, GHOSTTY_MOUSE_ACTION_RELEASE, right));
+        assert_eq!(buttons, vec![MouseButton::Left]);
+        assert!(track_mouse_button(&mut buttons, GHOSTTY_MOUSE_ACTION_PRESS, right));
+        assert!(track_mouse_button(&mut buttons, GHOSTTY_MOUSE_ACTION_RELEASE, right));
+        assert_eq!(buttons, vec![MouseButton::Left]);
+        assert!(!track_mouse_button(&mut buttons, GHOSTTY_MOUSE_ACTION_MOTION, right));
+        assert!(track_mouse_button(&mut buttons, GHOSTTY_MOUSE_ACTION_RELEASE, left));
+        assert!(buttons.is_empty());
+        assert!(!track_mouse_button(&mut buttons, GHOSTTY_MOUSE_ACTION_MOTION, left));
+        assert!(!track_mouse_button(&mut buttons, GHOSTTY_MOUSE_ACTION_RELEASE, left));
+        assert!(track_mouse_button(&mut buttons, GHOSTTY_MOUSE_ACTION_MOTION, None));
+    }
+
+    #[test]
+    fn selection_autoscroll_only_runs_outside_the_grid_and_caps_speed() {
+        use super::selection_scroll_lines as lines;
+        assert_eq!(lines(0.0, 20.0, 40), 0);
+        assert_eq!(lines(799.0, 20.0, 40), 0);
+        assert_eq!(lines(-1.0, 20.0, 40), -1);
+        assert_eq!(lines(800.0, 20.0, 40), 1);
+        assert_eq!(lines(-41.0, 20.0, 40), -3);
+        assert_eq!(lines(841.0, 20.0, 40), 3);
+        assert_eq!(lines(-10_000.0, 20.0, 40), -5);
+        assert_eq!(lines(10_000.0, 20.0, 40), 5);
+    }
+
     struct Empty;
     impl gpui::Render for Empty {
         fn render(&mut self, _: &mut gpui::Window, _: &mut gpui::Context<Self>) -> impl gpui::IntoElement {
@@ -1420,7 +1611,8 @@ mod tests {
                             _ => None,
                         }).collect();
                         assert!(rendered.contains(missing), "{text:?}, underline={underline}, strike={strike}");
-                        assert!(ops.iter().any(|op| matches!(op, super::RowOp::Icon { .. })));
+                        assert!(rendered.contains('\u{f10d}'));
+                        assert!(!ops.iter().any(|op| matches!(op, super::RowOp::Icon { .. })));
                         let positions: Vec<_> = ops.iter().filter_map(|op| match op {
                             super::RowOp::Text { x, line } => { assert!(!line.text.is_empty()); Some(*x) }
                             super::RowOp::Icon { x, .. } => Some(*x),
@@ -1428,6 +1620,26 @@ mod tests {
                         }).collect();
                         assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
                     }
+                }
+            }
+        }).unwrap();
+    }
+
+    #[gpui::test]
+    fn icons_available_in_the_terminal_font_stay_in_one_text_run(cx: &mut gpui::TestAppContext) {
+        let window = cx.add_window(|_, _| Empty);
+        window.update(cx, |_, window, _| {
+            // The test text system supplies every glyph in the requested font.
+            for (bold, italic) in [(false, false), (true, false), (false, true)] {
+                for text in ["\u{f1c0}\u{f0e7} 99.6%", "\u{f0e4} 54 t/s", "\u{f233} \u{f0e7}"] {
+                    let row: Vec<_> = text.chars().map(|c| crate::vt::Cell {
+                        text: c.to_string(), bold, italic, ..Default::default()
+                    }).collect();
+                    let ops = super::row_ops(&row, gpui::size(gpui::px(8.0), gpui::px(16.0)), window);
+                    assert_eq!(ops.len(), 1, "{text:?}");
+                    let super::RowOp::Text { x, line } = &ops[0] else { panic!("configured font was bypassed") };
+                    assert_eq!(*x, 0);
+                    assert_eq!(line.text.as_ref(), text);
                 }
             }
         }).unwrap();
@@ -1502,6 +1714,43 @@ mod tests {
     }
 
     #[test]
+    fn horizontal_and_vertical_scroll_report_sgr_wheel_buttons() {
+        use gpui::{point, px, size, ScrollDelta, TouchPhase};
+        let mut vt = Vt::new(80, 24);
+        vt.write(b"\x1b[?1000h\x1b[?1006h");
+        let cell = size(px(10.0), px(20.0));
+        let mut scrolled = point(0.0, 0.0);
+        for (delta, expected) in [
+            (point(10.0, 0.0), b"\x1b[<66;2;2M".as_slice()),
+            (point(-10.0, 0.0), b"\x1b[<67;2;2M".as_slice()),
+            (point(0.0, 20.0), b"\x1b[<64;2;2M".as_slice()),
+            (point(0.0, -20.0), b"\x1b[<65;2;2M".as_slice()),
+            (point(-10.0, 20.0), b"\x1b[<64;2;2M\x1b[<67;2;2M".as_slice()),
+        ] {
+            let steps = super::scroll_delta_steps(&mut scrolled, ScrollDelta::Pixels(point(px(delta.x), px(delta.y))), TouchPhase::Moved, cell, 80, 24);
+            assert_eq!(super::scroll_mouse_bytes(&mut vt, steps, 15.0, 25.0, (80, 24, 10.0, 20.0)), expected);
+        }
+        let steps = super::scroll_delta_steps(&mut scrolled, ScrollDelta::Lines(point(1.0, -1.0)), TouchPhase::Moved, cell, 80, 24);
+        let count = if cfg!(target_os = "macos") { 3 } else { 1 };
+        assert_eq!(steps, point(1, -count));
+        assert_eq!(super::scroll_mouse_bytes(&mut vt, steps, 15.0, 25.0, (80, 24, 10.0, 20.0)), [b"\x1b[<65;2;2M".repeat(count as usize), b"\x1b[<66;2;2M".to_vec()].concat());
+    }
+
+    #[test]
+    fn scroll_axes_accumulate_independently_and_reset_together() {
+        use gpui::{point, px, size, ScrollDelta, TouchPhase::*};
+        let mut scrolled = point(0.0, 0.0);
+        let mut steps = |phase, x, y| super::scroll_delta_steps(&mut scrolled, ScrollDelta::Pixels(point(px(x), px(y))), phase, size(px(10.0), px(20.0)), 80, 24);
+        assert_eq!(steps(Moved, 6.0, 8.0), point(0, 0));
+        assert_eq!(steps(Moved, 5.0, 8.0), point(1, 0));
+        assert_eq!(steps(Moved, 0.0, 8.0), point(0, 1));
+        assert_eq!(steps(Started, 0.0, 0.0), point(0, 0));
+        assert_eq!(steps(Moved, -9.0, -19.0), point(0, 0));
+        assert_eq!(steps(Moved, -2.0, -2.0), point(-1, -1));
+        assert_eq!(steps(Ended, 100.0, 100.0), point(0, 0));
+    }
+
+    #[test]
     fn macos_wheel_events_scroll_as_in_ghostty() {
         use super::macos_wheel_steps as steps;
         assert_eq!(steps(0.1), 3, "a slow notch");
@@ -1545,6 +1794,10 @@ mod tests {
                 modifiers: Modifiers { control: has("ctrl"), alt: has("alt"), shift: has("shift"), platform: has("cmd"), function: false },
                 key: key.into(),
                 key_char: typed.map(str::to_owned),
+                #[cfg(target_os = "macos")]
+                unshifted_key: None,
+                #[cfg(target_os = "macos")]
+                option_side: None,
             },
             is_held: false,
             prefer_character_input: false,
@@ -1570,7 +1823,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn option_as_alt_encodes_legacy_and_kitty_shortcuts() {
         let _guard = OPTION_AS_ALT_TEST_LOCK.lock().unwrap();
-        gpui_macos::set_option_as_alt(Some(true));
+        gpui_macos::set_option_as_alt(Some(gpui_macos::OptionAsAlt::Both));
         let mut vt = Vt::new(20, 3);
         for (key, text, bytes) in [("alt-p", "p", b"\x1bp"), ("alt-e", "e", b"\x1be"), ("alt-b", "b", b"\x1bb")] {
             assert_eq!(key_bytes(&mut vt, &press(key, Some(text))).unwrap(), bytes);
@@ -1578,7 +1831,7 @@ mod tests {
         vt.write(b"\x1b[>1u");
         assert_eq!(key_bytes(&mut vt, &press("alt-e", Some("e"))).unwrap(), b"\x1b[101;3u");
         vt.write(b"\x1b[<u");
-        gpui_macos::set_option_as_alt(Some(false));
+        gpui_macos::set_option_as_alt(Some(gpui_macos::OptionAsAlt::None));
         assert_eq!(key_bytes(&mut vt, &press("alt-p", Some("π"))).unwrap(), "π".as_bytes());
         for setup in [b"".as_slice(), b"\x1b[>1u"] {
             let mut vt = Vt::new(20, 3);
@@ -1592,6 +1845,40 @@ mod tests {
             }
             assert_eq!(key_bytes(&mut vt, &press("alt-left", None)).unwrap(), b"\x1b[1;3D");
         }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn option_sides_encode_shortcuts_and_native_text() {
+        use gpui::OptionSide;
+        use gpui_macos::OptionAsAlt;
+        let _guard = OPTION_AS_ALT_TEST_LOCK.lock().unwrap();
+        for setting in [OptionAsAlt::Left, OptionAsAlt::Right] {
+            gpui_macos::set_option_as_alt(Some(setting));
+            for side in [OptionSide::Left, OptionSide::Right, OptionSide::Both] {
+                let as_alt = side == OptionSide::Both || matches!((setting, side), (OptionAsAlt::Left, OptionSide::Left) | (OptionAsAlt::Right, OptionSide::Right));
+                for kitty in [false, true] {
+                    let mut vt = Vt::new(20, 3);
+                    if kitty { vt.write(b"\x1b[>1u"); }
+                    for native in ["π", "@"] {
+                        let mut event = press("alt-p", Some(if as_alt { "p" } else { native }));
+                        event.keystroke.option_side = Some(side);
+                        let expected = if as_alt {
+                            if kitty { b"\x1b[112;3u".as_slice() } else { b"\x1bp".as_slice() }
+                        } else { native.as_bytes() };
+                        assert_eq!(key_bytes(&mut vt, &event).unwrap(), expected);
+                        // Shortcut-prefix replay must retain the original Option side.
+                        let mut replay = event.clone();
+                        replay.prefer_character_input = true;
+                        assert_eq!(key_bytes(&mut vt, &replay).unwrap(), expected);
+                    }
+                    let mut arrow = press("alt-left", None);
+                    arrow.keystroke.option_side = Some(side);
+                    assert_eq!(key_bytes(&mut vt, &arrow).unwrap(), b"\x1b[1;3D");
+                }
+            }
+        }
+        gpui_macos::set_option_as_alt(Some(OptionAsAlt::None));
     }
 
     #[test]
@@ -1629,7 +1916,7 @@ mod tests {
         #[cfg(target_os = "macos")]
         let _guard = OPTION_AS_ALT_TEST_LOCK.lock().unwrap();
         #[cfg(target_os = "macos")]
-        gpui_macos::set_option_as_alt(Some(false));
+        gpui_macos::set_option_as_alt(Some(gpui_macos::OptionAsAlt::None));
         // Herdr keeps native Option text on macOS (libghostty's default
         // option-as-alt=false); other platforms prefix an unconsumed Alt.
         const ALT_B: &[u8] = if cfg!(target_os = "macos") { b"b" } else { b"\x1bb" };
@@ -1692,6 +1979,45 @@ mod tests {
     }
 
     #[test]
+    fn escape_keeps_the_next_key_separate_in_each_keyboard_mode() {
+        for flags in [0, 1, 9] {
+            for win32 in [false, true] {
+                let mut vt = Vt::new(20, 3);
+                if win32 { vt.write(b"\x1b[?9001h"); }
+                vt.write(format!("\x1b[>{flags}u").as_bytes());
+                let escape: &[u8] = if flags != 0 {
+                    b"\x1b[27u".as_slice()
+                } else if win32 {
+                    b"\x1b[27;1;27;1;0;1_\x1b[27;1;27;0;0;1_"
+                } else {
+                    b"\x1b"
+                };
+                for (next, text, expected) in [
+                    ("ctrl-c", None, if flags == 0 { b"\x03".as_slice() } else { b"\x1b[99;5u" }),
+                    ("ctrl-c", Some("c"), if flags == 0 { b"\x03".as_slice() } else { b"\x1b[99;5u" }),
+                    ("a", Some("a"), if flags & 8 == 0 { b"a".as_slice() } else { b"\x1b[97u" }),
+                    ("space", Some(" "), if flags & 8 == 0 { b" ".as_slice() } else { b"\x1b[32u" }),
+                    ("escape", None, escape),
+                ] {
+                    assert_eq!(key_bytes(&mut vt, &press("escape", None)).as_deref(), Some(escape), "flags={flags}, win32={win32}");
+                    assert_eq!(key_bytes(&mut vt, &press(next, text)).as_deref(), Some(expected), "flags={flags}, win32={win32}, {next}");
+                }
+                vt.write(b"\x1b[<u");
+                let restored = if win32 { b"\x1b[27;1;27;1;0;1_\x1b[27;1;27;0;0;1_".as_slice() } else { b"\x1b" };
+                assert_eq!(key_bytes(&mut vt, &press("escape", None)).as_deref(), Some(restored));
+                vt.write(b"\x1b[?9001l");
+                assert_eq!(key_bytes(&mut vt, &press("escape", None)).unwrap(), b"\x1b");
+            }
+        }
+        let mut vt = Vt::new(20, 3);
+        vt.write(b"\x1b[?9001h");
+        for (spec, held) in [("shift-escape", 16), ("ctrl-escape", 8), ("alt-escape", 2)] {
+            let expected = format!("\x1b[27;1;27;1;{held};1_\x1b[27;1;27;0;{held};1_");
+            assert_eq!(key_bytes(&mut vt, &press(spec, None)).unwrap(), expected.as_bytes());
+        }
+    }
+
+    #[test]
     fn kitty_input_takes_precedence_over_win32() {
         for flags in 1..=31 {
             for win32_first in [false, true] {
@@ -1700,6 +2026,7 @@ mod tests {
                 vt.write(format!("\x1b[>{flags}u").as_bytes());
                 if !win32_first { vt.write(b"\x1b[?9001h"); }
                 for (spec, expected) in [
+                    ("escape", b"\x1b[27u".as_slice()),
                     ("shift-enter", b"\x1b[13;2u".as_slice()),
                     ("ctrl-enter", b"\x1b[13;5u"),
                     ("alt-enter", b"\x1b[13;3u"),
@@ -1737,6 +2064,34 @@ mod tests {
         assert_eq!(super::device_cell(cell, 1.0), (8, 22));
         assert_eq!(super::device_cell(cell, 2.0), (17, 43));
         assert_eq!(super::device_cell(gpui::size(gpui::px(0.0), gpui::px(0.0)), 2.0), (1, 1));
-        assert_eq!(super::display_facts((17, 43))["cell"], serde_json::json!([17, 43]));
+        assert_eq!(super::display_update(&mut None, &crate::vt::theme(), (17, 43)).unwrap()["cell"], serde_json::json!([17, 43]));
+    }
+
+    #[test]
+    fn theme_changes_update_core_facts_without_resizing() {
+        use crate::vt::{theme, Rgb};
+        let mut theme = theme();
+        let cell = (9, 18);
+        let mut told = None;
+        let first = super::display_update(&mut told, &theme, cell).unwrap();
+        assert_eq!(first["cell"], serde_json::json!([9, 18]));
+        assert!(super::display_update(&mut told, &theme, cell).is_none());
+
+        for background in [Rgb(255, 255, 255), Rgb(23, 25, 29)] {
+            theme.bg = background;
+            let update = super::display_update(&mut told, &theme, cell)
+                .expect("a theme-only change must reach the core");
+            assert_eq!(update["bg"], format!("#{:02x}{:02x}{:02x}", background.0, background.1, background.2));
+            assert_eq!(update["cell"], first["cell"]);
+            assert!(super::display_update(&mut told, &theme, cell).is_none());
+        }
+
+        theme.fg = Rgb(1, 2, 3);
+        assert_eq!(super::display_update(&mut told, &theme, cell).unwrap()["fg"], "#010203");
+        theme.cursor = Rgb(4, 5, 6);
+        assert_eq!(super::display_update(&mut told, &theme, cell).unwrap()["cursor"], "#040506");
+        assert_eq!(super::display_update(&mut told, &theme, (17, 43)).unwrap()["cell"], serde_json::json!([17, 43]));
+        theme.selection_bg = Rgb(7, 8, 9);
+        assert!(super::display_update(&mut told, &theme, (17, 43)).is_none(), "local selection colors are not core display facts");
     }
 }

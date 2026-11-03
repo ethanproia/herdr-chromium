@@ -1,0 +1,2 @@
+{ "id": "files", "name": "Files", "group": "Tools", "icon": "file.svg", "order": 10,
+  "open": { "mod": "files" }, "places": ["side"] }
