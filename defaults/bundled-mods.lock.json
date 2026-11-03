@@ -29,7 +29,14 @@
       "commit": "00f55b2830c131e0a992285281ce2cb593355236",
       "version": "0.1.0",
       "pr": "essexlabs/labs#1303 (on #1298)",
-      "path": "projects/herdr-mods/core"
+      "path": "projects/herdr-mods/core",
+      "keys": {
+        "global": {
+          "cmd-d": "core.split-right",
+          "cmd-shift-d": "core.split-down"
+        }
+      },
+      "rename": "paths"
     },
     "notepad": {
       "branch": "ethan/herdr-notepad-virtual",

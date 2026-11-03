@@ -57,7 +57,7 @@ function copySpec(c) {
 
 // raw descriptor object -> tool (throws Error with a plain message when invalid)
 export function normalizeTool(raw, folder, opts = {}) {
-  const self = opts.self ?? "fork-core";
+  const self = opts.self ?? "core";
   if (!isObj(raw)) bad("descriptor must be an object");
   if (typeof raw.id !== "string" || !ID_RE.test(raw.id)) bad("id missing or not a plain name");
   if (typeof raw.name !== "string" || !raw.name.trim()) bad("name missing");
@@ -177,7 +177,7 @@ export async function loadRegistry(io) {
 // The Notepad as it was before it shipped its own tool.json (header buttons and copy included).
 export const FALLBACKS = {
   notepad: {
-    id: "fork-notepad", name: "Notepad", icon: "note.svg", order: 2,
+    id: "notepad", name: "Notepad", icon: "note.svg", order: 2,
     open: { mod: "." }, places: ["tab", "split", "pane", "side"],
     header: [
       { id: "md", icon: "md.svg", label: "Markdown", action: { toggleShared: "notepad.md" } },

@@ -1,5 +1,5 @@
 // Role "pane-header": a pane's header, for layouts that frame their panes (replaces the old pane-browser):
-//   { "tab": "active", "pane": { "header": { "content": { "mod": "fork-core", "props": { "role": "pane-header" } } } } }
+//   { "tab": "active", "pane": { "header": { "content": { "mod": "core", "props": { "role": "pane-header" } } } } }
 // Shows the program's icon, the agent's name or the terminal's title, the folder, and the agent's status; buttons split,
 // zoom and close this pane. A mod pane gets its name, icon, own buttons and Copy from that tool's descriptor
 // (registry). Props from the app: { pane, terminal }. Click: focus the pane.
@@ -22,7 +22,7 @@ function progIcon(p, size, color) {
 // The Notepad as it was before it shipped its own tool.json: used only while no descriptor names that folder.
 // (Keys are plain folder names; the fork's rename "fork-" prefix is covered.)
 const NOTEPAD_BUILTIN = {
-  id: "fork-notepad", name: "Notepad", icon: "note.svg",
+  id: "notepad", name: "Notepad", icon: "note.svg",
   open: { mod: "." }, places: ["tab", "split", "pane", "side"],
   header: [
     { id: "md", icon: "md.svg", label: "Markdown", action: { toggleShared: "notepad.md" } },
@@ -150,7 +150,7 @@ export default class PaneHeader {
       : (head?.folder ?? folder(p.cwd));
     const links = shared("notepad.links");
     const backlinks = Array.isArray(links) ? links.filter((h) => (p.terminal && h === `herdr:agent/${p.terminal}`) || h === `herdr:tab/${p.tab}`) : [];
-    const noteMod = this.reg.tools.find((x) => x.id === "fork-notepad")?.open.mod ?? builtinFor("fork-notepad").open.mod;
+    const noteMod = this.reg.tools.find((x) => x.id === "notepad")?.open.mod ?? builtinFor("notepad").open.mod;
     const name = isViewer ? (viewPath ? viewPath.slice(viewPath.lastIndexOf("/") + 1) : "File") : (head ? head.name : baseName);
     const pic = isViewer ? svg(icon("viewer-file")).size(14).flex_none().text_color(t.dim)
       : head?.icon ? svg(head.icon).size(14).flex_none().text_color(t.dim) : head ? null : (progIcon(p.program, 14, t.dim) ?? svg(icon("shell")).size(14).flex_none().text_color(t.dim));

@@ -94,8 +94,8 @@ export const STRIP_HEIGHT = 34;
 
 // Adds { mod, props: { role: "side-strip" } } as a fixed-height block above panel-body (inside the column that holds
 // panel-body). Idempotent: an existing strip is left as it is. Nothing outside that column is touched; no panel-body
-// means an unchanged copy. `mod` is the folder the layout names for core (the shipped layouts say "fork-core").
-export function withSideStrip(tree, mod = "fork-core") {
+// means an unchanged copy. `mod` is the folder the layout names for core (the shipped layouts say "core").
+export function withSideStrip(tree, mod = "core") {
   const out = structuredClone(tree);
   const find2 = (n) => {
     if ((n?.children ?? []).some((c) => c.id === BODY)) return n;
