@@ -162,6 +162,15 @@ mod tests {
     }
 
     #[test]
+    fn a_persons_own_cmd_d_survives_fork_core() {
+        let h = home("cmdd");
+        write(&h.join("keys.json"), json!({ "global": { "cmd-d": "pane.zoom" } }));
+        write(&h.join("mods/fork-core/keys.json"), json!({ "global": { "cmd-d": "fork-core.split-right" } }));
+        merge_at(&h).unwrap();
+        assert_eq!(keys(&h)["global"]["cmd-d"], "pane.zoom");
+    }
+
+    #[test]
     fn a_deleted_binding_stays_deleted_and_an_untouched_one_follows_the_mod() {
         let h = home("follow");
         write(&h.join("keys.json"), json!({ "global": {} }));

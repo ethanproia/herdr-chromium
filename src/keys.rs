@@ -104,6 +104,18 @@ fn gone_mod(action: &str) -> bool {
         && name.split_once('.').is_some_and(|(m, _)| !m.starts_with("frame-") && !crate::mods::mods_dir().join(m).is_dir())
 }
 
+// HERDR: fork-core's split commands open its New panel chooser; while fork-core is
+// turned off or missing their keys fall back to the built-in split instead of going dead.
+const FALLBACKS: &[(&str, &str)] = &[("fork-core.split-right", "pane.split:right"), ("fork-core.split-down", "pane.split:down")];
+
+/// The action a binding runs: itself, a gone mod's fallback, or None (bound to nothing).
+fn resolve(action: &str, gone: impl Fn(&str) -> bool) -> Option<String> {
+    if !gone(action) {
+        return Some(action.to_owned());
+    }
+    FALLBACKS.iter().find(|(a, _)| *a == action).map(|(_, b)| (*b).to_owned())
+}
+
 fn valid_action(action: &str) -> bool {
     let name = action.split_once(':').map_or(action, |(n, _)| n);
     crate::commands::find(name).is_some()
@@ -135,10 +147,8 @@ pub fn parse(text: &str) -> Result<Vec<KeyBinding>, String> {
             }
         };
         for (keys, action) in keys {
-            let action = &current(action);
-            if gone_mod(action) {
-                continue;
-            }
+            let Some(action) = resolve(&current(action), gone_mod) else { continue };
+            let action = &action;
             if !valid_action(action) {
                 problems.push(format!("{section}.{keys}: unknown action {action:?}"));
                 continue;
@@ -206,6 +216,25 @@ mod tests {
         assert_eq!(super::current("context.new"), "tab.new");
         assert_eq!(super::current("mod.open:start"), "tab.new");
         assert_eq!(super::current("pane.zoom"), "pane.zoom");
+    }
+
+    #[test]
+    fn core_split_keys_fall_back_while_core_is_off_or_missing() {
+        use super::resolve;
+        // fork-core on: its command.
+        assert_eq!(resolve("fork-core.split-right", |_| false).as_deref(), Some("fork-core.split-right"));
+        // Turned off (mods_disabled) or folder missing: gone_mod is true either way.
+        assert_eq!(resolve("fork-core.split-right", |_| true).as_deref(), Some("pane.split:right"));
+        assert_eq!(resolve("fork-core.split-down", |_| true).as_deref(), Some("pane.split:down"));
+        // Any other gone mod's key stays unbound.
+        assert_eq!(resolve("ribbon.next", |_| true), None);
+    }
+
+    #[test]
+    fn own_cmd_d_is_never_replaced() {
+        // A person's own action on the key is kept as written: no fallback applies to it.
+        assert_eq!(super::resolve("pane.zoom", |_| false).as_deref(), Some("pane.zoom"));
+        assert_eq!(super::parse(r#"{ "global": { "cmd-d": "pane.zoom" } }"#).unwrap().len(), 1);
     }
 
     #[test]
