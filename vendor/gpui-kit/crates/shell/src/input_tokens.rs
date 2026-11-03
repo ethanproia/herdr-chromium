@@ -232,7 +232,26 @@ pub(crate) const METHODS: &[(&str, &str, bool)] = &[
     ),
     ("set_selected_range", "(range: InputRange): void", false),
     ("replace", "(text: string): void", false),
+    // HERDR: selection hooks for script toolbars.
+    ("selected_range", "(): InputSelection", true),
+    ("selection_bounds", "(): TextBounds | null", true),
+    ("caret_bounds", "(): TextBounds | null", true),
 ];
+
+// HERDR: window bounds as the script sees them: x/y from the text element's top-left (the
+// container `input_bounds`), plus the window position.
+fn text_bounds_data(bounds: Option<gpui::Bounds<gpui::Pixels>>, element: gpui::Bounds<gpui::Pixels>) -> Data {
+    let Some(b) = bounds else { return Data::Null };
+    let n = |p: gpui::Pixels| Data::Number(f32::from(p) as f64);
+    object([
+        ("x", n(b.origin.x - element.origin.x)),
+        ("y", n(b.origin.y - element.origin.y)),
+        ("width", n(b.size.width)),
+        ("height", n(b.size.height)),
+        ("window_x", n(b.origin.x)),
+        ("window_y", n(b.origin.y)),
+    ])
+}
 
 macro_rules! state_binding {
     ($state:ty, $invoke:ident, $methods:ident) => {
@@ -279,6 +298,22 @@ macro_rules! state_binding {
                     let text = string(text)?;
                     entity.update(cx, |state, cx| state.replace(text, window, cx));
                     Ok(Data::Null)
+                }
+                ("selected_range", []) => {
+                    let (range, reversed) = entity.read(cx).selection_utf16();
+                    Ok(object([
+                        ("start", Data::Number(range.start as f64)),
+                        ("end", Data::Number(range.end as f64)),
+                        ("reversed", Data::Boolean(reversed)),
+                    ]))
+                }
+                ("selection_bounds", []) => {
+                    let state = entity.read(cx);
+                    Ok(text_bounds_data(state.selection_bounds(), state.input_bounds()))
+                }
+                ("caret_bounds", []) => {
+                    let state = entity.read(cx);
+                    Ok(text_bounds_data(state.caret_bounds(), state.input_bounds()))
                 }
                 _ => bail!("invalid arguments for input state operation `{name}`"),
             }

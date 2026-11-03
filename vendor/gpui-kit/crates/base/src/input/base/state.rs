@@ -131,6 +131,10 @@ pub enum InputEvent {
     Blur,
     /// A paste found no text on the clipboard (an image, say): the owner may read it.
     PasteWithoutText,
+    // HERDR: selection hooks for script toolbars.
+    /// The active selection changed (keys, mouse, drag, programmatic, undo), checked once per
+    /// painted frame. Offsets are UTF-16, like the script API's `InputRange`.
+    SelectionChange { start: usize, end: usize, reversed: bool, composing: bool },
 }
 
 pub(super) const CONTEXT: &str = "Input";
@@ -463,6 +467,8 @@ pub struct InputBaseState<M: InputModeKind> {
     /// The text bounds
     pub(super) last_bounds: Option<Bounds<Pixels>>,
     pub(super) last_selected_range: Option<CursorSelection>,
+    // HERDR: the selection last reported as `InputEvent::SelectionChange` (UTF-16, reversed).
+    pub(super) last_emitted_selection: Option<(usize, usize, bool)>,
     pub(super) selecting: bool,
     /// Anchor point of an in-progress columnar (block) selection.
     pub(super) column_select_start: Option<ColumnarPoint>,
@@ -645,6 +651,73 @@ impl<M: InputModeKind> InputBaseState<M> {
 
     pub fn text_bounds(&self) -> Option<Bounds<Pixels>> {
         self.last_bounds
+    }
+
+    // HERDR: selection hooks for script toolbars.
+    /// The active selection in UTF-16 offsets (the script API's unit) and whether it was made
+    /// backwards (the caret is at `start`).
+    pub fn selection_utf16(&self) -> (Range<usize>, bool) {
+        (self.range_to_utf16(&self.selected_range()), self.active_selection().reversed)
+    }
+
+    /// Whether an IME composition (marked text) is open.
+    pub fn is_composing(&self) -> bool {
+        self.ime_marked_range.is_some()
+    }
+
+    /// Window-coordinate bounds of the active selection from the last painted layout: one line
+    /// tall when it sits on one visual line, else the union of the lines it spans. None when
+    /// nothing is selected or before the first paint.
+    pub fn selection_bounds(&self) -> Option<Bounds<Pixels>> {
+        let range = self.selected_range();
+        if range.is_empty() {
+            return None;
+        }
+        self.range_bounds(range)
+    }
+
+    /// Window-coordinate bounds of the caret (one line tall, zero wide), None before the first paint.
+    pub fn caret_bounds(&self) -> Option<Bounds<Pixels>> {
+        let cursor = self.cursor();
+        self.range_bounds(cursor..cursor)
+    }
+
+    /// Bounds of a byte range in window coordinates, measured like the IME's `bounds_for_range`.
+    fn range_bounds(&self, range: Range<usize>) -> Option<Bounds<Pixels>> {
+        let last_layout = self.last_layout.as_ref()?;
+        let origin = self.last_bounds?.origin;
+        let line_height = last_layout.line_height;
+        let gutter = point(last_layout.line_number_width, px(0.));
+        let mut y_offset = last_layout.visible_top;
+        let (mut start, mut end) = (None, None);
+        let mut right = px(0.);
+        for (vi, line) in last_layout.lines.iter().enumerate() {
+            let base = last_layout.visible_line_byte_offsets[vi];
+            let size = line.size(line_height);
+            if start.is_none() && range.start >= base {
+                start = line.position_for_index(range.start - base, last_layout, false).map(|p| p + point(px(0.), y_offset));
+            }
+            if start.is_some() {
+                if size.width > right {
+                    right = size.width;
+                }
+                if range.end >= base {
+                    end = line.position_for_index(range.end - base, last_layout, false).map(|p| p + point(px(0.), y_offset));
+                }
+                if end.is_some() {
+                    break;
+                }
+            }
+            y_offset += size.height;
+        }
+        let start = start?;
+        let end = end.unwrap_or(start);
+        let (left, right) = if end.y == start.y {
+            (start.x, if end.x > start.x { end.x } else { start.x })
+        } else {
+            (px(0.), right)
+        };
+        Some(Bounds::from_corners(origin + gutter + point(left, start.y), origin + gutter + point(right, end.y + line_height)))
     }
 
     pub fn diagnostic_popover(&self) -> Option<Rc<crate::input::DiagnosticEntry>> {
@@ -852,6 +925,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             prepaint_caret_geometry: None,
             last_bounds: None,
             last_selected_range: None,
+            last_emitted_selection: None,
             column_select_start: None,
             last_cursor: None,
             scroll_handle: ScrollHandle::new(),
@@ -10916,6 +10990,107 @@ mod tests {
                 assert!(range_bounds.size.width >= px(0.0));
             });
         });
+    }
+
+    // HERDR: selection hooks for script toolbars.
+    fn selection_events(view: &InputView<TextareaMode>, cx: &mut TestAppContext) -> (Rc<RefCell<Vec<(usize, usize, bool, bool)>>>, gpui::Subscription) {
+        let seen: Rc<RefCell<Vec<(usize, usize, bool, bool)>>> = Rc::new(RefCell::new(Vec::new()));
+        let sink = seen.clone();
+        let sub = cx.update(|cx| {
+            cx.subscribe(&view.input, move |_, ev: &InputEvent, _| {
+                if let InputEvent::SelectionChange { start, end, reversed, composing } = ev {
+                    sink.borrow_mut().push((*start, *end, *reversed, *composing));
+                }
+            })
+        });
+        (seen, sub)
+    }
+
+    #[gpui::test]
+    fn selection_is_reported_in_utf16_once_per_change(cx: &mut TestAppContext) {
+        let view = InputView::build_textarea(cx, |state| state.rows(4).default_value("é😀a\nsecond line"));
+        let (seen, _sub) = selection_events(&view, cx);
+        let mut visual = VisualTestContext::from_window(view.window_handle.into(), cx);
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(seen.borrow().is_empty(), "the first paint only records the selection");
+        // "é😀" is 6 bytes and 3 UTF-16 units.
+        visual.update(|window, cx| {
+            view.input.update(cx, |state, cx| state.set_selected_range(0..6, cx));
+            window.draw(cx).clear(cx);
+        });
+        assert_eq!(view.input.read_with(&visual, |s, _| s.selection_utf16()), (0..3, false));
+        assert_eq!(seen.borrow().as_slice(), &[(0, 3, false, false)]);
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        assert_eq!(seen.borrow().len(), 1, "an unchanged selection is not reported again");
+        // Made backwards: reversed, the caret at start.
+        visual.update(|window, cx| {
+            view.input.update(cx, |state, cx| {
+                state.set_selected_range(7..7, cx);
+                state.select_to(0, cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        assert_eq!(seen.borrow().last(), Some(&(0, 4, true, false)));
+        // An open IME composition is reported as composing.
+        visual.update(|window, cx| {
+            view.input.update(cx, |state, cx| {
+                state.focus(window, cx);
+                state.set_selected_range(7..7, cx);
+                state.replace_and_mark_text_in_range(None, "に", None, window, cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        assert!(seen.borrow().last().is_some_and(|e| e.3), "{:?}", seen.borrow());
+    }
+
+    #[gpui::test]
+    fn a_mouse_drag_reports_the_growing_selection(cx: &mut TestAppContext) {
+        let view = InputView::build_textarea(cx, |state| state.rows(4).default_value("alpha beta gamma"));
+        let (seen, _sub) = selection_events(&view, cx);
+        let mut visual = VisualTestContext::from_window(view.window_handle.into(), cx);
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let (text, line_height) = view.input.read_with(&visual, |s, _| (s.text_bounds().unwrap(), s.last_layout.as_ref().unwrap().line_height));
+        let y = text.origin.y + line_height / 2.;
+        visual.simulate_mouse_down(point(text.origin.x + px(1.), y), MouseButton::Left, gpui::Modifiers::default());
+        for dx in [20., 40., 60.] {
+            visual.simulate_mouse_move(point(text.origin.x + px(dx), y), MouseButton::Left, gpui::Modifiers::default());
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        visual.simulate_mouse_up(point(text.origin.x + px(60.), y), MouseButton::Left, gpui::Modifiers::default());
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let seen = seen.borrow();
+        assert!(seen.len() >= 2, "one event per painted frame of the drag: {seen:?}");
+        let ends: Vec<usize> = seen.iter().map(|e| e.1).collect();
+        assert!(ends.windows(2).all(|w| w[0] <= w[1]), "the drag only grows: {ends:?}");
+        assert!(seen.last().is_some_and(|e| e.0 == 0 && e.1 > 0), "{seen:?}");
+    }
+
+    #[gpui::test]
+    fn selection_and_caret_bounds_come_from_the_painted_layout(cx: &mut TestAppContext) {
+        let view = InputView::build_textarea(cx, |state| state.rows(4).default_value("first line\nsecond line"));
+        assert_eq!(view.input.read_with(cx, |s, _| s.caret_bounds()), None, "nothing before the first paint");
+        let mut visual = VisualTestContext::from_window(view.window_handle.into(), cx);
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let (input, line_height) = view.input.read_with(&visual, |s, _| (s.input_bounds(), s.last_layout.as_ref().unwrap().line_height));
+        assert_eq!(view.input.read_with(&visual, |s, _| s.selection_bounds()), None, "a caret is not a selection");
+        let caret = view.input.read_with(&visual, |s, _| s.caret_bounds()).unwrap();
+        assert_eq!((caret.size.width, caret.size.height), (px(0.), line_height));
+        // "first" on one line: one line tall, inside the element, about as wide as the word.
+        visual.update(|window, cx| {
+            view.input.update(cx, |state, cx| state.set_selected_range(0..5, cx));
+            window.draw(cx).clear(cx);
+        });
+        let one = view.input.read_with(&visual, |s, _| s.selection_bounds()).unwrap();
+        assert_eq!(one.size.height, line_height);
+        assert!(one.size.width > px(10.) && input.contains(&one.origin), "{one:?} in {input:?}");
+        // "line\nsecond": two lines tall, from the left edge of the text.
+        visual.update(|window, cx| {
+            view.input.update(cx, |state, cx| state.set_selected_range(6..17, cx));
+            window.draw(cx).clear(cx);
+        });
+        let two = view.input.read_with(&visual, |s, _| s.selection_bounds()).unwrap();
+        assert_eq!(two.size.height, line_height * 2.);
+        assert!(two.origin.x <= one.origin.x && two.size.width >= one.size.width, "{two:?} vs {one:?}");
     }
 }
 

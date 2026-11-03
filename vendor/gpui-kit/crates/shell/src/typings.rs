@@ -2381,6 +2381,12 @@ const WINDOW: &str = r#"
 const INLINE_TOKEN_TYPES: &str = r#"
   /** Half-open JavaScript UTF-16 string offsets, as used by slice(). */
   export interface InputRange { start: number; end: number }
+  /** The active selection (UTF-16, like InputRange); `start == end` is a caret. `reversed`: made backwards, the caret is at `start`. */
+  export interface InputSelection { start: number; end: number; reversed: boolean }
+  /** Logical px from the text element's top-left, plus its window position. */
+  export interface TextBounds { x: number; y: number; width: number; height: number; window_x: number; window_y: number }
+  /** A `selection` event: the new selection; `composing` while IME text is uncommitted (hide toolbars then). */
+  export interface SelectionEvent extends InputSelection { composing: boolean }
   export interface InlineToken { id: string; text: string; label?: string }
   export interface InlineTokenSpan { range: InputRange; token: InlineToken }
   export interface InputContent { text: string; tokens: InlineTokenSpan[] }
@@ -3054,6 +3060,21 @@ const BASE: &str = r#"  /** A row. */
     /** `change`, `submit`, `focus`, `blur`, or `paste_other`: a paste found no text (an image, say). */
     on(event: "change" | "submit" | "focus" | "blur" | "paste_other", handler: (event: InputEvent, cx: Context) => void): boolean;
     /**
+     * Any change of the selection: keys, mouse, drags, `set_selected_range`, undo. Checked once
+     * per painted frame, so a drag gives one event per frame and a state that is not on screen
+     * gives none.
+     */
+    on(event: "selection", handler: (event: SelectionEvent, cx: Context) => void): boolean;
+    /** The active selection, in the same UTF-16 offsets as `set_selected_range`. */
+    selected_range(): InputSelection;
+    /**
+     * Where the selection is drawn (one line tall on one line, else the lines it spans), from the
+     * last paint; `null` when nothing is selected or before the first paint.
+     */
+    selection_bounds(): TextBounds | null;
+    /** Where the caret is drawn (zero wide, one line tall); `null` before the first paint. */
+    caret_bounds(): TextBounds | null;
+    /**
      * How much one step moves the value in a `NumberInput`. Default is 1;
      * `null` gives up stepping entirely.
      *
@@ -3122,6 +3143,21 @@ const BASE: &str = r#"  /** A row. */
     set_value(next: string | InputContent): void;
     /** `change`, `submit`, `focus`, `blur`, or `paste_other`: a paste found no text (an image, say). */
     on(event: "change" | "submit" | "focus" | "blur" | "paste_other", handler: (event: InputEvent, cx: Context) => void): boolean;
+    /**
+     * Any change of the selection: keys, mouse, drags, `set_selected_range`, undo. Checked once
+     * per painted frame, so a drag gives one event per frame and a state that is not on screen
+     * gives none.
+     */
+    on(event: "selection", handler: (event: SelectionEvent, cx: Context) => void): boolean;
+    /** The active selection, in the same UTF-16 offsets as `set_selected_range`. */
+    selected_range(): InputSelection;
+    /**
+     * Where the selection is drawn (one line tall on one line, else the lines it spans), from the
+     * last paint; `null` when nothing is selected or before the first paint.
+     */
+    selection_bounds(): TextBounds | null;
+    /** Where the caret is drawn (zero wide, one line tall); `null` before the first paint. */
+    caret_bounds(): TextBounds | null;
     /** Shows this many rows. */
     set_rows(rows: number): void;
     /** Grows with the content, between the two row counts. */

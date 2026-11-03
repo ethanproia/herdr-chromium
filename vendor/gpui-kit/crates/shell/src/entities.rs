@@ -1169,6 +1169,17 @@ impl EntityStore {
             })
     }
 
+    // HERDR: test the selection hooks behind a script's TextareaState.
+    #[cfg(test)]
+    pub(crate) fn first_textarea(&self) -> Option<Entity<TextareaState>> {
+        self.records
+            .values()
+            .find_map(|stored| match &stored.record {
+                Record::Textarea { state, .. } => Some(state.clone()),
+                _ => None,
+            })
+    }
+
     #[cfg(test)]
     pub(crate) fn first_input(&self) -> Option<Entity<InputState>> {
         self.records
@@ -1264,6 +1275,8 @@ pub enum InputEventName {
     Blur,
     /// A paste with no text on the clipboard (an image): the script reads it.
     PasteOther,
+    // HERDR: any change of the active selection (see InputEvent::SelectionChange).
+    Selection,
 }
 
 impl InputEventName {
@@ -1274,11 +1287,12 @@ impl InputEventName {
             "focus" => Some(Self::Focus),
             "blur" => Some(Self::Blur),
             "paste_other" => Some(Self::PasteOther),
+            "selection" => Some(Self::Selection),
             _ => None,
         }
     }
 
-    pub const NAMES: &'static [&'static str] = &["change", "submit", "focus", "blur", "paste_other"];
+    pub const NAMES: &'static [&'static str] = &["change", "submit", "focus", "blur", "paste_other", "selection"];
 
     fn matches(self, event: &InputEvent) -> bool {
         matches!(
@@ -1288,6 +1302,7 @@ impl InputEventName {
                 | (Self::Focus, InputEvent::Focus)
                 | (Self::Blur, InputEvent::Blur)
                 | (Self::PasteOther, InputEvent::PasteWithoutText)
+                | (Self::Selection, InputEvent::SelectionChange { .. })
         )
     }
 }

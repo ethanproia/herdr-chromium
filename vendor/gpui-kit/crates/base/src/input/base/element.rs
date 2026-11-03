@@ -3312,6 +3312,14 @@ impl<M: InputModeKind> Element for TextElement<M> {
             state.last_cursor = Some(state.cursor());
             state.set_input_bounds(input_bounds, cx);
             state.last_selected_range = Some(selected_range);
+            // HERDR: report a changed selection once per painted frame (a drag coalesces). The
+            // first paint only records it.
+            let (sel, reversed) = state.selection_utf16();
+            let now = (sel.start, sel.end, reversed);
+            if state.last_emitted_selection.is_some_and(|last| last != now) {
+                cx.emit(super::InputEvent::SelectionChange { start: now.0, end: now.1, reversed, composing: state.is_composing() });
+            }
+            state.last_emitted_selection = Some(now);
             state.scroll_size = prepaint.scroll_size;
             state.update_scroll_offset(Some(prepaint.cursor_scroll_offset), cx);
             state.deferred_scroll_offset = None;
