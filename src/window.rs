@@ -2063,7 +2063,9 @@ impl AppWindow {
             let before = tab.before.clone();
             let zoomed = tab.zoomed.clone();
             let id = tab.id.clone();
-            self.model.split(&target, Axis::Row, &pane, addr);
+            // A terminal that already runs is placed even without room (minimums squeeze).
+            let share = self.split_room(&target, Axis::Row, &Node::block("", Content::Terminal { terminal: String::new() })).unwrap_or(0.5);
+            self.model.split_share(&target, Axis::Row, crate::model::pane(&pane, addr), share);
             let tab = self.model.tab_mut(&id).unwrap();
             tab.focused = focused;
             tab.before = before;
@@ -2497,7 +2499,8 @@ impl AppWindow {
                     let destination = target.filter(|p| self.model.tab_of(p).is_some_and(|t| t.id == tab))
                         .or_else(|| self.model.tab(&tab).and_then(|t| t.root.panes().first().map(|p| p.id.clone())));
                     if let Some(target) = destination {
-                        self.model.split(&target, axis, &pane, &address);
+                        let share = self.split_room(&target, axis, &Node::block("", Content::Terminal { terminal: String::new() })).unwrap_or(0.5);
+                        self.model.split_share(&target, axis, crate::model::pane(&pane, &address), share);
                     } else {
                         self.model.add_tab(&space, Tab::new(&tab, &name, &pane, &address));
                     }
@@ -4004,13 +4007,15 @@ impl AppWindow {
     }
 
     // HERDR: browser block. A page asked for a new window: a browser beside it (a split in its
-    // tab); a layout block's page opens a new tab.
+    // tab, when both minimums fit); a layout block's page (or no room) opens a new tab.
     fn browser_new_window(&mut self, from: &str, url: &str, window: &mut Window, cx: &mut Context<Self>) {
         let block = crate::layout::BrowserBlock { url: url.to_owned(), profile: "default".into(), ..Default::default() };
-        let r = if self.model.tab_of(from).is_some() {
+        // Beside the page when there is room for both minimums, else a new tab.
+        let room = self.model.tab_of(from).is_some().then(|| self.split_room(from, Axis::Row, &Node::block("", Content::Browser { browser: block.clone() })).ok()).flatten();
+        let r = if let Some(share) = room {
             let machine = self.model.space_of(from).and_then(|s| s.machine.clone());
             let pane = self.model.fresh_id_on("p", machine.as_deref());
-            self.model.split_with(from, Axis::Row, Node::block(pane.clone(), Content::Browser { browser: block }));
+            self.model.split_share(from, Axis::Row, Node::block(pane.clone(), Content::Browser { browser: block }), share);
             self.model.focus_pane(&pane);
             Ok(json!({ "id": pane }))
         } else {
@@ -4088,7 +4093,10 @@ impl AppWindow {
                 let target = self.model.focused_pane().ok_or("no pane to open beside")?;
                 let machine = self.model.space_of(&target).and_then(|s| s.machine.clone());
                 let pane = self.model.fresh_id_on("p", machine.as_deref());
-                self.model.split_with(&target, if side == "right" { Axis::Row } else { Axis::Column }, Node::block(pane.clone(), content));
+                let axis = if side == "right" { Axis::Row } else { Axis::Column };
+                let block = Node::block(pane.clone(), content);
+                let share = self.split_room(&target, axis, &block)?;
+                self.model.split_share(&target, axis, block, share);
                 Ok(json!({ "id": pane }))
             }
             other => Err(format!("browser.open place {other:?}: tab, right or down")),
