@@ -679,7 +679,9 @@ fn shipped_layouts_and_keys() {
                     action == "terminal"
                         || action.starts_with("send:")
                         || crate::commands::COMMANDS.iter().any(|c| c.name == name)
-                        || (mod_commands.contains(&name) && mods.contains(name.split('.').next().unwrap())),
+                        || (mod_commands.contains(&name) && mods.contains(name.split('.').next().unwrap()))
+                        // HERDR: a bundled mod's key with a built-in fallback (keys.rs) is never dead.
+                        || crate::keys::has_fallback(action),
                     "unknown shipped key action {action}"
                 );
             }

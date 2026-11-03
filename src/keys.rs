@@ -113,6 +113,10 @@ const FALLBACKS: &[(&str, &str)] = &[
     ("fork-core.toggle-sidebar", "layout.toggle:sidebar"),
 ];
 
+pub(crate) fn has_fallback(action: &str) -> bool {
+    FALLBACKS.iter().any(|(a, _)| *a == action)
+}
+
 /// The action a binding runs: itself, a gone mod's fallback, or None (bound to nothing).
 fn resolve(action: &str, gone: impl Fn(&str) -> bool) -> Option<String> {
     if !gone(action) {
