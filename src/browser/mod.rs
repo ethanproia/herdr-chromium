@@ -53,6 +53,8 @@ pub struct BrowserState {
     pub cursor: String,
     /// The page's icon url (`Favicon`), empty until the page names one.
     pub favicon: String,
+    /// The block's profile ("agent": an agent opened it; "default": the person's).
+    pub profile: String,
 }
 
 /// Looks up a live browser by block id; part 1 provides it, part 5 uses it for `browser.*` commands.

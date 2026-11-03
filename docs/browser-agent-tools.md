@@ -24,3 +24,5 @@ Cursor's set comes from `extensions/cursor-browser-automation/dist/extension.js`
 | `browser_fill_form` (seen as a string only) | yes | `fields*: [{ref, value}]` (Cursor's shape is unverified) | fill_form fills a textbox and a select |
 
 Ours only: `text`, `wait`, `console`, `network`, `eval`, `close`, `open` (T3/Playwright-style extras), the `herdr-app do browser.*` commands, and the person's grants.
+
+Grants (S29): the shield (🛡) in each block's bar has Control, CDP, Capture and "Mark page sensitive", all off by default, kept per block id in `browser/grants.json` (app-owned, 0600). `herdr-app do browser.*` on a block the person opened needs Control (agent-opened blocks, profile "agent", have it); a screenshot of a page marked sensitive needs Capture; `browser.pick` without x/y and `browser.annotations` stay open. `browser.open profile=default` is refused. The shield is blue while any grant is on and reads "🛡 Agent" while an agent holds the lease.

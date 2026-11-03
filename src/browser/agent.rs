@@ -106,6 +106,10 @@ impl Agent {
     pub fn run(&mut self, name: &str, a: &Value, reg: &dyn BrowserRegistry, focus: &Focus, reply: Reply) -> Step {
         if name == "browser.open" {
             let profile = arg(a, "profile").unwrap_or(AGENT_PROFILE).to_string();
+            if profile == PERSON_PROFILE {
+                reply(Err("an agent can't open a browser on the person's profile (their logins): ask them to open one (+ menu > Browser) and allow agents in its shield".into()));
+                return Step::Done;
+            }
             return Step::Open { url: arg(a, "url").map(Into::into), place: arg(a, "place").map(Into::into), profile, reply };
         }
         if name == "browser.annotations" {
@@ -118,6 +122,10 @@ impl Agent {
                 return Step::Done;
             }
         };
+        if let Err(e) = self.allowed(name, a, &id, reg) {
+            reply(Err(e));
+            return Step::Done;
+        }
         if name == "browser.close" {
             return Step::Close { id, reply };
         }
@@ -185,6 +193,22 @@ impl Agent {
             other => reply(Err(format!("unknown browser command {other}"))),
         }
         Step::Done
+    }
+
+    /// Whether an agent may run `name` on block `id`: blocks the person opened need their Control grant (in the
+    /// block's shield); a screenshot of a page they marked sensitive needs Capture. Picks the person answers stay
+    /// open: the person chooses what they share.
+    fn allowed(&self, name: &str, a: &Value, id: &BrowserId, reg: &dyn BrowserRegistry) -> Result<(), String> {
+        let opened_by_agent = reg.state(id).is_some_and(|s| s.profile == AGENT_PROFILE);
+        for grant in needs(name, a, self.grants.get(id, Grant::Sensitive)) {
+            if grant == Grant::Control && opened_by_agent {
+                continue;
+            }
+            if !self.grants.get(id, grant) {
+                return Err(format!("the person hasn't allowed {} (browser {id:?}): they turn it on in the shield in its bar", grant.what()));
+            }
+        }
+        Ok(())
     }
 
     fn park(&mut self, id: &BrowserId, op: Op, reply: Reply) -> u64 {
@@ -488,6 +512,19 @@ impl CdpFile {
     }
 }
 
+/// The profile of the person's own browsers (their cookies and logins).
+pub const PERSON_PROFILE: &str = "default";
+
+/// The grants an agent command on one block needs (Control is implied on blocks agents opened).
+pub fn needs(name: &str, a: &Value, sensitive: bool) -> Vec<Grant> {
+    let named_point = a.get("x").is_some() && a.get("y").is_some();
+    match name {
+        "browser.pick" if !named_point => vec![],
+        "browser.screenshot" if sensitive => vec![Grant::Control, Grant::Capture],
+        _ => vec![Grant::Control],
+    }
+}
+
 /// What the person lets agents do in one browser block. Only the block's own UI calls `Grants::set` (there is no
 /// `herdr-app do` command for it), so an agent cannot grant itself anything through the agent tools.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -498,6 +535,22 @@ pub enum Grant {
     Cdp,
     /// Screenshots of a page the person marked sensitive.
     Capture,
+    /// Not a grant: the person marked the block's page sensitive (screenshots then need Capture).
+    Sensitive,
+}
+
+impl Grant {
+    pub const ALL: [Grant; 4] = [Grant::Control, Grant::Cdp, Grant::Capture, Grant::Sensitive];
+
+    /// The words refusals use.
+    pub fn what(self) -> &'static str {
+        match self {
+            Grant::Control => "agents to drive this browser",
+            Grant::Cdp => "agents' raw CDP",
+            Grant::Capture => "agents' screenshots of this sensitive page",
+            Grant::Sensitive => "marking this page sensitive",
+        }
+    }
 }
 
 impl Grant {
@@ -506,6 +559,7 @@ impl Grant {
             Grant::Control => "control",
             Grant::Cdp => "cdp",
             Grant::Capture => "capture",
+            Grant::Sensitive => "sensitive",
         }
     }
 }
@@ -519,8 +573,20 @@ pub struct Grants {
 }
 
 impl Grants {
+    /// Loads the grants the person gave in earlier runs (blocks keep their ids in the layout).
     pub fn new(dir: PathBuf) -> Self {
-        Self { dir, ..Default::default() }
+        let saved: BTreeMap<BrowserId, BTreeMap<String, bool>> =
+            std::fs::read_to_string(dir.join("grants.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+        let by_block = saved
+            .into_iter()
+            .map(|(id, g)| (id, Grant::ALL.iter().filter_map(|k| g.get(k.key()).map(|on| (k.key(), *on))).collect()))
+            .collect();
+        Self { dir, by_block }
+    }
+
+    /// Any grant on in block `id` (the shield shows it).
+    pub fn any(&self, id: &BrowserId) -> bool {
+        [Grant::Control, Grant::Cdp, Grant::Capture].iter().any(|g| self.get(id, *g))
     }
 
     pub fn path(&self) -> PathBuf {
@@ -591,11 +657,14 @@ mod tests {
 
     struct Reg {
         live: Vec<&'static str>,
+        /// Blocks the person opened (profile "default"); the rest an agent opened.
+        person: Vec<&'static str>,
         link: Link,
     }
     impl BrowserRegistry for Reg {
         fn state(&self, id: &BrowserId) -> Option<BrowserState> {
-            self.live.contains(&id.as_str()).then(BrowserState::default)
+            let profile = if self.person.contains(&id.as_str()) { PERSON_PROFILE } else { AGENT_PROFILE };
+            self.live.contains(&id.as_str()).then(|| BrowserState { profile: profile.into(), ..Default::default() })
         }
         fn link(&self) -> &dyn HostLink {
             &self.link
@@ -603,7 +672,7 @@ mod tests {
     }
 
     fn reg() -> Reg {
-        Reg { live: vec!["b1", "b2"], link: Link::default() }
+        Reg { live: vec!["b1", "b2"], person: vec![], link: Link::default() }
     }
 
     type Got = Arc<Mutex<Option<Result<Value, String>>>>;
@@ -771,9 +840,10 @@ mod tests {
         let step = a.run("browser.open", &json!({ "url": "https://x.test", "place": "right" }), &reg, &Focus { focused: None, block_of_pane: &pane }, reply);
         assert!(matches!(step, Step::Open { url: Some(u), place: Some(p), profile, .. } if u == "https://x.test" && p == "right" && profile == "agent"),
             "an agent's browser gets its own profile by default");
-        let (_got, reply) = catch();
+        let (got, reply) = catch();
         let step = a.run("browser.open", &json!({ "profile": "default" }), &reg, &Focus { focused: None, block_of_pane: &pane }, reply);
-        assert!(matches!(step, Step::Open { profile, .. } if profile == "default"));
+        assert!(matches!(step, Step::Done), "never the person's profile (S29)");
+        assert!(got.lock().unwrap().take().unwrap().unwrap_err().contains("person's profile"));
     }
 
     #[test]
@@ -907,6 +977,75 @@ mod tests {
         let (_g, reply) = catch();
         assert!(matches!(a.run("browser.lock", &json!({ "on": false }), &reg, &focus, reply), Step::Lease { agent: None, .. }));
         assert!(sent(&reg).is_empty());
+    }
+
+    #[test]
+    fn every_command_needs_the_persons_grant_on_their_blocks() {
+        // Every per-block command x who opened the block x grant: (command, args, needs control, needs capture
+        // when the page is marked sensitive).
+        let cmds: Vec<(&str, Value, bool)> = vec![
+            ("browser.navigate", json!({ "url": "https://x.test" }), true),
+            ("browser.back", json!({}), true),
+            ("browser.forward", json!({}), true),
+            ("browser.reload", json!({}), true),
+            ("browser.stop", json!({}), true),
+            ("browser.devtools", json!({}), true),
+            ("browser.eval", json!({ "expr": "1" }), true),
+            ("browser.screenshot", json!({}), true),
+            ("browser.find", json!({ "text": "a" }), true),
+            ("browser.lock", json!({}), true),
+            ("browser.close", json!({}), true),
+            ("browser.pick", json!({ "x": 1, "y": 1 }), true),
+            // The person answers a pick themselves: what they choose to share.
+            ("browser.pick", json!({}), false),
+        ];
+        assert_eq!(COMMANDS_COVERED.len(), cmds.iter().map(|c| c.0).collect::<std::collections::BTreeSet<_>>().len());
+        for person_opened in [false, true] {
+            for granted in [false, true] {
+                for (name, args, gated) in &cmds {
+                    let (_d, mut a) = agent();
+                    let reg = Reg { live: vec!["b1"], person: if person_opened { vec!["b1"] } else { vec![] }, link: Link::default() };
+                    if granted {
+                        a.grants.set(&"b1".into(), Grant::Control, true);
+                    }
+                    let pane = |_: &str| None;
+                    let (got, reply) = catch();
+                    let _ = a.run(name, args, &reg, &Focus { focused: Some("b1".into()), block_of_pane: &pane }, reply);
+                    let refused = got.lock().unwrap().take().is_some_and(|r| r.is_err_and(|e| e.contains("hasn't allowed")));
+                    let want = *gated && person_opened && !granted;
+                    assert_eq!(refused, want, "{name} {args} person_opened={person_opened} granted={granted}");
+                }
+            }
+        }
+        // A sensitive page: screenshots need Capture too, even on an agent's block with Control.
+        let (_d, mut a) = agent();
+        let reg = reg();
+        a.grants.set(&"b1".into(), Grant::Sensitive, true);
+        assert!(run(&mut a, &reg, "browser.screenshot", json!({})).unwrap().unwrap_err().contains("sensitive"));
+        a.grants.set(&"b1".into(), Grant::Capture, true);
+        assert_eq!(run(&mut a, &reg, "browser.screenshot", json!({})), None, "parked for the host");
+        // annotations is not per-block: never gated.
+        assert!(!matches!(run(&mut a, &reg, "browser.annotations", json!({})), Some(Err(e)) if e.contains("hasn't allowed")));
+    }
+
+    /// Every agent `browser.*` command but the window's (new, remote) and the ungated ones (open, annotations).
+    const COMMANDS_COVERED: [&str; 12] = ["navigate", "back", "forward", "reload", "stop", "devtools", "eval", "screenshot", "find", "lock", "close", "pick"];
+
+    #[test]
+    fn the_table_covers_every_browser_command() {
+        for c in crate::commands::COMMANDS.iter().filter(|c| c.name.starts_with("browser.")) {
+            let short = &c.name["browser.".len()..];
+            assert!(COMMANDS_COVERED.contains(&short) || ["open", "annotations", "new", "remote"].contains(&short), "{} is not in the grants table", c.name);
+        }
+    }
+
+    #[test]
+    fn grants_survive_a_restart() {
+        let (d, mut a) = agent();
+        a.grants.set(&"b1".into(), Grant::Control, true);
+        a.grants.set(&"b1".into(), Grant::Sensitive, true);
+        let again = Grants::new(d.path().join("browser"));
+        assert!(again.get(&"b1".into(), Grant::Control) && again.get(&"b1".into(), Grant::Sensitive) && !again.get(&"b1".into(), Grant::Cdp));
     }
 
     #[test]
