@@ -56,6 +56,7 @@ export function parseHref(href) {
   if ((m = /^date:(\d{4}-\d{2}-\d{2})(?:T(\d{2}:\d{2}))?$/.exec(h))) return m[2] ? { kind: "date", date: m[1], time: m[2] } : { kind: "date", date: m[1] };
   if ((m = /^herdr:agent\/(.+)$/.exec(h))) return { kind: "agent", id: m[1] };
   if ((m = /^herdr:tab\/(.+)$/.exec(h))) return { kind: "tab", id: m[1] };
+  if ((m = /^herdr:pane\/(.+)$/.exec(h))) return { kind: "pane", id: m[1] };   // "Copy link to panel" on a non-terminal pane
   if (/^[a-z][a-z0-9+.-]*:\/\//i.test(h) || /^mailto:/i.test(h)) return { kind: "url", id: h };
   return { kind: "file", path: h };
 }
