@@ -32,6 +32,47 @@ pub fn load_error_kind(code: i32) -> Option<&'static str> {
     })
 }
 
+/// v1 prompts only for these; anything else is denied by the host without asking.
+pub const PROMPTED_KINDS: [&str; 4] = ["camera", "microphone", "geolocation", "clipboard-read"];
+
+/// The words for a media request's bits (CEF `cef_media_access_permission_types_t`).
+pub fn media_kinds(mask: u32) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if mask & 2 != 0 { out.push("camera"); }
+    if mask & 1 != 0 { out.push("microphone"); }
+    if mask & (4 | 8) != 0 { out.push("screen"); }
+    out
+}
+
+/// The words for a permission prompt's bits (CEF `cef_permission_request_types_t`).
+pub fn prompt_kinds(mask: u32) -> Vec<&'static str> {
+    let named: [(u32, &str); 6] = [(4, "camera"), (4096, "microphone"), (256, "geolocation"), (16, "clipboard-read"), (32768, "notifications"), (8192, "midi")];
+    let mut out: Vec<&str> = named.iter().filter(|(bit, _)| mask & bit != 0).map(|(_, k)| *k).collect();
+    if mask & !named.iter().fold(0, |m, (bit, _)| m | bit) != 0 { out.push("other"); }
+    out
+}
+
+/// Whether a request is asked at all: only when every kind is one v1 prompts for.
+pub fn asks(kinds: &[&str]) -> bool {
+    !kinds.is_empty() && kinds.iter().all(|k| PROMPTED_KINDS.contains(k))
+}
+
+#[cfg(test)]
+mod permission_tests {
+    use super::*;
+
+    #[test]
+    fn only_camera_mic_location_and_clipboard_are_asked() {
+        assert_eq!(media_kinds(3), vec!["camera", "microphone"]);
+        assert_eq!(media_kinds(8), vec!["screen"]);
+        assert_eq!(prompt_kinds(256 | 16), vec!["geolocation", "clipboard-read"]);
+        assert_eq!(prompt_kinds(32768 | 1), vec!["notifications", "other"]);
+        assert!(asks(&media_kinds(3)) && asks(&prompt_kinds(256)));
+        assert!(!asks(&media_kinds(2 | 8)), "screen capture has no picker yet");
+        assert!(!asks(&prompt_kinds(32768)) && !asks(&prompt_kinds(8192)) && !asks(&prompt_kinds(1)) && !asks(&[]));
+    }
+}
+
 #[cfg(test)]
 mod load_error_tests {
     #[test]

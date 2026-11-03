@@ -73,6 +73,11 @@ path = "tests/browser_load_errors.rs"
 harness = false
 
 [[test]]
+name = "browser_permissions"
+path = "tests/browser_permissions.rs"
+harness = false
+
+[[test]]
 name = "browser_grants"
 path = "tests/browser_grants.rs"
 harness = false

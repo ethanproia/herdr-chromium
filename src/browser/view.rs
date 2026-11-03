@@ -522,6 +522,7 @@ fn target(msg: &HostToApp) -> Option<&BrowserId> {
         | H::Download { id, .. }
         | H::FileChooser { id, .. }
         | H::Dialog { id, .. }
+        | H::Permission { id, .. }
         | H::ImeCaret { id, .. }
         | H::FindResult { id, .. }
         | H::Console { id, .. }
@@ -591,6 +592,11 @@ pub struct BrowserView {
     pub state: BrowserState,
     /// The host or the page died; the block shows a reload card until clicked.
     crashed: Option<String>,
+    /// Site permission requests waiting on the person, oldest first (req, origin, kinds); the bar
+    /// shows the first. The host denies any left after 60 s, on close and when the page changes.
+    prompts: std::collections::VecDeque<(u64, String, Vec<String>)>,
+    /// The bar's "Remember for this site" box (the person's profile only).
+    prompt_remember: bool,
     /// The main frame's failed load (kind, code, url): an error card over the page until the next load.
     load_error: Option<(String, i32, String)>,
     /// Size and scale the host was last told; None: no page made yet.
@@ -856,6 +862,8 @@ impl BrowserView {
             link,
             state,
             crashed: None,
+            prompts: Default::default(),
+            prompt_remember: false,
             load_error: None,
             sized: None,
             frames: FrameView::new(),
@@ -983,6 +991,10 @@ impl BrowserView {
                 // A raw-chords (remote desktop) block's url may carry its one-time token: the app
                 // keeps, shows and saves it without the token.
                 let url = if self.block.raw_chords { without_token(&url) } else { url };
+                // The host denied what the old page asked for; the bar goes with it.
+                if url != self.state.url {
+                    self.prompts.clear();
+                }
                 self.annotations.set_page(&url);
                 if url != self.state.url {
                     self.overlay.changed(Change::Navigate);
@@ -1119,6 +1131,23 @@ impl BrowserView {
                     self.on_target(ask, ok.then_some((selector, label, rect)), cx);
                 }
             }
+            H::Permission { req, origin, kinds, .. } => {
+                // A remembered answer (the person's profile, exact origin and kind) needs no bar.
+                if let Some(allow) = super::permissions::decided(&self.link.config().dir, &self.block.profile, &origin, &kinds) {
+                    self.link.send(AppToHost::PermissionResult { id: self.id.clone(), req, allow });
+                    return;
+                }
+                self.prompts.push_back((req, origin, kinds));
+                // Drop it from the bar when the host's 60 s wait runs out (the host denies it).
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(Duration::from_secs(60)).await;
+                    let _ = this.update(cx, |v, cx| {
+                        v.prompts.retain(|(r, _, _)| *r != req);
+                        cx.notify();
+                    });
+                })
+                .detach();
+            }
             H::Error { message, .. } => tracing::warn!("browser {}: {message}", self.id),
             _ => return,
         }
@@ -1159,6 +1188,72 @@ impl BrowserView {
 
     /// The reload card's button: a new page at the last url (starting the host again if needed).
     /// The failed load's card: plain text only (the url is page-chosen), the url capped, Back and Reload.
+    /// The waiting permission requests, oldest first (origin, kinds), for tests and the bar.
+    pub fn prompts(&self) -> Vec<(String, Vec<String>)> {
+        self.prompts.iter().map(|(_, o, k)| (o.clone(), k.clone())).collect()
+    }
+
+    /// The bar's "Remember for this site" box.
+    pub fn set_prompt_remember(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.prompt_remember = on && self.block.profile == super::agent::PERSON_PROFILE;
+        cx.notify();
+    }
+
+    /// The person answers the first waiting permission request (agents have no way to).
+    pub fn answer_permission(&mut self, allow: bool, cx: &mut Context<Self>) {
+        let Some((req, origin, kinds)) = self.prompts.pop_front() else { return };
+        if self.prompt_remember {
+            if let Err(e) = super::permissions::remember(&self.link.config().dir, &self.block.profile, &origin, &kinds, allow) {
+                tracing::warn!("browser {}: permissions.json: {e}", self.id);
+            }
+        }
+        self.prompt_remember = false;
+        self.link.send(AppToHost::PermissionResult { id: self.id.clone(), req, allow });
+        cx.notify();
+    }
+
+    /// The bar over the top of the page for the first waiting permission request.
+    fn permission_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (_, origin, kinds) = self.prompts.front()?;
+        let person = self.block.profile == super::agent::PERSON_PROFILE;
+        let button = |name: &'static str| div().id(name).px_2().py_0p5().rounded_sm().bg(rgb(0x3a3a3a)).cursor_pointer().child(name);
+        let more = self.prompts.len() - 1;
+        Some(
+            div()
+                .id("permission-bar")
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .py_1()
+                .text_xs()
+                .bg(rgb(0x2b2b2b))
+                .text_color(rgb(0xf0f0f0))
+                .child(div().flex_1().overflow_hidden().whitespace_nowrap().child(super::permissions::prompt_text(origin, kinds)))
+                .when(more > 0, |d| d.child(div().opacity(0.6).child(format!("+{more}"))))
+                .when(person, |d| {
+                    let on = self.prompt_remember;
+                    d.child(
+                        div()
+                            .id("permission-remember")
+                            .cursor_pointer()
+                            .child(if on { "☑ Remember for this site" } else { "☐ Remember for this site" })
+                            .on_click(cx.listener(|v, _, _, cx| {
+                                v.prompt_remember = !v.prompt_remember;
+                                cx.notify();
+                            })),
+                    )
+                })
+                .child(button("Deny").on_click(cx.listener(|v, _, _, cx| v.answer_permission(false, cx))))
+                .child(button("Allow").on_click(cx.listener(|v, _, _, cx| v.answer_permission(true, cx))))
+                .into_any_element(),
+        )
+    }
+
     fn load_error_card(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let (kind, code, url) = self.load_error.as_ref()?;
         let (title, hint) = load_error_words(kind, url);
@@ -2345,7 +2440,7 @@ impl Render for BrowserView {
             });
         }
         let page = match (&self.crashed, frame) {
-            (None, Some(frame)) => page.child(div().absolute().size_full().child(frame)).children(self.load_error_card(cx)),
+            (None, Some(frame)) => page.child(div().absolute().size_full().child(frame)).children(self.load_error_card(cx)).children(self.permission_bar(cx)),
             (None, None) => page.child(
                 div().absolute().size_full().flex().items_center().justify_center().text_color(rgb(0x606060)).text_sm().child(self.shown_url()),
             ),

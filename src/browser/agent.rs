@@ -618,7 +618,7 @@ impl Grants {
 }
 
 /// Writes owner-only (0600 file, 0700 dir): these files name the CDP port and what agents may do.
-fn write_atomic(path: &Path, body: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_atomic(path: &Path, body: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension("json.tmp");
     #[cfg(unix)]
     {

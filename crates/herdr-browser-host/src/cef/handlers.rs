@@ -1,6 +1,6 @@
 //! CEF callbacks, each turned into a protocol message for the app.
 
-use super::{downloads_dir, keep_chooser, keep_dialog, next_req, on_frame, on_popup_frame, on_popup_show, on_popup_size, send, view_of};
+use super::{deny_permissions, downloads_dir, keep_chooser, keep_dialog, keep_permission, PermCb, next_req, on_frame, on_popup_frame, on_popup_show, on_popup_size, send, view_of};
 use cef::*;
 use herdr_browser_protocol::{DialogKind, DownloadState, HostToApp};
 
@@ -358,6 +358,8 @@ wrap_display_handler! {
     impl DisplayHandler {
         fn on_address_change(&self, _browser: Option<&mut Browser>, frame: Option<&mut Frame>, url: Option<&CefString>) {
             if frame.is_some_and(|f| f.is_main() == 1) {
+                // Leaving the page denies what it asked for.
+                deny_permissions(Some(&self.id), false);
                 send(HostToApp::Url { id: self.id.clone(), url: s(url) });
             }
         }
@@ -674,6 +676,43 @@ wrap_context_menu_handler! {
     }
 }
 
+wrap_permission_handler! {
+    pub(crate) struct Permissions {
+        id: String,
+    }
+
+    /// `requesting_origin` is CEF's security origin of the requesting frame, never page text.
+    /// v1 asks only for camera, microphone, geolocation and clipboard-read; any request with
+    /// another kind (screen, notifications, midi, ...) is denied without a prompt.
+    impl PermissionHandler {
+        fn on_request_media_access_permission(&self, _browser: Option<&mut Browser>, _frame: Option<&mut Frame>, requesting_origin: Option<&CefString>, requested_permissions: u32, callback: Option<&mut MediaAccessCallback>) -> ::std::os::raw::c_int {
+            let Some(cb) = callback else { return 0 };
+            let kinds = crate::media_kinds(requested_permissions);
+            if !crate::asks(&kinds) {
+                cb.cancel();
+                return 1;
+            }
+            let req = next_req();
+            keep_permission(&self.id, req, PermCb::Media(cb.clone(), requested_permissions));
+            send(HostToApp::Permission { id: self.id.clone(), req, origin: s(requesting_origin), kinds: kinds.iter().map(|k| k.to_string()).collect() });
+            1
+        }
+
+        fn on_show_permission_prompt(&self, _browser: Option<&mut Browser>, _prompt_id: u64, requesting_origin: Option<&CefString>, requested_permissions: u32, callback: Option<&mut PermissionPromptCallback>) -> ::std::os::raw::c_int {
+            let Some(cb) = callback else { return 0 };
+            let kinds = crate::prompt_kinds(requested_permissions);
+            if !crate::asks(&kinds) {
+                cb.cont(PermissionRequestResult::from(sys::cef_permission_request_result_t::CEF_PERMISSION_RESULT_DENY));
+                return 1;
+            }
+            let req = next_req();
+            keep_permission(&self.id, req, PermCb::Prompt(cb.clone()));
+            send(HostToApp::Permission { id: self.id.clone(), req, origin: s(requesting_origin), kinds: kinds.iter().map(|k| k.to_string()).collect() });
+            1
+        }
+    }
+}
+
 wrap_client! {
     pub(crate) struct ClientBuilder {
         render: RenderHandler,
@@ -686,9 +725,13 @@ wrap_client! {
         find: FindHandler,
         menus: ContextMenuHandler,
         requests: RequestHandler,
+        permissions: PermissionHandler,
     }
 
     impl Client {
+        fn permission_handler(&self) -> Option<PermissionHandler> {
+            Some(self.permissions.clone())
+        }
         fn render_handler(&self) -> Option<RenderHandler> {
             Some(self.render.clone())
         }
@@ -840,7 +883,8 @@ pub fn client(id: &str) -> Client {
         Downloads::new(id.clone()),
         Finds::new(id.clone()),
         Menus::new(id.clone()),
-        Requests::new(id),
+        Requests::new(id.clone()),
+        Permissions::new(id),
     )
 }
 

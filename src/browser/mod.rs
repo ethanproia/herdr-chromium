@@ -29,6 +29,8 @@ pub mod inbox;
 // HERDR: part 4, S27 addressed Send (recipient popover, Queued/Read chip).
 pub mod send_to;
 pub mod input;
+// HERDR: part 4, site permission prompts (camera, microphone, location, clipboard).
+pub mod permissions;
 // HERDR: part 4, design slice S9.
 pub mod markup;
 // HERDR: part 4, design slice S6 (app side).
