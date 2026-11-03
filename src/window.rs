@@ -4244,8 +4244,10 @@ impl AppWindow {
         let total = la + lb;
         // Each side keeps its minimum (its own `min`, a mod's mod.json); a window too small for
         // both squeezes them in proportion, down to FLOOR.
-        let leaf = self.leaf_min();
-        let (ma, mb) = (a.min_along(axis, &leaf).max(a.min.unwrap_or(0.0)), b.min_along(axis, &leaf).max(b.min.unwrap_or(0.0)));
+        let (ma, mb) = {
+            let leaf = self.leaf_min();
+            (a.min_along(axis, &leaf).max(a.min.unwrap_or(0.0)), b.min_along(axis, &leaf).max(b.min.unwrap_or(0.0)))
+        };
         let (lo, hi) = crate::layout::squeeze(ma, mb, total);
         let mut new_a = (p - start).clamp(lo, hi);
         if let Some(max) = a.max {
