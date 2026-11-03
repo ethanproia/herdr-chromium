@@ -26,6 +26,8 @@ pub mod geometry;
 pub mod handoff;
 // HERDR: part 4, S27 inbox core.
 pub mod inbox;
+// HERDR: part 4, S27 addressed Send (recipient popover, Queued/Read chip).
+pub mod send_to;
 pub mod input;
 // HERDR: part 4, design slice S9.
 pub mod markup;
