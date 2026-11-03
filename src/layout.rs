@@ -144,6 +144,20 @@ pub struct Float {
     pub hidden: bool,
 }
 
+/// The smallest a pane gets along an axis (DIPs): a divider drag stops there, and mod minimums
+/// give way down to it when the window is too small.
+pub const FLOOR: f32 = 24.0;
+
+/// The range the first of two neighbours sharing `total` may take: each keeps its minimum, and
+/// when both can't, the minimums give way in proportion, never under FLOOR.
+pub fn squeeze(min_a: f32, min_b: f32, total: f32) -> (f32, f32) {
+    if min_a + min_b <= total {
+        return (min_a, total - min_b);
+    }
+    let a = (total * min_a / (min_a + min_b)).min(total - FLOOR).max(FLOOR);
+    (a, a)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Size {
@@ -504,6 +518,25 @@ impl Node {
         }
     }
 
+    /// The narrowest this node can get along `axis` (DIPs, unzoomed): a block's own minimum
+    /// (`leaf`, a mod's mod.json), never under FLOOR; side-by-side children add up with their gaps
+    /// and dividers (and their own `min`); across `axis`, the largest child's.
+    pub fn min_along(&self, axis: Axis, leaf: &dyn Fn(&Content, Axis) -> Option<f32>) -> f32 {
+        let shown = || self.children().iter().filter(|c| !c.hidden);
+        match &self.kind {
+            Kind::Block { content } => leaf(content, axis).unwrap_or(0.0).max(FLOOR),
+            Kind::Row { .. } | Kind::Column { .. } if self.axis() == Some(axis) => {
+                let n = shown().count();
+                if n == 0 {
+                    return FLOOR;
+                }
+                let between = (n - 1) as f32 * (self.gap.unwrap_or(0.0) + self.divider.as_ref().map_or(0.0, |d| d.width));
+                shown().map(|c| c.min_along(axis, leaf).max(c.min.unwrap_or(0.0))).sum::<f32>() + between
+            }
+            _ => shown().map(|c| c.min_along(axis, leaf)).fold(FLOOR, f32::max),
+        }
+    }
+
     pub fn children_mut(&mut self) -> Option<&mut Vec<Node>> {
         match &mut self.kind {
             Kind::Row { children } | Kind::Column { children } | Kind::Stack { children, .. } => Some(children),
@@ -640,23 +673,29 @@ impl Node {
     /// Puts `new` beside `target` along `axis` (after it). Reuses the parent
     /// if it already runs along that axis, else wraps the target.
     pub fn split(&mut self, target: &str, axis: Axis, new: Node, container_id: String) -> bool {
+        self.split_share(target, axis, new, container_id, 0.5)
+    }
+
+    /// `split`, the new pane taking `share` (0 to 1) of the target's room.
+    pub fn split_share(&mut self, target: &str, axis: Axis, new: Node, container_id: String, share: f32) -> bool {
+        let share = share.clamp(0.0, 1.0);
         if let Some(parent) = self.parent_of(target).map(|p| p.id.clone())
             && let Some(p) = self.find_mut(&parent)
             && p.axis() == Some(axis)
         {
             let c = p.children_mut().unwrap();
             let i = c.iter().position(|n| n.id == target).unwrap();
-            // The new pane takes half of the target's share.
-            let share = match c[i].size {
+            // The new pane takes `share` of the target's weight.
+            let weight = match c[i].size {
                 Some(Size::Weight { weight }) => weight,
                 None => 1.0,
                 Some(Size::Px { .. }) => 1.0,
             };
             if !matches!(c[i].size, Some(Size::Px { .. })) {
-                c[i].size = Some(Size::Weight { weight: share / 2.0 });
+                c[i].size = Some(Size::Weight { weight: weight * (1.0 - share) });
             }
             let mut new = new;
-            new.size = Some(Size::Weight { weight: share / 2.0 });
+            new.size = Some(Size::Weight { weight: weight * share });
             c.insert(i + 1, new);
             return true;
         }
@@ -664,6 +703,11 @@ impl Node {
         let old = std::mem::replace(t, Node::new(container_id, Kind::Row { children: vec![] }));
         let mut old = old;
         let slot_size = old.size.take();
+        let mut new = new;
+        if share != 0.5 {
+            old.size = Some(Size::Weight { weight: 1.0 - share });
+            new.size = Some(Size::Weight { weight: share });
+        }
         let mut wrapper = Node::container(t.id.clone(), axis, vec![old, new]);
         wrapper.size = slot_size;
         *t = wrapper;
@@ -796,6 +840,68 @@ pub fn snap(x: f32, y: f32, w: f32, h: f32) -> (Edge, Align) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn min_along_covers_every_node_kind() {
+        // A "notes" mod wants 320 wide and 200 tall; terminals, browsers, agents want nothing (FLOOR).
+        let leaf = |c: &Content, axis: Axis| match (c, axis) {
+            (Content::Mod { name, .. }, Axis::Row) if name == "notes" => Some(320.0),
+            (Content::Mod { name, .. }, Axis::Column) if name == "notes" => Some(200.0),
+            _ => None,
+        };
+        let notes = || Node::block("n", Content::Mod { name: "notes".into(), props: Value::Null });
+        let term = |id: &str| Node::block(id, Content::Terminal { terminal: "t1".into() });
+        let other_mod = Node::block("m", Content::Mod { name: "files".into(), props: Value::Null });
+        let agent = Node::block("a", Content::Agent { agent: "focused".into() });
+        let mut row = Node::container("r", Axis::Row, vec![term("t"), notes()]);
+        row.gap = Some(4.0);
+        row.divider = Some(Line { width: 1.0, color: "border".into() });
+        let mut with_min = Node::container("r2", Axis::Row, vec![term("t"), term("u")]);
+        with_min.children_mut().unwrap()[0].min = Some(100.0);
+        let mut hidden = Node::container("r3", Axis::Row, vec![term("t"), notes()]);
+        hidden.children_mut().unwrap()[1].hidden = true;
+        let nested = Node::container("c", Axis::Column, vec![term("t"), Node::container("r", Axis::Row, vec![term("u"), notes()])]);
+        let stack = Node::new("s", Kind::Stack { children: vec![term("t"), notes()], active: None, header: None });
+        let empty = Node::container("e", Axis::Row, vec![]);
+        let cases: Vec<(&str, Node, Axis, f32)> = vec![
+            ("mod with a minimum", notes(), Axis::Row, 320.0),
+            ("mod with a minimum, other axis", notes(), Axis::Column, 200.0),
+            ("mod without one", other_mod, Axis::Row, FLOOR),
+            ("terminal", term("t"), Axis::Row, FLOOR),
+            ("agent", agent, Axis::Column, FLOOR),
+            ("row along: sum + gap + divider", row.clone(), Axis::Row, FLOOR + 320.0 + 5.0),
+            ("row across: the largest", row, Axis::Column, 200.0),
+            ("a child's own min", with_min, Axis::Row, 100.0 + FLOOR),
+            ("hidden child left out", hidden, Axis::Row, FLOOR),
+            ("column in a row, across", nested.clone(), Axis::Row, FLOOR + 320.0),
+            ("column along", nested, Axis::Column, FLOOR + 200.0),
+            ("stack: the largest child", stack, Axis::Row, 320.0),
+            ("empty container", empty, Axis::Row, FLOOR),
+        ];
+        for (what, n, axis, want) in cases {
+            assert_eq!(n.min_along(axis, &leaf), want, "{what}");
+        }
+    }
+
+    #[test]
+    fn squeeze_keeps_minimums_then_gives_way_in_proportion() {
+        assert_eq!(squeeze(24.0, 320.0, 800.0), (24.0, 480.0)); // room for both
+        assert_eq!(squeeze(320.0, 320.0, 400.0), (200.0, 200.0)); // too small: halves
+        assert_eq!(squeeze(24.0, 320.0, 30.0), (FLOOR, FLOOR)); // never under the floor
+    }
+
+    #[test]
+    fn split_share_gives_the_new_pane_its_part_of_the_weight() {
+        let term = |id: &str| Node::block(id, Content::Terminal { terminal: id.into() });
+        let mut n = Node::container("r", Axis::Row, vec![term("a")]);
+        assert!(n.split_share("a", Axis::Row, term("b"), "w".into(), 0.75));
+        assert_eq!(n.children()[0].size, Some(Size::Weight { weight: 0.25 }));
+        assert_eq!(n.children()[1].size, Some(Size::Weight { weight: 0.75 }));
+        // Wrapping (the other axis): the two get the shares.
+        assert!(n.split_share("b", Axis::Column, term("c"), "w".into(), 0.4));
+        let w = n.find("w").unwrap();
+        assert_eq!(w.children()[1].size, Some(Size::Weight { weight: 0.4 }));
+    }
 
     #[test]
     fn floats_snap_to_the_nearest_edge_and_third() {

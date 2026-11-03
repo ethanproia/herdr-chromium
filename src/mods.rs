@@ -338,6 +338,12 @@ pub struct Hint {
     pub place: Option<String>,
     #[serde(default)]
     pub size: Option<f32>,
+    /// The narrowest and shortest its pane should get (DIPs): splits and divider drags keep it;
+    /// a window too small for every minimum squeezes it, down to 24.
+    #[serde(default)]
+    pub min_width: Option<f32>,
+    #[serde(default)]
+    pub min_height: Option<f32>,
 }
 
 #[derive(Clone)]
