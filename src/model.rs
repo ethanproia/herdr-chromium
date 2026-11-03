@@ -274,11 +274,16 @@ impl Model {
 
     /// Splits a pane with any block: a terminal, or a mod (a viewer beside the shell).
     pub fn split_with(&mut self, target: &str, axis: Axis, block: Node) -> bool {
+        self.split_share(target, axis, block, 0.5)
+    }
+
+    /// `split_with`, the new pane taking `share` of the target's room.
+    pub fn split_share(&mut self, target: &str, axis: Axis, block: Node, share: f32) -> bool {
         let machine = self.space_of(target).and_then(|s| s.machine.clone());
         let container = self.fresh_id_on("s", machine.as_deref());
         let new_pane = block.id.clone();
         let Some(c) = self.tab_of_mut(target) else { return false };
-        if !c.root.split(target, axis, block, container) {
+        if !c.root.split_share(target, axis, block, container, share) {
             return false;
         }
         c.zoomed = None;

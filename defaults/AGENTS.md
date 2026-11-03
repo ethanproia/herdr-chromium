@@ -730,8 +730,13 @@ has 120 programs (agents, editors, runtimes, tools, databases, infra);
 ~/.config/herdr-app/mods/<name>/
   main.js       the mod (required)
   mod.json    where it first appears: { "place": "right" | "left" | "top" | "bottom" | "none", "size": 320 }
+              and, optionally, its smallest pane: "min_width": 320, "min_height": 200
   *.js, *.svg   more modules ("./ui.js"), its own icons
 ```
+
+- `min_width` / `min_height` (DIPs) hold for its pane in a tab: a divider drag stops there, a
+  split that leaves no room for both minimums is refused, and a window too small for every
+  minimum squeezes the panes in proportion (down to 24), never off the edge.
 
 - The first time Herdr sees a folder, it docks one copy per `mod.json` into
   the shown layout (`"none"`: only where a layout or another mod puts it).

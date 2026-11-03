@@ -2076,7 +2076,9 @@ impl AppWindow {
             let before = tab.before.clone();
             let zoomed = tab.zoomed.clone();
             let id = tab.id.clone();
-            self.model.split(&target, Axis::Row, &pane, addr);
+            // A terminal that already runs is placed even without room (minimums squeeze).
+            let share = self.split_room(&target, Axis::Row, &Node::block("", Content::Terminal { terminal: String::new() })).unwrap_or(0.5);
+            self.model.split_share(&target, Axis::Row, crate::model::pane(&pane, addr), share);
             let tab = self.model.tab_mut(&id).unwrap();
             tab.focused = focused;
             tab.before = before;
@@ -2337,9 +2339,10 @@ impl AppWindow {
         let cwd = folder.unwrap_or_else(|| target_addr.as_ref().and_then(|a| self.cwds.get(a).cloned()).unwrap_or(fallback));
         // A split stays on the machine of the pane it splits (else its space's).
         let on = target_addr.and_then(|a| a.split_once('/').map(|(m, _)| m.to_owned())).or_else(|| self.machine_of(&space));
+        let share = self.split_room(&target, axis, &Node::block("", Content::Terminal { terminal: String::new() }))?;
         let new = self.model.fresh_id_on("p", on.as_deref());
         let addr = self.spawn(argv, cwd, &space, &ctx, on.as_deref())?;
-        self.model.split(&target, axis, &new, &addr);
+        self.model.split_share(&target, axis, crate::model::pane(&new, &addr), share);
         Ok(json!({ "pane": new, "terminal": addr }))
     }
 
@@ -2354,9 +2357,34 @@ impl AppWindow {
         }
         let machine = self.model.space_of(&target).and_then(|s| s.machine.clone());
         self.require_document(machine.as_deref())?;
+        let block = Node::block("", Content::Mod { name, props });
+        let share = self.split_room(&target, axis, &block)?;
         let new = self.model.fresh_id_on("p", machine.as_deref());
-        self.model.split_with(&target, axis, Node::block(new.clone(), Content::Mod { name, props }));
+        self.model.split_share(&target, axis, Node { id: new.clone(), ..block }, share);
         Ok(json!({ "pane": new }))
+    }
+
+    /// A mod's minimum along `axis` (mod.json min_width / min_height); other blocks have none.
+    fn leaf_min(&self) -> impl Fn(&Content, Axis) -> Option<f32> + '_ {
+        |content, axis| match content {
+            Content::Mod { name, .. } => self.folders.get(name).and_then(|f| match axis {
+                Axis::Row => f.hint.min_width,
+                Axis::Column => f.hint.min_height,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Whether `new` fits beside `target` along `axis` with both at their minimums: the new pane's
+    /// share of the room (half, or more or less so each keeps its minimum), else why not. A pane
+    /// not drawn yet has no size to check: half.
+    fn split_room(&self, target: &str, axis: Axis, new: &Node) -> Result<f32, String> {
+        let Some(old) = self.model.tab_of(target).and_then(|c| c.root.find(target)) else { return Err(format!("no pane {target:?}")) };
+        let Some(b) = self.bounds.borrow().get(target).copied() else { return Ok(0.5) };
+        let room = f32::from(match axis { Axis::Row => b.size.width, Axis::Column => b.size.height }) / settings::zoom();
+        let leaf = self.leaf_min();
+        let (m_old, m_new) = (old.min_along(axis, &leaf), new.min_along(axis, &leaf));
+        split_share(m_old, m_new, room)
     }
 
     /// Ask only whether a missing terminal is closed. Core owns restarting it.
@@ -2484,7 +2512,8 @@ impl AppWindow {
                     let destination = target.filter(|p| self.model.tab_of(p).is_some_and(|t| t.id == tab))
                         .or_else(|| self.model.tab(&tab).and_then(|t| t.root.panes().first().map(|p| p.id.clone())));
                     if let Some(target) = destination {
-                        self.model.split(&target, axis, &pane, &address);
+                        let share = self.split_room(&target, axis, &Node::block("", Content::Terminal { terminal: String::new() })).unwrap_or(0.5);
+                        self.model.split_share(&target, axis, crate::model::pane(&pane, &address), share);
                     } else {
                         self.model.add_tab(&space, Tab::new(&tab, &name, &pane, &address));
                     }
@@ -3991,13 +4020,15 @@ impl AppWindow {
     }
 
     // HERDR: browser block. A page asked for a new window: a browser beside it (a split in its
-    // tab); a layout block's page opens a new tab.
+    // tab, when both minimums fit); a layout block's page (or no room) opens a new tab.
     fn browser_new_window(&mut self, from: &str, url: &str, window: &mut Window, cx: &mut Context<Self>) {
         let block = crate::layout::BrowserBlock { url: url.to_owned(), profile: "default".into(), ..Default::default() };
-        let r = if self.model.tab_of(from).is_some() {
+        // Beside the page when there is room for both minimums, else a new tab.
+        let room = self.model.tab_of(from).is_some().then(|| self.split_room(from, Axis::Row, &Node::block("", Content::Browser { browser: block.clone() })).ok()).flatten();
+        let r = if let Some(share) = room {
             let machine = self.model.space_of(from).and_then(|s| s.machine.clone());
             let pane = self.model.fresh_id_on("p", machine.as_deref());
-            self.model.split_with(from, Axis::Row, Node::block(pane.clone(), Content::Browser { browser: block }));
+            self.model.split_share(from, Axis::Row, Node::block(pane.clone(), Content::Browser { browser: block }), share);
             self.model.focus_pane(&pane);
             Ok(json!({ "id": pane }))
         } else {
@@ -4075,7 +4106,10 @@ impl AppWindow {
                 let target = self.model.focused_pane().ok_or("no pane to open beside")?;
                 let machine = self.model.space_of(&target).and_then(|s| s.machine.clone());
                 let pane = self.model.fresh_id_on("p", machine.as_deref());
-                self.model.split_with(&target, if side == "right" { Axis::Row } else { Axis::Column }, Node::block(pane.clone(), content));
+                let axis = if side == "right" { Axis::Row } else { Axis::Column };
+                let block = Node::block(pane.clone(), content);
+                let share = self.split_room(&target, axis, &block)?;
+                self.model.split_share(&target, axis, block, share);
                 Ok(json!({ "id": pane }))
             }
             other => Err(format!("browser.open place {other:?}: tab, right or down")),
@@ -4209,9 +4243,9 @@ impl AppWindow {
         let bounds = self.bounds.borrow();
         let (Some(ba), Some(bb)) = (bounds.get(&a.id).copied(), bounds.get(&b.id).copied()) else { return };
         drop(bounds);
-        let (start, end, p) = match axis {
-            Axis::Row => (f32::from(ba.left()), f32::from(bb.right()), f32::from(pos.x)),
-            Axis::Column => (f32::from(ba.top()), f32::from(bb.bottom()), f32::from(pos.y)),
+        let (start, p) = match axis {
+            Axis::Row => (f32::from(ba.left()), f32::from(pos.x)),
+            Axis::Column => (f32::from(ba.top()), f32::from(pos.y)),
         };
         let (la, lb) = match axis {
             Axis::Row => (f32::from(ba.size.width), f32::from(bb.size.width)),
@@ -4219,16 +4253,19 @@ impl AppWindow {
         };
         // Measured on screen; sizes are stored as designed (unzoomed).
         let zoom = settings::zoom();
-        let (la, lb, start, end, p) = (la / zoom, lb / zoom, start / zoom, end / zoom, p / zoom);
+        let (la, lb, start, p) = (la / zoom, lb / zoom, start / zoom, p / zoom);
         let total = la + lb;
-        let mut new_a = (p - start).clamp(24.0, (end - start) - 24.0);
-        if let Some(min) = a.min {
-            new_a = new_a.max(min);
-        }
+        // Each side keeps its minimum (its own `min`, a mod's mod.json); a window too small for
+        // both squeezes them in proportion, down to FLOOR.
+        let (ma, mb) = {
+            let leaf = self.leaf_min();
+            (a.min_along(axis, &leaf).max(a.min.unwrap_or(0.0)), b.min_along(axis, &leaf).max(b.min.unwrap_or(0.0)))
+        };
+        let (lo, hi) = crate::layout::squeeze(ma, mb, total);
+        let mut new_a = (p - start).clamp(lo, hi);
         if let Some(max) = a.max {
-            new_a = new_a.min(max);
+            new_a = new_a.min(max).max(lo);
         }
-        let new_a = new_a.min(total - 24.0);
         let (a_id, b_id) = (a.id.clone(), b.id.clone());
         let (sa, sb) = (a.size, b.size);
         let Some(parent) = self.find_node_mut(&container) else { return };
@@ -4820,6 +4857,17 @@ mod tests {
     }
 
     #[test]
+    fn a_split_keeps_both_minimums_or_is_refused() {
+        // Beside a 320 px notes pane: 500 px can't hold 320 + another 320; 1000 can.
+        assert!(super::split_share(320.0, 320.0, 500.0).unwrap_err().contains("640 px"));
+        assert_eq!(super::split_share(320.0, 320.0, 1000.0).unwrap(), 0.5);
+        // A terminal beside notes at 400: the new notes pane takes 320, not half.
+        assert_eq!(super::split_share(24.0, 320.0, 400.0).unwrap(), 0.8);
+        // And the other way round: notes keep 320, the new terminal gets the rest.
+        assert_eq!(super::split_share(320.0, 24.0, 400.0).unwrap(), 0.2);
+    }
+
+    #[test]
     fn the_remote_desktop_bridge_url_is_read_and_its_token_never_reaches_an_error() {
         let dir = std::env::temp_dir().join(format!("hrd-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -5074,6 +5122,15 @@ mod tests {
 // HERDR: browser block. The person's own browser: their cookies and logins, keys as in any app.
 fn person_browser(url: Option<&str>) -> crate::layout::BrowserBlock {
     crate::layout::BrowserBlock { url: url.unwrap_or_default().to_owned(), profile: "default".into(), ..Default::default() }
+}
+
+/// The new pane's share of `room` when splitting beside a pane: half, moved so each side keeps
+/// its minimum; refused when both minimums don't fit (nothing moves).
+fn split_share(m_old: f32, m_new: f32, room: f32) -> Result<f32, String> {
+    if m_old + m_new > room {
+        return Err(format!("No room to split here: the panes need {} px, there are {}", (m_old + m_new).round(), room.round()));
+    }
+    Ok((room / 2.0).clamp(m_new, room - m_old) / room)
 }
 
 /// HERDR: browser block. The bridge's one url (`http://127.0.0.1:<port>/?token=..&machine=..`):
