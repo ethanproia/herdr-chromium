@@ -19,6 +19,8 @@ use herdr_browser_protocol::BrowserId;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
+// HERDR: the agent socket is Unix-only; elsewhere the broker reports itself unsupported.
+#[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -103,7 +105,14 @@ impl Broker {
         dir.join("broker.token")
     }
 
+    /// No agent socket off Unix (HERDR: keeps non-mac builds compiling).
+    #[cfg(not(unix))]
+    pub fn start(_dir: PathBuf, _pipe: PipeNow, _target_of: TargetOf, _authorize: Authorize) -> std::io::Result<Arc<Broker>> {
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "the browser broker needs a Unix socket"))
+    }
+
     /// Writes a fresh token, binds the socket (owner-only) and serves it on a thread.
+    #[cfg(unix)]
     pub fn start(dir: PathBuf, pipe: PipeNow, target_of: TargetOf, authorize: Authorize) -> std::io::Result<Arc<Broker>> {
         use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
         std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
@@ -133,6 +142,7 @@ impl Broker {
         &self.dir
     }
 
+    #[cfg(unix)]
     fn serve(self: Arc<Self>, stream: UnixStream) {
         let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
         let mut lines = BufReader::new(match stream.try_clone() {
@@ -166,6 +176,7 @@ impl Broker {
         got.len() == self.token.len() && got.bytes().zip(self.token.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
     }
 
+    #[cfg(unix)]
     fn call(&self, req: &Value, out: &Arc<Mutex<UnixStream>>, watched: &Arc<Mutex<HashSet<String>>>) -> Result<Value, String> {
         let method = req["method"].as_str().ok_or("no method")?;
         if refused(method) {
@@ -217,6 +228,7 @@ impl Broker {
     }
 }
 
+#[cfg(unix)]
 fn send(out: &Arc<Mutex<UnixStream>>, msg: &Value) -> bool {
     let mut line = msg.to_string();
     line.push('\n');
@@ -255,6 +267,7 @@ mod tests {
     /// The real app gate over agent.sock with a real token: a block the person opened, every shield
     /// toggle off, refuses eval, input, screenshots and network subscription; the same block with
     /// Control on gets through to the (absent) host; an agent-opened block needs no Control.
+    #[cfg(unix)]
     #[test]
     fn a_persons_block_with_grants_off_refuses_everything_through_the_socket() {
         use crate::browser::agent::{Agent, Grant};
@@ -297,16 +310,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     fn line(s: &mut UnixStream, v: Value) {
         s.write_all(format!("{v}\n").as_bytes()).unwrap();
     }
 
+    #[cfg(unix)]
     fn read(s: &UnixStream) -> Option<Value> {
         let mut l = String::new();
         BufReader::new(s.try_clone().unwrap()).read_line(&mut l).ok()?;
         serde_json::from_str(&l).ok()
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_socket_needs_the_token_and_is_private() {
         use std::os::unix::fs::PermissionsExt;
