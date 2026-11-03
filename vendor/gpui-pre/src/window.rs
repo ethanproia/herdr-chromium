@@ -1785,6 +1785,10 @@ impl Window {
                     {
                         // Don't lose a pending forced render to throttling.
                         deferred_force_render |= force_render;
+                        if crate::frame_stats::enabled() {
+                            // HERDR: frame stats.
+                            crate::frame_stats::record(crate::frame_stats::FrameSample::Throttled { window: window_id.as_u64() });
+                        }
                         // Deferred by throttling: ask demand-driven platforms to retry.
                         handle
                             .update(&mut cx, |_, window, _| {
@@ -1842,16 +1846,37 @@ impl Window {
                                     // atlas tile references after a GPU device recovery.
                                     window.refresh();
                                 }
+                                // HERDR: frame stats (one atomic load when off).
+                                let stats = crate::frame_stats::enabled().then(std::time::Instant::now);
                                 let arena_clear_needed = window.draw(cx);
+                                let drawn = stats.map(|_| std::time::Instant::now());
                                 window.present();
+                                if let (Some(t0), Some(t1)) = (stats, drawn) {
+                                    let at = std::time::Instant::now();
+                                    crate::frame_stats::record(crate::frame_stats::FrameSample::Frame {
+                                        window: window_id.as_u64(),
+                                        draw_ms: (t1 - t0).as_secs_f64() * 1e3,
+                                        present_ms: (at - t1).as_secs_f64() * 1e3,
+                                        at,
+                                    });
+                                }
                                 arena_clear_needed.clear(cx);
                             })
                             .log_err();
                     })
                 } else if needs_present {
+                    // HERDR: frame stats.
+                    let t0 = crate::frame_stats::enabled().then(std::time::Instant::now);
                     handle
                         .update(&mut cx, |_, window, _| window.present())
                         .log_err();
+                    if let Some(t0) = t0 {
+                        let at = std::time::Instant::now();
+                        crate::frame_stats::record(crate::frame_stats::FrameSample::PresentOnly { window: window_id.as_u64(), present_ms: (at - t0).as_secs_f64() * 1e3, at });
+                    }
+                } else if crate::frame_stats::enabled() {
+                    // HERDR: frame stats.
+                    crate::frame_stats::record(crate::frame_stats::FrameSample::Skipped { window: window_id.as_u64() });
                 }
 
                 handle

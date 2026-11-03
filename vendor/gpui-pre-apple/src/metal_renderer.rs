@@ -503,7 +503,13 @@ impl MetalRenderer {
             (viewport_size.width.ceil() as i32).into(),
             (viewport_size.height.ceil() as i32).into(),
         );
-        let drawable = if let Some(drawable) = layer.next_drawable() {
+        // HERDR: frame stats: how long the layer makes us wait for a drawable.
+        let wait_start = gpui::frame_stats::enabled().then(std::time::Instant::now);
+        let next = layer.next_drawable();
+        if let Some(t) = wait_start {
+            gpui::frame_stats::record(gpui::frame_stats::FrameSample::DrawableWait { ms: t.elapsed().as_secs_f64() * 1e3 });
+        }
+        let drawable = if let Some(drawable) = next {
             drawable
         } else {
             log::error!(
@@ -565,11 +571,19 @@ impl MetalRenderer {
         let instance_buffer_pool = self.instance_buffer_pool.clone();
         let instance_buffer = Cell::new(Some(writer.finish()));
         let surface_textures = Cell::new(Some(mem::take(&mut self.surface_textures))); // HERDR
-        let block = RcBlock::new(move |_: ptr::NonNull<AnyObject>| {
+        let block = RcBlock::new(move |cb: ptr::NonNull<AnyObject>| {
             if let Some(instance_buffer) = instance_buffer.take() {
                 instance_buffer_pool.lock().release(instance_buffer);
             }
             drop(surface_textures.take()); // HERDR: GPU done, release CVMetalTextures
+            if gpui::frame_stats::enabled() {
+                // HERDR: frame stats: GPU execution time of this frame (seconds on the GPU clock).
+                let cb: &AnyObject = unsafe { cb.as_ref() };
+                let (start, end): (f64, f64) = unsafe { (objc2::msg_send![cb, GPUStartTime], objc2::msg_send![cb, GPUEndTime]) };
+                if end > start && start > 0.0 {
+                    gpui::frame_stats::record(gpui::frame_stats::FrameSample::Gpu { ms: (end - start) * 1e3 });
+                }
+            }
         });
         // SAFETY: Both pointee types are opaque views of the same Objective-C block pointer ABI.
         unsafe {

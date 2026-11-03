@@ -36,6 +36,8 @@ mod platform;
 pub mod prelude;
 /// Profiling utilities for task, frame, and thread performance tracking.
 pub mod profiler;
+/// HERDR: optional frame timing for the embedding app.
+pub mod frame_stats;
 #[cfg(any(
     test,
     target_os = "windows",
