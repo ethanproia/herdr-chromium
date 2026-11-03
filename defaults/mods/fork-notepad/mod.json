@@ -1,12 +1,11 @@
 {
   "place": "none",
   "focusable": true,
-  "min_width": 320,
   "version": "0.1.0",
   "source": {
     "repo": "essexlabs/labs",
-    "branch": "ethan/herdr-notepad-virtual",
-    "commit": "6b9163c3bad568356c49640740d54c0c4e174a9e",
+    "branch": "ethan/herdr-mods",
+    "commit": "beeb3c485415dcadd2d72aee0f6d5b17509496c2",
     "path": "projects/herdr-mods/notepad"
   }
 }

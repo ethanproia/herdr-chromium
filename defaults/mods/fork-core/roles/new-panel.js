@@ -1,14 +1,14 @@
 // Role "new-panel": the chooser a split opens in its new, empty pane (replaces the old split-chooser): the tools
 // that can open in a split (from the registry), then the installed agents. Picking one splits this pane with it and,
-// once the new pane really exists, closes this pane (and the replaced one, for Turn into). If it never appears
-// within 2 s nothing is closed and an error shows. Props: { role: "new-panel", direction, replace? }.
+// once the new pane really exists, closes this pane. If it never appears
+// within 2 s nothing is closed and an error shows. Props: { role: "new-panel", direction }.
 // ↑/↓ move, Enter or 1-9 pick, Esc closes this pane.
 import { div, svg, image } from "gpui-kit";
 import { v_flex } from "gpui-base";
 import { theme, spaces, panes, knownAgents, run, props, notify } from "herdr";
 import { SELF } from "../self.js";
-import { groupLabel, menuRow, toolIcon, openInSplit, registryIO, openRegistry, keepSelection } from "../look.js";
-import { createRegistry, toolsFor } from "../registry.js";
+import { groupLabel, menuRow, toolIcon, openInSplit, openRegistry, keepSelection, registryNotice } from "../look.js";
+import { toolsFor } from "../registry.js";
 
 export default class NewPanel {
   init(_p, cx) {
@@ -45,11 +45,11 @@ export default class NewPanel {
     ];
   }
 
-  // Never destroy first: split, wait until the new pane shows up in panes(), then close this one (and the replaced one).
+  // Never destroy first: split, wait until the new pane shows up in panes(), then close this one.
   pick(choice, cx) {
     const pane = this.me();
     if (!pane || this.busy) return;
-    const { direction = "right", replace } = props() ?? {};
+    const { direction = "right" } = props() ?? {};
     const before = new Set(panes().map((p) => p.pane));
     const tab = panes().find((p) => p.pane === pane)?.tab;
     // Only a pane this request made counts: new, in this tab, and of the kind chosen.
@@ -60,7 +60,6 @@ export default class NewPanel {
     const tick = (cx) => {
       if (panes().some(mine)) {
         run("pane.close", { pane });
-        if (replace) run("pane.close", { pane: replace });
         return;
       }
       if (Date.now() >= deadline) {
@@ -97,9 +96,9 @@ export default class NewPanel {
         onHover: (cx) => { if (this.at !== i) { this.at = i; cx.notify(); } },
       }));
     });
-    const skipped = this.reg.errors[0];
+    const note = registryNotice(this.reg);
     if (this.error) rows.push(div().px(8).pt(8).text_size(12).text_color(t.blocked).child(this.error));
-    if (skipped) rows.push(div().px(8).pt(8).truncate().text_size(11).text_color(t.dim).child(`Skipped ${skipped}`));
+    if (note) rows.push(div().px(8).pt(8).truncate().text_size(11).text_color(t.dim).child(note));
     return v_flex().id("new-panel").track_focus(this.handle).size_full().bg(t.background).items_center().justify_center().p(16)
       .font_family(".SystemUIFont")
       .on_mouse_down("left", () => this.handle.focus())

@@ -4,16 +4,19 @@ import { run, layout, shared, setShared, openOverlay } from "herdr";
 import { SELF } from "../self.js";
 import { normalizeSections, toggleSection, sectionsPlan, menuHeight, SECTION_KEYS } from "../sections-pure.js";
 
-function find(node, id) {
+export function find(node, id) {
   if (node?.id === id) return node;
   for (const child of node?.children ?? []) { const f = find(child, id); if (f) return f; }
   return null;
 }
+// The rail is a width, not a flag. Pass a tree to read that snapshot; otherwise read the layout file.
+export const isCollapsed = (node = layout()) => (find(node, "sidebar")?.size?.px ?? Infinity) < 160;
+export const narrow = isCollapsed;
 export const sections = () => normalizeSections(shared("sidebar.sections"));
 // collapsedNow: the real on-screen state when the caller knows it (a drag updates the layout file only on release).
 const layoutState = (collapsedNow) => {
   const l = layout();
-  return { spacesHidden: find(l, "spaces")?.hidden === true, agentsHidden: find(l, "agents")?.hidden === true, footerPx: find(l, "sidebar-footer")?.size?.px, footerHidden: find(l, "sidebar-footer")?.hidden === true, collapsed: collapsedNow ?? (find(l, "sidebar")?.size?.px ?? Infinity) < 160,
+  return { spacesHidden: find(l, "spaces")?.hidden === true, agentsHidden: find(l, "agents")?.hidden === true, footerPx: find(l, "sidebar-footer")?.size?.px, footerHidden: find(l, "sidebar-footer")?.hidden === true, collapsed: collapsedNow ?? isCollapsed(l),
     statusHidden: find(l, "status") ? find(l, "status").hidden === true : undefined };
 };
 // Issues commands only where the layout differs from the sections. Returns how many.
@@ -38,7 +41,6 @@ export const openSectionsMenu = () =>
 // (<core>.toggle-sidebar, cmd-b). Open -> remember the open width, go to the 44px rail; rail -> back to that width.
 const RAIL_PX = 44, OPEN_MIN = 200, OPEN_MAX = 480;
 const sidebarPx = () => find(layout(), "sidebar")?.size?.px;
-export const isCollapsed = () => (sidebarPx() ?? Infinity) < 160;
 const openWidth = () => Math.min(OPEN_MAX, Math.max(OPEN_MIN, shared("sidebar.width") ?? 268));
 export function toggleSidebar() {
   const width = sidebarPx(), c = isCollapsed();

@@ -11,7 +11,6 @@ import { exec, readTextFile, home, appHome, run } from "herdr";
 import { parseMeta, hashKey, extOf, isRemote, excerpt, lineOf, fit, cover, clampText, domainOf, cacheGet, cacheSet, FAIL_TTL } from "./embeds-core.js";
 import { openableUrl } from "./rows.js";
 
-const FILE_RECHECK_MS = 2000;
 const CACHE_REL = "mods/fork-notepad/.cache";   // image() paths are relative to ~/.config/herdr-app
 const FETCH_MS = 5000, FETCH_CAP = 512 * 1024, FILE_LINES = 20;
 const MAX_IMG_H = 520;
@@ -63,7 +62,10 @@ async function load(e, cx) {
   if (e.kind === "bookmark") {
     let meta = { title: "", description: "", image: "", favicon: "", domain: domainOf(e.url) };
     try {
-      const html = await withTimeout(fetch(e.url).then((r) => r.text()), FETCH_MS, cx);
+      // curl, not fetch: fetch can't be aborted here and buffers the whole body. 5 s cap, refuse bodies declared
+      // over 5 MB, and stop reading at FETCH_CAP (head closes the pipe). The URL is an argument, never shell text.
+      const r = await withTimeout(exec("sh", ["-c", 'curl -sL -m 5 --max-filesize 5242880 -- "$1" | head -c "$2"', "sh", e.url, String(FETCH_CAP)]), FETCH_MS + 1000, cx);
+      const html = r && typeof r.stdout === "string" ? r.stdout : "";
       meta = parseMeta(html.slice(0, FETCH_CAP), e.url);
     } catch { /* offline or slow: the card still shows the url */ }
     const [thumb, icon] = await Promise.all([meta.image ? cached(meta.image) : null, meta.favicon ? cached(meta.favicon) : null]);
@@ -79,7 +81,7 @@ async function load(e, cx) {
 }
 
 export class Embeds {
-  constructor() { this.cache = new Map(); this.busy = new Set(); this.checked = new Map(); }
+  constructor() { this.cache = new Map(); this.busy = new Set(); }
   // At most 3 loads at once (the rest start as these finish and redraw); keep the newest 200 results.
   static MAX_LOADS = 3;
   static MAX_CACHE = 200;
@@ -88,20 +90,7 @@ export class Embeds {
     try {
       const k = keyOf(embed);
       const hit = cacheGet(this.cache, k, Date.now());
-      if (hit) {
-        // An embedded file on screen is re-read at most every 2 s; it redraws only when its text changed.
-        if (embed.kind === "file" && hit.ok && Date.now() - (this.checked.get(k) ?? 0) > FILE_RECHECK_MS && !this.busy.has(k)) {
-          this.checked.set(k, Date.now());
-          this.busy.add(k);
-          cx.spawn(async (cx) => {
-            let data;
-            try { data = await load(embed, cx); } catch { data = null; }
-            this.busy.delete(k);
-            if (data && JSON.stringify(data) !== JSON.stringify(hit)) { cacheSet(this.cache, k, data, Date.now(), Embeds.MAX_CACHE); cx.notify(); }
-          });
-        }
-        return hit;
-      }
+      if (hit) return hit;
       if (!this.busy.has(k) && this.busy.size < Embeds.MAX_LOADS) {
         this.busy.add(k);
         cx.spawn(async (cx) => {

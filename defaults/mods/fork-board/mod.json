@@ -11,8 +11,8 @@
   "version": "0.1.0",
   "source": {
     "repo": "essexlabs/labs",
-    "branch": "ethan/herdr-board-mod",
-    "commit": "ede14fc4083832b99a7c576c3be8d58ab4239ecc",
+    "branch": "ethan/herdr-board",
+    "commit": "b8f13e93d540780d16c263743e85fc83dc734884",
     "path": "projects/herdr-mods/board/mods/board"
   }
 }

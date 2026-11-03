@@ -3,29 +3,17 @@
 // style as search and sidebar buttons"). Always shown, so it also re-applies the saved sidebar sections at start.
 import { div, image, svg } from "gpui-kit";
 import { h_flex } from "gpui-base";
-import { theme, run, window, shared, setShared, layout, updates, settings } from "herdr";
+import { theme, run, window, layout, updates, settings } from "herdr";
 import { icon } from "../self.js";
-import { applySections, openSectionsMenu, toggleSidebar, applySidebarState, isCollapsed } from "./sections.js";
+import { sidebarWidthSettled, sidebarRulesPending } from "../sections-pure.js";
+import { applySections, applySidebarState, find, isCollapsed, openSectionsMenu, toggleSidebar } from "./sections.js";
 // With the fork's "glass" setting the sidebar's layout background draws translucent over a blurred window; painting
 // our own opaque chrome here would hide it, so sidebar roots leave the background to the layout then.
 const glassOn = () => settings()?.glass === true;
 
-
-function find(node, id) {
-  if (node?.id === id) return node;
-  for (const child of node?.children ?? []) { const f = find(child, id); if (f) return f; }
-  return null;
-}
-// The collapsed rail is one width, the sidebar's minimum (Ethan: "lock it to the minimum width, the whole rail").
-const RAIL_PX = 44;
-const OPEN_MIN = 200;     // the open sidebar's minimum width
-const OPEN_MAX = 480;
-const narrow = () => (find(layout(), "sidebar")?.size?.px ?? Infinity) < 160;
-// The open width: the last width the sidebar had open, kept within its limits.
-const openWidth = () => Math.min(OPEN_MAX, Math.max(OPEN_MIN, shared("sidebar.width") ?? 268));
-
 export default class SidebarHeader {
   init(_p, cx) {
+    this.cx = cx;
     // Herdr reports no size change at start, so the current state's rules are applied once here.
     applySidebarState(isCollapsed());
     applySections();
@@ -37,11 +25,27 @@ export default class SidebarHeader {
     const c = w < 160;
     if (c !== this.wasNarrow) {
       this.wasNarrow = c; applySections(c);
-      // Whoever changed the width (button, key, the rail's own button), the state's full rules follow it.
-      const l = layout(), bar = find(l, "sidebar");
-      if (bar && (c ? bar.max !== RAIL_PX : bar.min !== 200)) applySidebarState(c);
+      this.pendingCollapsed = c;
     }
-
+    this.flushState(w);
+  }
+  // Whoever changed the width (button, key, the rail's own button), the state's full rules follow it. Not mid-drag:
+  // the file still has the pre-drag width until release, and layout.set of that tree would jump the sidebar back.
+  flushState(w) {
+    this.liveW = w;
+    const bar = find(layout(), "sidebar");
+    if (!sidebarWidthSettled(bar?.size?.px, w)) {
+      if (this.pendingCollapsed != null && !this.stateWait && this.cx) {
+        this.stateWait = true;
+        this.cx.timer.after(50, () => { this.stateWait = false; this.flushState(this.liveW); });
+      }
+      return;
+    }
+    if (this.pendingCollapsed == null) return;
+    const c = this.pendingCollapsed;
+    this.pendingCollapsed = null;
+    // Not bar.min: Expand already writes 200, and that used to hide the still-missing open rules.
+    if (sidebarRulesPending(layout(), c)) applySidebarState(c);
   }
   button(t, id, ic, action, dot) {
     return div().id(id).size(26).flex_none().flex().items_center().justify_center().rounded(6).text_color(t.muted).hover((s) => s.bg(t.hover).text_color(t.foreground))
@@ -51,14 +55,14 @@ export default class SidebarHeader {
   }
   render() {
     const t = theme();
-    const collapsed = narrow();
+    const collapsed = isCollapsed();
     const mac = window()?.platform === "macos";
     // Collapsed: the sidebar button stays in this top row, centered (Ethan: "at the actual top of the rail where it was
     // before"). In a windowed macOS the traffic lights hold this row, so the rail shows it first instead.
     // Equal margin top, left and right: (44 rail - 26 button) / 2 = 9 (Ethan: "outer margin around the rail top sidebar
     // button is equidistant"); the button sits on the space tiles' center line.
     if (collapsed) return h_flex().size_full().when(!glassOn(), (el) => el.bg(t.chrome)).items_center().justify_center().on_size_change((sz) => this.onSize(sz.width)).on_mouse_down("right", () => openSectionsMenu())
-      .when(!mac || window()?.fullscreen, (el) => el.child(this.button(t, "sidebar-toggle", "sidebar", toggleSidebar).tooltip("Expand sidebar")));
+      .when(!mac || window()?.fullscreen, (el) => el.child(this.button(t, "sidebar-toggle", "sidebar", toggleSidebar).tooltip("Expand Sidebar")));
     return h_flex().size_full().when(!glassOn(), (el) => el.bg(t.chrome)).pl(14).pr(10).gap(4).items_center().text_size(13.5)
       .on_size_change((sz) => this.onSize(sz.width))
       .on_mouse_down("right", () => openSectionsMenu())
