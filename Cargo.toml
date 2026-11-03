@@ -63,6 +63,11 @@ path = "tests/browser_raw_chords.rs"
 harness = false
 
 [[test]]
+name = "browser_grants"
+path = "tests/browser_grants.rs"
+harness = false
+
+[[test]]
 name = "browser_perf"
 path = "tests/browser_perf.rs"
 harness = false
