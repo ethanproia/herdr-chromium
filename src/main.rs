@@ -31,6 +31,8 @@ mod spawn;
 mod sprites;
 mod telemetry;
 mod feedback;
+// HERDR: HERDR_APP_FRAME_STATS (frame timing of the app window).
+mod frame_stats;
 mod terminal;
 mod update;
 mod update_notes;
@@ -147,6 +149,7 @@ fn main() {
     update::start();
     telemetry::start(settings::telemetry_setting(&person));
     bench::start();
+    frame_stats::start(); // HERDR: off unless HERDR_APP_FRAME_STATS=1 or 2
     if let Err(e) = mods::write_workspace() {
         eprintln!("herdr-app: cannot write {}: {e}", mods::app_dir().display());
     }
