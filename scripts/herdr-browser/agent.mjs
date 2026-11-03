@@ -241,9 +241,9 @@ export default function register({ sessions, onEvent, onOpen, route, dir, openTa
     if (cmd === "navigate" && !tab) { const r = await run({ cmd: "open", url: args.url, position: args.position }); selected = r.tab; return r; }
     if (cmd === "open") {
       const id = String(tab || `agent-${Date.now().toString(36)}`).replace(/[^a-z0-9_-]/gi, "");
-      opened.add(id);
       // position (Cursor): "side" opens beside the focused pane, "active" (default) as a tab.
       const s = await openTab(id, args.position === "side" ? "right" : "tab"); // a new browser block (or, on the stand-in, a new target); the app may pick its id
+      // Only the id the app made counts as opened; the asked-for id may name someone else's block.
       opened.add(s.id);
       s.state.agent = true; s.state.agentOpened = true;
       if (args.url) await acts.navigate(s, args);
