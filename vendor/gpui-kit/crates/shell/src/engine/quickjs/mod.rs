@@ -4170,6 +4170,23 @@ impl ShellRuntime {
         });
     }
 
+    // HERDR: an OS file drag entered an element: where (window px) and how many paths.
+    pub(crate) fn dispatch_drag_enter(self: &Rc<Self>, id: CallbackId, position: gpui::Point<gpui::Pixels>, count: usize, window: &mut Window, cx: &mut App) {
+        let (x, y) = (f32::from(position.x) as f64, f32::from(position.y) as f64);
+        self.dispatch_simple_event(id, "drag enter", window, cx, move |ctx| {
+            let payload = Object::new(ctx.clone())?;
+            payload.set("x", x)?;
+            payload.set("y", y)?;
+            payload.set("count", count as f64)?;
+            Ok(payload)
+        });
+    }
+
+    // HERDR: the drag left the element, was dropped on it, or left the window.
+    pub(crate) fn dispatch_drag_leave(self: &Rc<Self>, id: CallbackId, window: &mut Window, cx: &mut App) {
+        self.dispatch_simple_event(id, "drag leave", window, cx, |ctx| Object::new(ctx.clone()));
+    }
+
     /// Delivers one dispatched action to a script handler.
     ///
     /// The id is handed over even though the handler was registered for one
@@ -7167,6 +7184,8 @@ impl ShellRuntime {
                 "on_mouse_up",
                 "on_mouse_down_out",
                 "on_drop",
+                "on_drag_enter",
+                "on_drag_leave",
                 "on_scroll_wheel",
                 "on_action",
                 "key_context",
@@ -8172,6 +8191,8 @@ impl ShellRuntime {
             | "on_modifiers_changed"
             | "on_mouse_down_out"
             | "on_drop"
+            | "on_drag_enter"
+            | "on_drag_leave"
             | "on_scroll_wheel"
             | "tab_bar"
             | "empty_group"
@@ -10147,6 +10168,8 @@ fn callback_op_name(method: &str) -> Option<&'static str> {
         "on_modifiers_changed" => "on_modifiers_changed",
         "on_mouse_down_out" => "on_mouse_down_out",
         "on_drop" => "on_drop",
+        "on_drag_enter" => "on_drag_enter",
+        "on_drag_leave" => "on_drag_leave",
         "on_scroll_wheel" => "on_scroll_wheel",
         "on_item_click" => "on_item_click",
         "on_item_secondary_click" => "on_item_secondary_click",
