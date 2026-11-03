@@ -5839,6 +5839,51 @@ export default class Note extends View {
     assert!(tree.contains("events=4-8:false,0-0:false range=0-0 bounds=null caret=yes"), "{tree}");
 }
 
+// HERDR: a notepad-style key hook: Enter is the script's, other keys type as usual.
+#[gpui::test]
+fn a_script_key_hook_cancels_enter_and_lets_typing_through(cx: &mut TestAppContext) {
+    cx.update(|cx| crate::init(cx));
+    let runtime = ShellRuntime::new_isolated().expect("runtime");
+    cx.update(|cx| runtime.set_global(cx));
+    let source = r#"
+import { View, div } from "gpui-kit";
+import { Textarea, TextareaState } from "gpui-base";
+export default class Note extends View {
+  init() {
+    this.body = TextareaState.new({ value: "milk", rows: 4 });
+    this.keys = [];
+    this.body.on("key", (e, cx) => { this.keys.push(e.key + (e.at_last_visual_line ? "@last" : "")); cx.notify(); return e.key === "enter"; });
+  }
+  render(cx) {
+    return div().child(Textarea.new(this.body).h(120)).child(`keys=${this.keys.join(",")} value=${JSON.stringify(this.body.value())}`);
+  }
+}
+"#;
+    let view_type = runtime.load_source("key-note", source).expect("load");
+    let runtime_for_view = runtime.clone();
+    let object_slot = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let slot = object_slot.clone();
+    let (_root, context) = cx.add_window_view(move |window, cx| {
+        let object = runtime_for_view.instantiate(&view_type, window, cx).expect("instantiate");
+        *slot.borrow_mut() = Some(object.clone());
+        let view = cx.new(|_| ScriptView::new(runtime_for_view, object));
+        crate::root::ShellRoot::new(view.into(), window, cx)
+    });
+    context.update(|window, cx| window.draw(cx).clear(cx));
+    let area = runtime.entities().first_textarea().expect("textarea");
+    context.update(|window, cx| {
+        area.update(cx, |state, cx| {
+            state.focus(window, cx);
+            state.set_selected_range(4..4, cx);
+        })
+    });
+    context.update(|window, cx| window.draw(cx).clear(cx));
+    context.simulate_keystrokes("enter a");
+    let object = object_slot.borrow().clone().unwrap();
+    let tree = context.update(|window, cx| runtime.render_to_spec(&object, None, window, cx)).expect("render");
+    assert!(tree.contains(r#"keys=enter@last,a@last value=\"milka\""#) || tree.contains(r#"keys=enter@last,a@last value="milka""#), "{tree}");
+}
+
 #[gpui::test]
 fn an_unknown_input_event_names_the_valid_ones(cx: &mut TestAppContext) {
     cx.update(|cx| crate::init(cx));

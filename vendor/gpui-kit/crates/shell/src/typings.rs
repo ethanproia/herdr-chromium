@@ -2387,6 +2387,8 @@ const INLINE_TOKEN_TYPES: &str = r#"
   export interface TextBounds { x: number; y: number; width: number; height: number; window_x: number; window_y: number }
   /** A `selection` event: the new selection; `composing` while IME text is uncommitted (hide toolbars then). */
   export interface SelectionEvent extends InputSelection { composing: boolean }
+  /** A key-down offered to `on("key", ...)`: the key, modifiers, auto-repeat, the selection (UTF-16) and whether the caret is on the first or last visual (wrapped) line. */
+  export interface KeyHookEvent { key: string; key_char: string | null; shift: boolean; ctrl: boolean; alt: boolean; cmd: boolean; repeat: boolean; start: number; end: number; at_first_visual_line: boolean; at_last_visual_line: boolean }
   export interface InlineToken { id: string; text: string; label?: string }
   export interface InlineTokenSpan { range: InputRange; token: InlineToken }
   export interface InputContent { text: string; tokens: InlineTokenSpan[] }
@@ -3065,6 +3067,16 @@ const BASE: &str = r#"  /** A row. */
      * gives none.
      */
     on(event: "selection", handler: (event: SelectionEvent, cx: Context) => void): boolean;
+    /**
+     * Sees each key-down BEFORE key bindings, but only while this state has focus (never for other
+     * inputs or the rest of the window) and never during IME composition. Return `true` to cancel
+     * the key: the text field's own handling does not run (no newline, no deletion, no caret move)
+     * AND neither does Herdr's own key binding for that key while this field has focus (for
+     * example, cancelling cmd-b also stops cmd-b toggling the sidebar). Return anything else to let
+     * the key through. A handler that throws lets the key through. One hook per state; a later
+     * `on("key", ...)` replaces it. Key-downs only; `repeat` is true while a key is held.
+     */
+    on(event: "key", handler: (event: KeyHookEvent, cx: Context) => boolean): boolean;
     /** The active selection, in the same UTF-16 offsets as `set_selected_range`. */
     selected_range(): InputSelection;
     /**
@@ -3149,6 +3161,16 @@ const BASE: &str = r#"  /** A row. */
      * gives none.
      */
     on(event: "selection", handler: (event: SelectionEvent, cx: Context) => void): boolean;
+    /**
+     * Sees each key-down BEFORE key bindings, but only while this state has focus (never for other
+     * inputs or the rest of the window) and never during IME composition. Return `true` to cancel
+     * the key: the text field's own handling does not run (no newline, no deletion, no caret move)
+     * AND neither does Herdr's own key binding for that key while this field has focus (for
+     * example, cancelling cmd-b also stops cmd-b toggling the sidebar). Return anything else to let
+     * the key through. A handler that throws lets the key through. One hook per state; a later
+     * `on("key", ...)` replaces it. Key-downs only; `repeat` is true while a key is held.
+     */
+    on(event: "key", handler: (event: KeyHookEvent, cx: Context) => boolean): boolean;
     /** The active selection, in the same UTF-16 offsets as `set_selected_range`. */
     selected_range(): InputSelection;
     /**

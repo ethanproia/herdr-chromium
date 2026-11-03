@@ -1332,6 +1332,10 @@ fn subscribe(
     handler: Handler,
     what: &str,
 ) -> JsResult<bool> {
+    // HERDR: "key" is a hook that answers, not an event: see subscribe_key.
+    if name == "key" {
+        return subscribe_key(ctx, runtime, handle, handler, what);
+    }
     let event = InputEventName::from_name(name).ok_or_else(|| {
         Exception::throw_type(
             ctx,
@@ -1377,6 +1381,38 @@ fn subscribe(
             ctx,
             &format!("this {what} state has been released"),
         ));
+    }
+    Ok(true)
+}
+
+// HERDR: `on("key", (e, cx) => boolean)`: the handler runs before key bindings while this state
+// has focus and no IME composition is open; returning true cancels the key.
+fn subscribe_key(
+    ctx: &Ctx<'_>,
+    runtime: &Weak<ShellRuntime>,
+    handle: EntityHandle,
+    handler: Handler,
+    what: &str,
+) -> JsResult<bool> {
+    let saved = handler.0;
+    let dispatch = runtime.clone();
+    let store = alive(ctx, runtime)?;
+    let owner = InputCallbackOwner {
+        policy: scope::policy(),
+        application: scope::current_application_generation(),
+        view: scope::current_view().map(|view| view.downgrade()),
+    };
+    let hook: gpui_base::input::KeyHook = std::rc::Rc::new(move |event, window, cx| {
+        let Some(runtime) = dispatch.upgrade() else {
+            return false;
+        };
+        runtime.dispatch_key_hook(&saved, &owner, event, window, cx)
+    });
+    let set = scope::with_current(|_, cx| store.entities().set_key_hook(handle, hook, cx)).ok_or_else(|| {
+        Exception::throw_type(ctx, "on(\"key\", ...) needs a live host call; subscribe from init() or an event handler")
+    })?;
+    if !set {
+        return Err(Exception::throw_type(ctx, &format!("this {what} state has been released, or has no key hook")));
     }
     Ok(true)
 }

@@ -3884,6 +3884,55 @@ impl ShellRuntime {
         scheduler::drain_runtime_jobs(self, window, cx);
     }
 
+    // HERDR: asks a script's key hook whether to cancel a key. Only a strict `true` cancels; a
+    // throw or any other answer lets the key through, so a broken hook cannot eat the keyboard.
+    pub(super) fn dispatch_key_hook(
+        self: &Rc<Self>,
+        handler: &Persistent<Function<'static>>,
+        owner: &InputCallbackOwner,
+        event: &gpui_base::input::KeyHookEvent,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        if owner.application.as_ref().is_some_and(|application| !application.is_active()) {
+            return false;
+        }
+        let view = owner.view.as_ref().and_then(WeakEntity::upgrade);
+        let (_guard, generation) = scope::enter_with_application(
+            self,
+            window,
+            cx,
+            ScopePhase::Event,
+            view,
+            owner.policy.clone(),
+            owner.application.clone(),
+        );
+        let result = self.with_js(|ctx| {
+            let handler = handler.clone().restore(ctx)?;
+            let payload = Object::new(ctx.clone())?;
+            let k = &event.keystroke;
+            payload.set("key", k.key.clone())?;
+            payload.set("key_char", k.key_char.clone())?;
+            payload.set("shift", k.modifiers.shift)?;
+            payload.set("ctrl", k.modifiers.control)?;
+            payload.set("alt", k.modifiers.alt)?;
+            payload.set("cmd", k.modifiers.platform)?;
+            payload.set("repeat", event.repeat)?;
+            payload.set("start", event.start as f64)?;
+            payload.set("end", event.end as f64)?;
+            payload.set("at_first_visual_line", event.at_first_visual_line)?;
+            payload.set("at_last_visual_line", event.at_last_visual_line)?;
+            let answer: rquickjs::Value = handler.call((payload, context_object(ctx, ContextBinding::Call(generation))?))?;
+            Ok(answer.as_bool() == Some(true))
+        });
+        let cancel = result.unwrap_or_else(|error| {
+            tracing::error!("error in key hook: {error}");
+            false
+        });
+        scheduler::drain_runtime_jobs(self, window, cx);
+        cancel
+    }
+
     /// Delivers a slider event to a long-lived script subscription.
     ///
     /// The value is the whole payload rather than a field of an object,
