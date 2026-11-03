@@ -143,6 +143,11 @@ path = "tests/browser_attach.rs"
 harness = false
 
 [[test]]
+name = "browser_send_to"
+path = "tests/browser_send_to.rs"
+harness = false
+
+[[test]]
 name = "browser_annotations_agent"
 path = "tests/browser_annotations_agent.rs"
 harness = false
