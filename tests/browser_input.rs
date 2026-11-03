@@ -243,6 +243,8 @@ fn open(program: std::path::PathBuf) -> S {
         })
         .unwrap();
     let browser = window.update(&mut cx, |s, _, _| s.browsers.view("web").cloned().unwrap()).unwrap();
+    // The person turns Control on in the block's shield (S29), so the test's browser.* calls run.
+    cx.update(|cx| browser.update(cx, |v, cx| v.set_grant(browser::agent::Grant::Control, true, cx)));
     let input = cx.update(|cx| browser.read(cx).input().clone());
     let mut s = S { cx, window, browser, input, fails: vec![] };
     let deadline = Instant::now() + Duration::from_secs(30);
