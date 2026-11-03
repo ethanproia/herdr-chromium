@@ -69,6 +69,9 @@ pub struct AnnotationBatch {
     pub annotations: Vec<annotate::Annotation>,
     /// The style panel's edits line ("CSS edits — padding: 8px → 16px"), the person's own.
     pub css_edits: Option<String>,
+    /// The values those edits replaced, `(prop, was)`: read from the page, so untrusted.
+    #[serde(default)]
+    pub css_was: Vec<(String, String)>,
     /// A PNG under `<app home>/browser/attach/`; agent.rs keeps the last 20.
     pub picture: Option<std::path::PathBuf>,
     pub region: Option<RegionInfo>,
@@ -1767,7 +1770,9 @@ impl BrowserView {
         self.next_ask += 1;
         let req = VIEW_REQ_BASE + self.next_ask;
         let page = dir.join(format!("{}-{at}.page.png", self.id));
-        let css_edits = self.style_panel.as_ref().and_then(|p| super::edits::css_edits_line(&p.read(cx).panel.edits()));
+        // The person's new values only; the old ones came from the page and travel fenced.
+        let style_edits = self.style_panel.as_ref().map(|p| p.read(cx).panel.edits()).unwrap_or_default();
+        let (css_edits, css_was) = (super::edits::person_line(&style_edits), super::edits::was_values(&style_edits));
         let scroll = self.geometry().viewport_to_page(Pt { x: self.scroll.0, y: self.scroll.1 });
         let region = self.region_docs.last().map(|(r, anchor)| {
             let now = r.resolve(None, (scroll.x, scroll.y));
@@ -1783,10 +1788,11 @@ impl BrowserView {
             scroll: (scroll.x, scroll.y),
             annotations,
             css_edits,
+            css_was,
             picture: None,
             region: region.as_ref().map(|(anchor, r)| RegionInfo { anchor: anchor.clone(), rect: r.map(|r| (r.x, r.y, r.w, r.h)).unwrap_or_default(), detached: r.is_none() }),
             scale: 1.0,
-            untrusted: ["url", "title", "annotations.target.label", "annotations.target.selector", "annotations.target.rect", "region.anchor"].iter().map(|s| s.to_string()).collect(),
+            untrusted: ["url", "title", "annotations.target.label", "annotations.target.selector", "annotations.target.rect", "region.anchor", "css_was"].iter().map(|s| s.to_string()).collect(),
         };
         self.attaching.insert(req, (batch, page.clone()));
         self.link.send(AppToHost::Screenshot { id: self.id.clone(), req, path: page.to_string_lossy().into_owned() });
@@ -2666,6 +2672,11 @@ pub struct Browsers {
 impl Browsers {
     pub fn view(&self, id: &str) -> Option<&Entity<BrowserView>> {
         self.views.get(id).map(|(v, _)| v)
+    }
+
+    /// A block's profile as the app made it (None: no such block).
+    pub fn profile_of(&self, id: &str) -> Option<String> {
+        self.states.lock().unwrap().get(id).map(|s| s.profile.clone())
     }
 
     pub fn link_arc(&mut self) -> Arc<HostClient> {

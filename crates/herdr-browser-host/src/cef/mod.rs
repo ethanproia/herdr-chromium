@@ -758,7 +758,8 @@ fn apply_scheme(ctx: &RequestContext, dark: Option<bool>) {
 /// The request context for a block's `profile`: None (CEF's global context) for the default
 /// profile, else one context per name with its own cookies and storage under `<root>/<name>`.
 fn context_for(profile: Option<&str>) -> Result<Option<RequestContext>, String> {
-    let name = match profile.map(str::trim) {
+    // Exact names only: " default " is not an alias of the person's profile (it fails the name check).
+    let name = match profile {
         None | Some("") | Some("default") => return Ok(None),
         Some(n) => n.to_string(),
     };

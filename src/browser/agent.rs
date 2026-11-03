@@ -105,7 +105,8 @@ impl Agent {
 
     pub fn run(&mut self, name: &str, a: &Value, reg: &dyn BrowserRegistry, focus: &Focus, reply: Reply) -> Step {
         if name == "browser.open" {
-            let profile = arg(a, "profile").unwrap_or(AGENT_PROFILE).to_string();
+            // Canonical first, then authorized: " default " and "" both name the person's profile.
+            let profile = canonical_profile(arg(a, "profile").unwrap_or(AGENT_PROFILE));
             if profile == PERSON_PROFILE {
                 reply(Err("an agent can't open a browser on the person's profile (their logins): ask them to open one (+ menu > Browser) and allow agents in its shield".into()));
                 return Step::Done;
@@ -212,11 +213,12 @@ impl Agent {
     }
 
     /// The broker's door (agent.sock): the same grants as `allowed`, per CDP method. `profile` is the
-    /// block's; only exactly "agent" skips Control, and a block the app doesn't know is refused.
+    /// app's own record of how the block was made; only exactly "agent" (an agent's isolated
+    /// profile, holding only its own traffic) skips Control and Cdp. A block the app doesn't know is refused.
     pub fn broker_allowed(&self, id: &BrowserId, method: &str, profile: Option<&str>) -> Result<(), String> {
         let Some(profile) = profile else { return Err(format!("no browser block {id:?}")) };
         for grant in super::broker::needs(method, self.grants.get(id, Grant::Sensitive))? {
-            if grant == Grant::Control && profile == AGENT_PROFILE {
+            if matches!(grant, Grant::Control | Grant::Cdp) && profile == AGENT_PROFILE {
                 continue;
             }
             if !self.grants.get(id, grant) {
@@ -531,6 +533,14 @@ impl CdpFile {
 pub const PERSON_PROFILE: &str = "default";
 
 /// The grants an agent command on one block needs (Control is implied on blocks agents opened).
+/// The profile a name means to the host: trimmed, and empty is the default (person's) profile.
+pub fn canonical_profile(name: &str) -> String {
+    match name.trim() {
+        "" => PERSON_PROFILE.to_string(),
+        n => n.to_string(),
+    }
+}
+
 pub fn needs(name: &str, a: &Value, sensitive: bool) -> Vec<Grant> {
     let named_point = a.get("x").is_some() && a.get("y").is_some();
     match name {
@@ -859,6 +869,18 @@ mod tests {
         let step = a.run("browser.open", &json!({ "profile": "default" }), &reg, &Focus { focused: None, block_of_pane: &pane }, reply);
         assert!(matches!(step, Step::Done), "never the person's profile (S29)");
         assert!(got.lock().unwrap().take().unwrap().unwrap_err().contains("person's profile"));
+
+        // Aliases the host would read as the person's profile are refused too.
+        for alias in [" default ", "\tdefault\n"] {
+            let (got, reply) = catch();
+            let step = a.run("browser.open", &json!({ "profile": alias }), &reg, &Focus { focused: None, block_of_pane: &pane }, reply);
+            assert!(matches!(step, Step::Done), "alias {alias:?} refused");
+            assert!(got.lock().unwrap().take().unwrap().unwrap_err().contains("person's profile"));
+        }
+        // An empty profile is no profile: the agent's own.
+        let (_got, reply) = catch();
+        let step = a.run("browser.open", &json!({ "profile": "" }), &reg, &Focus { focused: None, block_of_pane: &pane }, reply);
+        assert!(matches!(step, Step::Open { profile, .. } if profile == "agent"));
     }
 
     #[test]

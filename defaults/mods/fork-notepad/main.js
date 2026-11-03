@@ -5,10 +5,15 @@
 import { View, div, svg } from "gpui-kit";
 import { h_flex, v_flex, Textarea, TextareaState, Popup } from "gpui-base";
 import { theme, settings, home, appHome, exec, readTextFile, writeTextFile, watchFolder, nextCommand, props, shared, setShared,
-  closeOverlay, openOverlay, notify, pickFolder } from "herdr";
+  closeOverlay, openOverlay, notify, pickFolder, run, hc } from "herdr";
+import { hasCopy, flushNote, flushAck, errorAfterWatch } from "./copy-clip.js";
+import { headerMenuCopyAction } from "./header-copy.js";
+import { runOverlayItem } from "./overlay-action.js";
+import { finishExport, exportFileTest } from "./export-finish.js";
 import { splitRows, joinRows, isFence, parseRow, filterTypes, setType, continuePrefix, isEmptyItem, toggleTask,
   parseInline, titleOf, slugOf, toPlain, toHtml, splitFront, iconOf, withIcon, TYPES, linkSpans, replaceLinkAt,
-  mergeAppend as joinAppend, draftRestore, loadedAfterRestore, savePlan, BY_MARK } from "./rows.js";
+  mergeAppend as joinAppend, draftRestore, loadedAfterRestore, savePlan, BY_MARK, prefixOffsets, visibleRange,
+  caretAfterEdit, spliceHeights, moveHeight } from "./rows.js";
 import { IconPicker, iconElement } from "./iconpicker.js";
 import { loadItems, openHref, KIND_ICON } from "./mentions.js";
 import { filterItems, encodeLink, parseHref } from "./mentions-core.js";
@@ -26,6 +31,8 @@ function notesDir() {
   return home() + "/Notes";
 }
 const NOTES_DIR = notesDir();
+// This mod's folder name, from the stack (import.meta.url is empty in mods; the fork renames folders).
+const SELF = (/\/mods\/([^/]+)\/[^/]+\.js/.exec(new Error().stack || "") || [])[1] ?? "fork-notepad";
 const NOTE_PATH = NOTES_DIR + "/notepad.md";
 setShared("notepad.dir", NOTES_DIR);   // the pane header shows this resolved folder
 const LOCK = NOTE_PATH + ".lock";               // shared with bin/notepad: one writer at a time
@@ -44,7 +51,9 @@ async function readDraftBase() {
   } catch { /* a broken meta must not let Restore overwrite the disk */ }
   return undefined;
 }
+const TMP_DIR = `${appHome()}/data/notepad/tmp`;   // export/copy scratch files: inside the app home, where writeTextFile may write
 const SAVE_MS = 400;
+const ownersNow = () => { const o = shared("notepad.owners"); return Array.isArray(o) ? o : []; };
 const CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 
 // Look. One place for every number (see refs/REFS.md).
@@ -81,7 +90,10 @@ function inline(text) {
   if (!v) { if (INLINE.size > 4000) INLINE.clear(); v = parseInline(text); INLINE.set(text, v); }
   return v;
 }
-const BADGE_ICON = { agent: "chat", tab: "list", file: "file", date: "calendar", url: "globe" };
+const BADGE_ICON = { agent: "chat", tab: "list", pane: "bookmark", file: "file", date: "calendar", url: "globe" };
+const VIRTUAL_MIN = 60;    // lines above which only the rows on screen are drawn (measured faster from ~60 up)
+const OVERSCAN = 300;      // px drawn above and below the view
+const EST = new Map();     // row text -> estimated height
 const PH = { p: "Type '/' to style", h1: "Heading 1", h2: "Heading 2", h3: "Heading 3", task: "To-do", bullet: "List", number: "List", quote: "Empty quote" };
 // Rows whose markdown prefix is drawn as a control (checkbox, bullet...) and kept out of the text box.
 const DECORATED = new Set(["h", "task", "bullet", "number", "quote"]);
@@ -91,6 +103,8 @@ export default class Notes extends View {
     this.handle = cx.focus_handle();
     if (props()?.export) { this.exporting = false; return; }   // opened by the header's Export button
     if (props()?.headerMenu || props()?.backlinks) return;       // small popups: no note, no file watch
+    this.isNote = true; this.ownerId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    setShared("notepad.owners", [...ownersNow().filter((x) => x !== this.ownerId), this.ownerId]);   // open note copies; the last one out clears the links
     this.ta = TextareaState.new({});   // placeholders are drawn by renderActive (they change with the row type)
     this.titleTa = TextareaState.new({ placeholder: "Untitled" });
     this.titleTa.set_auto_grow(1, 8);
@@ -119,6 +133,9 @@ export default class Notes extends View {
     this.width = 800;      // pane width (on_size_change); FORK: panes have no min width a mod can set
     this.rowH = {};        // measured row heights by state (see measure())
     this.editFix = 0;      // px added above the text box so it matches the styled line
+    this.hAt = [];         // measured row heights by index; long notes draw only the rows on screen
+    this.rowsVer = 0; this.heightsVer = 0; this.layoutKey = ""; this.layoutCache = null;   // prefix sums of row heights, rebuilt only when rows or heights change
+    this.scrollY = 0; this.viewH = 0;
 
     cx.spawn(async (cx) => {
       try { await exec("mkdir", ["-p", NOTES_DIR]); } catch (e) { this.error = `Cannot create ${NOTES_DIR}: ${e}`; }
@@ -126,7 +143,7 @@ export default class Notes extends View {
       this.cur = { path: NOTE_PATH, text: text ?? "", loaded: text, dirty: false, conflict: false, front: "" };
       const { front, body } = splitFront(text ?? "");
       this.cur.front = front;
-      this.rows = body ? splitRows(body) : ["", ""];
+      this.replaceRows(body ? splitRows(body) : ["", ""]);
       if (!text) this.activate(0, cx, true);
       this.publishLinks();
       cx.notify();
@@ -144,6 +161,7 @@ export default class Notes extends View {
         const c = await nextCommand();
         if (c === "focus") { if (this.active >= 0) this.focusText(cx); else this.handle.focus(); }
         // ⌘A (keys.json "mod:fork-notepad"): select the line you're on. FORK: all lines needs a whole-note selection.
+        if (c === "flush") await this.flushForExport(cx);   // the Export popup asks for the note on disk to be current
         if (c === "select-all" && this.active >= 0) { const b = this.box(); b.set_selected_range({ start: 0, end: b.value().length }); }
         cx.notify();
       }
@@ -157,14 +175,21 @@ export default class Notes extends View {
   watch(cx) {
     cx.spawn(async (cx) => {
       let failures = 0;
+      let watchError = null;
       for (;;) {
         try {
           await watchFolder(NOTES_DIR);
           failures = 0;
+          this.error = errorAfterWatch(this.error, watchError);
+          watchError = null;
           await this.refreshCurrent();
           cx.notify();
         } catch (e) {
-          if (failures === 0) { this.error = `Cannot watch ${NOTES_DIR}: ${e}`; cx.notify(); }
+          if (failures === 0) {
+            watchError = `Cannot watch ${NOTES_DIR}: ${e}`;
+            this.error = watchError;
+            cx.notify();
+          }
           failures++;
           await cx.sleep(backoffMs(failures));
         }
@@ -202,7 +227,7 @@ export default class Notes extends View {
     c.dirty = c.text !== disk;
     const { front, body } = splitFront(c.text);
     c.front = front;
-    this.rows = splitRows(body);
+    this.replaceRows(splitRows(body));
     if (this.active >= this.rows.length) this.active = -1;
     this.publishLinks();
   }
@@ -211,9 +236,23 @@ export default class Notes extends View {
     this.cur.text = text; this.cur.loaded = text; this.cur.dirty = false; this.cur.conflict = false;
     const { front, body } = splitFront(text);
     this.cur.front = front;
-    this.rows = splitRows(body);
+    this.replaceRows(splitRows(body));
     this.active = -1; this.menu = null;
     this.publishLinks();
+  }
+
+  // The Export popup (another copy of this mod) sets "notepad.flushReq" and runs "notepad.flush"; every shown note
+  // saves, then answers in "notepad.flushAck" ({req, ok, error?}); one failed copy keeps ok false.
+  async flushForExport(cx) {
+    const req = shared("notepad.flushReq");
+    if (!this.cur || typeof req !== "string") return;
+    if (this.active >= 0) this.commit();
+    const errorBefore = this.error;
+    await this.save(false, cx);
+    const ack = flushAck({ dirty: this.cur.dirty, conflict: this.cur.conflict, errorBefore, errorAfter: this.error });
+    const prev = shared("notepad.flushAck");
+    if (prev && prev.req === req && prev.ok === false) return;
+    setShared("notepad.flushAck", ack.ok ? { req, ok: true } : { req, ok: false, error: ack.error });
   }
 
   // Publish the note's links (shared "notepad.links") so pane headers can show a backlink mark.
@@ -223,9 +262,24 @@ export default class Notes extends View {
     if (!Array.isArray(now) || now.join("\n") !== hrefs.join("\n")) setShared("notepad.links", hrefs);
   }
 
+  // A wholesale row replacement (load, reload, append-merge, draft restore). Old indexes no longer name the same rows.
+  replaceRows(rows) {
+    this.rows = rows;
+    this.hAt = [];
+    this.rowsVer++;
+  }
+
+  // Insert or remove rows and the measured heights at the same index. New rows stay unmeasured
+  // unless `heights` is passed (a duplicate keeps the source row's height).
+  spliceRows(start, deleteCount, items, heights) {
+    this.rows.splice(start, deleteCount, ...items);
+    this.hAt = spliceHeights(this.hAt, start, deleteCount, heights ?? items.map(() => undefined));
+    if (this.hAt.length > this.rows.length) this.hAt.length = this.rows.length;
+  }
+
   edited(cx) {
     this.cur.text = this.cur.front + joinRows(this.rows);
-    this.cur.dirty = true;
+    this.cur.dirty = true; this.rowsVer++;
     const mine = ++this.seq;
     cx.timer.after(SAVE_MS, (cx) => { if (mine === this.seq) this.save(false, cx); });
   }
@@ -294,7 +348,7 @@ export default class Notes extends View {
       const action = draftRestore(base, draft, this.cur.loaded);
       this.cur.text = draft;
       const { front, body } = splitFront(draft);
-      this.cur.front = front; this.rows = splitRows(body); this.active = -1;
+      this.cur.front = front; this.replaceRows(splitRows(body)); this.active = -1;
       this.cur.dirty = true;
       // "merge" pins the draft's base so save(false) still sees an outside append.
       // "save" keeps the current baseline: the disk already equals the draft or the base,
@@ -323,7 +377,7 @@ export default class Notes extends View {
     if (v.includes("\n")) {
       const [first, ...rest] = v.split("\n");
       this.rows[0] = this.titleRow(first);
-      this.rows.splice(1, 0, rest.join("\n"));
+      this.spliceRows(1, 0, [rest.join("\n")]);
       this.edited(cx);
       return this.activate(1, cx, false);
     }
@@ -367,6 +421,7 @@ export default class Notes extends View {
     this.commit();
     if (i < 0 || i >= this.rows.length) { cx.notify(); return; }
     this.active = i;
+    if (this.rows.length > VIRTUAL_MIN) this.reveal(i);
     const text = this.seat(this.rows[i], i);
     this.setBox(text);
     const pos = at ?? (atEnd ? text.length : 0);
@@ -398,7 +453,7 @@ export default class Notes extends View {
       if (parts.length === 2 && parts[1] === "" && isEmptyItem(first)) { this.setRow("", cx); cx.notify(); return; }
       const lead = parts.length === 2 ? continuePrefix(first) : "";
       const added = parts.slice(1).map((p, k) => (k === 0 ? lead : "") + p);
-      this.rows.splice(this.active, 1, first, ...added);
+      this.spliceRows(this.active, 1, [first, ...added]);
       this.edited(cx);
       const target = this.active + added.length;
       this.activate(target, cx, false, parts.length === 2 ? this.splitPrefix(this.rows[target])[1].length - parts[1].length : undefined);
@@ -407,7 +462,7 @@ export default class Notes extends View {
 
     // "---" typed on its own row becomes a divider, and the cursor moves to a fresh row below.
     if (!this.md && full === "---") {
-      this.rows.splice(this.active, 1, "---", "");
+      this.spliceRows(this.active, 1, ["---", ""]);
       this.edited(cx);
       return this.activate(this.active + 1, cx, true);
     }
@@ -417,7 +472,19 @@ export default class Notes extends View {
       const r = parseRow(shortcut ?? full);
       if (shortcut || (DECORATED.has(r.kind) && r.marker)) { this.setRow(shortcut ?? full, cx); this.updateMenu(cx); cx.notify(); return; }
     }
+    const old = this.rows[this.active];
+    const before = old.startsWith(this.prefix) && (this.suffix === "" || old.endsWith(this.suffix))
+      ? old.slice(this.prefix.length, old.length - this.suffix.length) : old;
     this.rows[this.active] = full;
+    // A pasted or just-finished link becomes a badge right away, not only after leaving the line.
+    // setBox rebuilds the text box, so put the caret back at the edit (a ")" typed mid-row must not jump to the end).
+    // The box cannot report its selection. caretAfterEdit is the stand-in, and it is ambiguous when the
+    // typed character equals the one already after the caret (a ")" just before another ")").
+    if (!this.md && linkSpans(v).length > this.ta.tokens().length) {
+      const caret = caretAfterEdit(before, v);
+      this.setBox(v);
+      this.ta.set_selected_range({ start: caret, end: caret });
+    }
     this.updateMenu(cx);
     this.edited(cx);
     cx.notify();
@@ -495,7 +562,7 @@ export default class Notes extends View {
     this.focusText(cx);
     if (id === "hr") {
       const keep = base.trim() ? [base] : [];
-      this.rows.splice(this.active, 1, ...keep, "---", "");
+      this.spliceRows(this.active, 1, [...keep, "---", ""]);
       this.edited(cx);
       this.activate(this.active + keep.length + 1, cx, true);
       return;
@@ -509,7 +576,7 @@ export default class Notes extends View {
     const i = this.active;
     if (this.prefix) { this.setRow(this.ta.value() + this.suffix, cx); cx.notify(); return; } // Backspace on an empty item: back to text
     if (i <= 0 || this.rows.length <= 1) return;
-    this.rows.splice(i, 1);
+    this.spliceRows(i, 1, []);
     this.edited(cx);
     this.activate(Math.max(0, i - 1), cx, true);
   }
@@ -536,14 +603,16 @@ export default class Notes extends View {
     this.commit();
     const [row] = this.rows.splice(from, 1);
     this.rows.splice(to > from ? to - 1 : to, 0, row);
+    this.hAt = moveHeight(this.hAt, from, to);
+    if (this.hAt.length > this.rows.length) this.hAt.length = this.rows.length;
     this.edited(cx);
   }
 
   blockAction(i, what, cx) {
     this.blockMenu = -1;
     this.commit();
-    if (what === "delete") { this.rows.splice(i, 1); if (this.rows.length < 2) this.rows.push(""); }
-    else if (what === "duplicate") this.rows.splice(i + 1, 0, this.rows[i]);
+    if (what === "delete") { this.spliceRows(i, 1, []); if (this.rows.length < 2) this.rows.push(""); }
+    else if (what === "duplicate") this.spliceRows(i + 1, 0, [this.rows[i]], [this.hAt[i]]);
     else this.rows[i] = setType(this.rows[i], what);
     this.edited(cx);
     cx.notify();
@@ -566,7 +635,7 @@ export default class Notes extends View {
   // Notion's +: a new row below with the / menu open.
   addBelow(i, cx) {
     i = Math.max(0, i);
-    this.rows.splice(i + 1, 0, "/");
+    this.spliceRows(i + 1, 0, ["/"]);
     this.edited(cx);
     this.activate(i + 1, cx, true);
     this.updateMenu(cx);
@@ -800,52 +869,152 @@ export default class Notes extends View {
     return list;
   }
 
+  // ---- long notes: draw only the rows on screen ----
+  // Measured 2026-11-03: building every row costs ~0.23 ms per line (1000 lines = 236 ms per redraw), so past
+  // VIRTUAL_MIN lines the note keeps its own scroll position (wheel events), draws the rows in view plus a margin
+  // (heights measured as they draw, estimated until then) and a thin scrollbar. Herdr's lazy `list` can't be used:
+  // its rows may not carry handlers, and every row here has some.
+  // Until a row has been drawn, its height is estimated from its type; cached by text (layout runs every redraw).
+  rowEstimate(i) {
+    if (i === 0) return 60;
+    const row = this.rows[i] ?? "";
+    let h = EST.get(row);
+    if (h === undefined) {
+      const { lh, top } = this.metrics(parseRow(row));
+      h = lh + 2 * S.rowPad + top;
+      if (EST.size > 20000) EST.clear();
+      EST.set(row, h);
+    }
+    return h;
+  }
+
+  // Prefix sums of the row heights (measured where drawn, estimated elsewhere), rebuilt only when the rows or a
+  // measured height changed (rowsVer / row count / heightsVer), not on every redraw.
+  layoutRows() {
+    const n = this.rows.length, key = `${this.rowsVer}:${n}:${this.heightsVer}`;
+    if (this.layoutCache && this.layoutKey === key) return this.layoutCache;
+    const hs = new Array(n);
+    for (let i = 0; i < n; i++) hs[i] = this.hAt[i] ?? this.rowEstimate(i);
+    const prefix = prefixOffsets(hs);
+    this.layoutKey = key;
+    return (this.layoutCache = { prefix, total: prefix[n] });
+  }
+
+  setHeight(i, h) { if (this.hAt[i] !== h) { this.hAt[i] = h; this.heightsVer++; } }
+
+  // Scroll so row i is on screen (used when the keyboard moves the line being edited).
+  reveal(i) {
+    const { prefix } = this.layoutRows();
+    const y = S.padTop + prefix[i], h = prefix[i + 1] - prefix[i];
+    const view = this.viewH || 600;
+    if (y < this.scrollY) this.scrollY = Math.max(0, y - 40);
+    else if (y + h > this.scrollY + view) this.scrollY = y + h - view + 40;
+  }
+
+  renderVirtual(t, cx) {
+    const { prefix, total } = this.layoutRows();
+    const n = this.rows.length, view = this.viewH || 800, height = S.padTop + total + 200;
+    this.scrollY = Math.max(0, Math.min(this.scrollY, Math.max(0, height - view)));
+    const { first, last } = visibleRange(prefix, this.scrollY - OVERSCAN - S.padTop, this.scrollY + view + OVERSCAN - S.padTop);
+    const firstY = S.padTop + prefix[first];
+    if (this.active >= 0 && (this.active < first || this.active >= last)) this.commit();   // scrolled off: stop editing
+    const rows = [];
+    for (let i = first; i < last; i++) {
+      const el = i === this.active ? this.renderActive(t, i) : this.renderRow(t, this.rows[i], i, cx);
+      rows.push(i === 0 ? this.titleArea(t, el) : this.blockFrame(t, this.rows[i], i, el));
+    }
+    if (last >= n) rows.push(div().id("tail").w_full().h(200).cursor_text().on_click((_e, cx) => this.tail(cx)));
+    const thumbH = Math.max(28, view * view / height), thumbY = (view - thumbH) * (this.scrollY / Math.max(1, height - view));
+    return div().id("scroll").flex_1().min_h(0).relative().overflow_hidden()
+      .on_size_change((size, cx) => { if (Math.abs(size.height - this.viewH) > 1) { this.viewH = size.height; cx.notify(); } })
+      .on_scroll_wheel((e, cx) => {
+        const next = Math.max(0, Math.min(this.scrollY - (e.delta?.y ?? 0), Math.max(0, height - view)));
+        if (next !== this.scrollY) { this.scrollY = next; cx.notify(); }
+      })
+      .child(h_flex().size_full().justify_center()
+        .child(div().relative().w_full().max_w(S.width).h_full()
+          .child(v_flex().absolute().left(0).right(0).top(firstY - this.scrollY).px(this.pad).children(rows))))
+      .when(height > view, (el) => el.child(div().absolute().right(3).top(thumbY).w(4).h(thumbH).rounded(2).bg(t.border)));
+  }
+
   // Flush a pending save when the pane closes, so nothing typed is lost.
   // The draft is written first (one quick local write), so a failed or cut-short save never loses typing.
   async close(cx) {
-    if (!this.cur?.dirty) return;
-    await writeTextFile(DRAFT, this.cur.text, await readTextFile(DRAFT).catch(() => null)).catch(() => {});
-    await writeTextFile(DRAFT_BASE, JSON.stringify({ base: this.cur.loaded }), await readTextFile(DRAFT_BASE).catch(() => null)).catch(() => {});
-    await this.save(false, cx);
-    if (!this.cur.dirty) clearDraftFiles();
+    if (!this.isNote) return;      // popups (export, menus, backlinks) hold no note
+    try {
+      if (this.cur?.dirty) {
+        await writeTextFile(DRAFT, this.cur.text, await readTextFile(DRAFT).catch(() => null)).catch(() => {});
+        await writeTextFile(DRAFT_BASE, JSON.stringify({ base: this.cur.loaded }), await readTextFile(DRAFT_BASE).catch(() => null)).catch(() => {});
+        await this.save(false, cx);
+        if (!this.cur.dirty) clearDraftFiles();
+      }
+    } finally {
+      // "notepad.links" is a cache of the open note's links: the last note copy out clears it (a note opening republishes it),
+      // so pane headers never show backlinks from a note nobody is watching.
+      const left = ownersNow().filter((x) => x !== this.ownerId);
+      setShared("notepad.owners", left);
+      if (!left.length) setShared("notepad.links", null);
+    }
   }
 
   // ---- export (this mod opened as a popup by the header's Export button) ----
   async runExport(kind, cx) {
     if (this.exporting) return;
     this.exporting = true; cx.notify();
-    const done = (title, body, level) => { notify({ title, body, level, timeout: 3000 }); closeOverlay(props().overlay); };
+    const work = `${TMP_DIR}/${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    // Every command's result is checked: a nonzero code throws with its stderr, so success is only reported when it is true.
+    const must = async (what, cmd, args) => {
+      const r = await exec(cmd, args);
+      if (r.code !== 0) throw new Error(`${what} failed${r.stderr ? `: ${r.stderr.trim()}` : ` (exit ${r.code})`}`);
+      return r;
+    };
+    // Remove the scratch folder once, before closeOverlay. Closing can tear this view down,
+    // so the removal has to finish while the popup is still open.
+    let outcome = null;
     try {
-      const text = splitFront((await readTextFile(NOTE_PATH).catch(() => null)) ?? "").body;
+      // Ask the open note (another copy of this mod) to save first; null when the file is current or no note answered.
+      const flushErr = await flushNote(SELF, { stamp: () => `${Date.now()}-${Math.random().toString(36).slice(2)}`, setShared, shared, run, sleep: (ms) => cx.sleep(ms) });
+      if (flushErr) throw new Error(flushErr);
+      const raw = await readTextFile(NOTE_PATH).catch(() => null);
+      if (raw === null) throw new Error("The note could not be read");
+      const text = splitFront(raw).body;     // what the editor holds (saved above), without the frontmatter
       const name = slugOf(titleOf(text), new Date().toISOString().slice(0, 10));
+      await must("Making the temp folder", "mkdir", ["-p", work]);
       if (kind === "copy-md" || kind === "copy-text") {
         // Through a file, not argv: a long note would hit the argument size limit.
-        const clip = (await exec("mktemp")).stdout.trim();
-        try {
-          await writeTextFile(clip, kind === "copy-md" ? text : toPlain(text), await readTextFile(clip).catch(() => null));
-          await exec("sh", ["-c", 'pbcopy < "$1"', "sh", clip]);
-        } finally { await exec("rm", ["-f", clip]).catch(() => {}); }
-        return done(kind === "copy-md" ? "Copied as Markdown" : "Copied as plain text");
+        const clip = `${work}/clip.txt`;
+        await writeTextFile(clip, kind === "copy-md" ? text : toPlain(text), null);
+        await must("Copying", "sh", ["-c", 'pbcopy < "$1"', "sh", clip]);
+        outcome = { title: kind === "copy-md" ? "Copied as Markdown" : "Copied as plain text" };
+      } else {
+        const folder = await pickFolder({ prompt: kind === "pdf" ? "Export PDF to" : "Export Markdown to" });
+        if (!folder) outcome = { cancelled: true };
+        else if (kind === "md") {
+          const src = `${work}/note.md`, dest = `${folder}/${name}.md`;
+          await writeTextFile(src, text, null);
+          await must("Saving the Markdown", "cp", [src, dest]);
+          await must("Checking the saved file", "test", [exportFileTest("md"), dest]);
+          outcome = { title: "Exported", body: dest };
+        } else {
+          const dest = `${folder}/${name}.pdf`;
+          await writeTextFile(`${work}/note.html`, toHtml(text, titleOf(text)), null);
+          await must("Making the PDF", CHROME, ["--headless=new", "--disable-gpu", "--no-pdf-header-footer", `--user-data-dir=${work}/profile`,
+            `--print-to-pdf=${dest}`, `file://${work}/note.html`]);
+          await must("Checking the PDF", "test", [exportFileTest("pdf"), dest]);
+          outcome = { title: "Exported PDF", body: dest };
+        }
       }
-      const folder = await pickFolder({ prompt: kind === "pdf" ? "Export PDF to" : "Export Markdown to" });
-      if (!folder) { this.exporting = false; return cx.notify(); }
-      if (kind === "md") {
-        await exec("cp", [NOTE_PATH, `${folder}/${name}.md`]);
-        return done("Exported", `${folder}/${name}.md`);
-      }
-      const tmp = (await exec("mktemp", ["-d"])).stdout.trim();
-      try {
-        await writeTextFile(`${tmp}/note.html`, toHtml(text, titleOf(text)), null);
-        await exec(CHROME, ["--headless=new", "--disable-gpu", "--no-pdf-header-footer", `--user-data-dir=${tmp}/profile`,
-          `--print-to-pdf=${folder}/${name}.pdf`, `file://${tmp}/note.html`]);
-      } finally {
-        await exec("rm", ["-rf", tmp]).catch(() => {});
-      }
-      return done("Exported PDF", `${folder}/${name}.pdf`);
     } catch (e) {
-      this.exporting = false;
-      done("Export failed", String(e), "error");
+      outcome = { title: "Export failed", body: e instanceof Error ? e.message : String(e), level: "error" };
     }
+    await finishExport(() => exec("rm", ["-rf", work]), outcome, {
+      stay: () => { this.exporting = false; cx.notify(); },
+      close: (o) => {
+        if (o?.level === "error") this.exporting = false;
+        notify({ title: o?.title, body: o?.body, level: o?.level, timeout: 3000 });
+        closeOverlay(props().overlay);
+      },
+    });
   }
 
   // "Mentioned in Notepad": the lines that link to a pane (opened from that pane's header mark).
@@ -858,7 +1027,7 @@ export default class Notes extends View {
     const want = new Set(props().backlinks);
     const lines = (this.blText ?? "").split("\n").filter((l) => parseInline(l).some((x) => x.t === "link" && want.has(x.href)));
     const plain = (l) => toPlain(l.replace(BY, ""));
-    return v_flex().id("backlinks").size_full().p(4).gap(1).bg(t.popover).font_family(FONT)
+    return v_flex().id("backlinks").w_full().h(200).p(4).gap(1).bg(t.popover).font_family(FONT)
       .child(div().px(8).py(6).text_size(12).font_weight(500).text_color(t.muted).child("Mentioned in Notepad"))
       .children(lines.map((l, k) => div().id(`bl-${k}`).px(8).py(6).rounded(6).text_size(13).text_color(t.foreground).truncate().child(plain(l))))
       .when(this.blText !== null && !lines.length, (el) => el.child(div().px(8).py(6).text_size(13).text_color(t.dim).child("No mentions")));
@@ -867,14 +1036,25 @@ export default class Notes extends View {
   // The header's ••• menu in a narrow pane: the Notepad buttons that didn't fit.
   renderHeaderMenu() {
     const t = theme();
-    const item = (id, icon, label, on, action) => h_flex().id(`hm-${id}`).h(32).px(8).gap(8).items_center().rounded(6).cursor_pointer()
-      .hover((s) => s.bg(t.hover)).on_click((_e, cx) => { closeOverlay(props().overlay); action(cx); })
+    const item = (id, icon, label, on, action, asyncWork) => h_flex().id(`hm-${id}`).h(32).px(8).gap(8).items_center().rounded(6).cursor_pointer()
+      .hover((s) => s.bg(t.hover)).on_click((_e, cx) => {
+        const overlay = props().overlay;
+        const pending = runOverlayItem(() => action(cx), () => closeOverlay(overlay), asyncWork, undefined, (ms) => cx.sleep(ms));
+        if (pending && typeof pending.catch === "function") pending.catch(() => {});
+      })
       .child(svg(`mods/fork-notepad/${icon}.svg`).size(16).text_color(t.muted))
       .child(div().flex_1().text_size(13).text_color(t.foreground).child(label))
       .when(on !== null, (el) => el.child(div().text_size(12).text_color(t.dim).child(on ? "On" : "Off")));
-    return v_flex().id("header-menu").size_full().p(4).gap(1).bg(t.popover)
-      .child(item("md", "md", "Markdown", this.md, () => this.toggleMd()))
-      .child(item("ex", "export", "Export…", null, () => openOverlay({ mod: "fork-notepad", kind: "popup", props: { export: true }, width: 220, height: 176 })));
+    const copy = props()?.copy, note = props()?.note !== false, copying = hasCopy(copy);
+    return v_flex().id("header-menu").w_full().h(8 + 32 * ((copying ? 1 : 0) + (note ? 2 : 0))).p(4).gap(1).bg(t.popover)
+      // Copy the whole pane. A terminal is read with hc first; pbcopy runs only when that read exits 0.
+      // The promise is returned so the popup stays up until the copy settles (see runOverlayItem).
+      .when(copying, (el) => el.child(item("cp", "copy", "Copy contents", null, headerMenuCopyAction(copy, {
+        hc, exec, writeTextFile, appHome, shared, setShared, run, notify,
+      }), true)))
+      .when(note, (el) => el
+        .child(item("md", "md", "Markdown", this.md, () => this.toggleMd()))
+        .child(item("ex", "export", "Export…", null, () => openOverlay({ mod: SELF, kind: "popup", props: { export: true }, width: 220, height: 176 }))));
   }
 
   renderExport() {
@@ -883,7 +1063,7 @@ export default class Notes extends View {
       .hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.runExport(id, cx))
       .child(div().flex_1().text_size(13).text_color(t.foreground).child(label))
       .child(div().text_size(11).text_color(t.dim).child(hint));
-    return v_flex().id("export").size_full().p(4).gap(1).bg(t.popover)
+    return v_flex().id("export").w_full().h(176).p(4).gap(1).bg(t.popover)
       .child(div().px(8).py(6).text_size(12).font_weight(500).text_color(t.muted).child(this.exporting ? "Exporting…" : "Export"))
       .child(item("copy-md", "Copy as Markdown", ""))
       .child(item("copy-text", "Copy as plain text", ""))
@@ -913,6 +1093,7 @@ export default class Notes extends View {
         onRemove: (cx) => { this.pickerOpen = false; this.setIcon("", cx); },
       }))));
     return v_flex().id("title-area").w_full().pb(2)
+      .on_size_change((size) => { this.setHeight(0, size.height); })
       .on_hover((h, cx) => { if (h !== this.titleHover) { this.titleHover = h; cx.notify(); } })
       .child(h_flex().w_full().pb(4).child(pop)).child(el);
   }
@@ -932,6 +1113,7 @@ export default class Notes extends View {
   // both states; the difference is added above the text box, which makes both the height and the text position match
   // at any zoom. Measured 2026-11-03: 33.0 vs 33.5 at zoom 1.1 (proof in work.noindex/herdr-notepad/jitter/).
   measure(i, row, size, cx) {
+    this.setHeight(i, size.height);   // for the long-note window (renderVirtual)
     const state = i === this.active ? "edit" : "styled";
     const rec = (this.rowH[row] ??= {});
     if (state === "edit") rec.edit = size.height - this.editFix; else rec.styled = size.height;
@@ -996,14 +1178,14 @@ export default class Notes extends View {
 
     let content;
     if (!this.cur) content = div();
-    else content = v_flex().w_full()
+    else if (this.rows.length <= VIRTUAL_MIN) content = v_flex().w_full()
       .children(this.rows.map((row, i) => {
         const el = i === this.active ? this.renderActive(t, i) : this.renderRow(t, row, i, cx);
         return i === 0 ? this.titleArea(t, el) : this.blockFrame(t, row, i, el);
       }))
       .child(div().id("tail").w_full().h(200).cursor_text().on_click((_e, cx) => this.tail(cx)));
 
-    return v_flex().id("notes-root").track_focus(this.handle)
+    const root = v_flex().id("notes-root").track_focus(this.handle)
       .on_size_change((size, cx) => { if (Math.abs(size.width - this.width) > 1) { this.width = size.width; cx.notify(); } }).size_full().bg(t.background).text_color(t.foreground).font_family(FONT)
       .on_key_down((e, cx) => this.onKey(e, cx))
       .on_mouse_up("left", (_e, cx) => {
@@ -1021,8 +1203,9 @@ export default class Notes extends View {
         act("reload", "Reload", (_e, cx) => { readTextFile(NOTE_PATH).then((d) => { this.adopt(d ?? ""); cx.notify(); }); }),
         act("overwrite", "Keep mine", (_e, cx) => this.save(true, cx)),
       ])))
-      .when(Boolean(this.error), (el) => el.child(div().px(16).pt(8).text_size(12).text_color(t.blocked).child(this.error)))
-      .child(div().id("scroll").flex_1().min_h(0).overflow_y_scrollbar()
+      .when(Boolean(this.error), (el) => el.child(div().px(16).pt(8).text_size(12).text_color(t.blocked).child(this.error)));
+    if (this.cur && this.rows.length > VIRTUAL_MIN) return root.child(this.renderVirtual(t, cx));
+    return root.child(div().id("scroll").flex_1().min_h(0).overflow_y_scrollbar()
         .child(h_flex().w_full().justify_center()
           .child(v_flex().w_full().max_w(S.width).px(this.pad).pt(S.padTop).child(content))));
   }
