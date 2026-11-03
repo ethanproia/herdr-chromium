@@ -80,6 +80,8 @@ try {
   check((await json("click", T, "x=5", "y=5")).ok, "click by coordinates");
   const con = (await json("console", T)).messages ?? [];
   check(con.some((m) => m.text === "page ready" && m.level === "warning") && con.some((m) => m.text === "clicked Ada"), `console messages captured (${con.length})`);
+  // No Cdp grant needed: T is the agent's own block (profile "agent", its own traffic only), which the
+  // broker lets watch the network; a person's block needs Control and Cdp (tested in broker.rs).
   check(((await json("network", T)).errors ?? []).some((e) => e.status === 404 && e.url.endsWith("/missing.png")), "network errors captured (404)");
   check((await json("wait", T, "selector=#nope", "timeout=500")).ok === false, "wait times out on a missing selector");
 
