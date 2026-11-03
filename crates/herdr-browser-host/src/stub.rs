@@ -134,15 +134,16 @@ impl<A: SurfaceAlloc> StubHost<A> {
                 if url_host(&b.history[b.pos]).ends_with(".invalid") {
                     out.push(HostToApp::LoadError { id: id.clone(), url: b.history[b.pos].clone(), code: -105, kind: "dns".into() });
                 }
+                self.loaded(&id, out);
+                self.frame(&id, out);
+                let url_now = self.browsers.get(&id).map(|b| b.history[b.pos].clone()).unwrap_or_default();
                 // `?permission=camera,microphone`: the page asks once, as a real page would.
-                if let Some(kinds) = b.history[b.pos].split_once("permission=").map(|(_, k)| k.split(['&', '#']).next().unwrap_or("")) {
-                    let origin = b.history[b.pos].split_once("://").map(|(scheme, r)| format!("{scheme}://{}", r.split(['/', '?', '#']).next().unwrap_or(""))).unwrap_or_default();
+                if let Some(kinds) = url_now.split_once("permission=").map(|(_, k)| k.split(['&', '#']).next().unwrap_or("")) {
+                    let origin = url_now.split_once("://").map(|(scheme, r)| format!("{scheme}://{}", r.split(['/', '?', '#']).next().unwrap_or(""))).unwrap_or_default();
                     static REQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                     let req = REQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                     out.push(HostToApp::Permission { id: id.clone(), req, origin, kinds: kinds.split(',').map(str::to_owned).collect() });
                 }
-                self.loaded(&id, out);
-                self.frame(&id, out);
             }
             M::Back { .. } | M::Forward { .. } => {
                 let back = matches!(msg, M::Back { .. });

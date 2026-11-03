@@ -22,7 +22,7 @@ fn answer(p: &mut Page, allow: bool, remember: bool) {
 /// The stub echoes what the app sent it, so the answer can be read back.
 fn answered(p: &mut Page, allow: bool) -> bool {
     let want = format!("\"allow\":{allow}");
-    p.wait(Duration::from_secs(10), |p| p.console().iter().any(|l| l.contains("PermissionResult") && l.contains(&want)))
+    p.wait(Duration::from_secs(10), |p| p.console().iter().any(|l| l.contains("permission_result") && l.contains(&want)))
 }
 
 fn main() {

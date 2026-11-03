@@ -681,9 +681,9 @@ wrap_permission_handler! {
         id: String,
     }
 
-    /// `requesting_origin` is CEF's security origin of the requesting frame, never page text.
-    /// v1 asks only for camera, microphone, geolocation and clipboard-read; any request with
-    /// another kind (screen, notifications, midi, ...) is denied without a prompt.
+    // `requesting_origin` is CEF's security origin of the requesting frame, never page text.
+    // v1 asks only for camera, microphone, geolocation and clipboard-read; any request with
+    // another kind (screen, notifications, midi, ...) is denied without a prompt.
     impl PermissionHandler {
         fn on_request_media_access_permission(&self, _browser: Option<&mut Browser>, _frame: Option<&mut Frame>, requesting_origin: Option<&CefString>, requested_permissions: u32, callback: Option<&mut MediaAccessCallback>) -> ::std::os::raw::c_int {
             let Some(cb) = callback else { return 0 };
