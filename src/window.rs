@@ -2994,6 +2994,13 @@ impl AppWindow {
             // HERDR: browser block. The + menu's Remote desktop: the labs bridge prints one url with a
             // one-time token; it opens in a new browser block with raw chords on. The person's
             // explicit source for raw chords; agents can't run it (their browser.* go to the agent).
+            // HERDR: browser block. The person's own browser (+ menu, cmd-shift-b, the pane menu): their
+            // profile, raw chords off; a new tab, or right/down of `pane` (else the focused pane).
+            "browser.new" => {
+                if let Err(e) = self.open_person_browser(a) {
+                    return self.fail(e);
+                }
+            }
             "browser.remote" => self.open_remote_desktop(Self::arg(a, "machine").map(str::to_owned), window, cx),
             "layout.set" if shipped_layouts().contains(&self.layout_name.as_str()) => {
                 let n = match serde_json::from_value::<Node>(a.get("layout").cloned().unwrap_or_default()) {
@@ -3432,6 +3439,14 @@ impl AppWindow {
             Request::CloseOverlay { id } => self.close_overlay(&id, window, cx),
             Request::Refresh => self.refresh_mods(cx),
             // HERDR: browser block. `browser.*` may answer later (eval, screenshot): the reply goes with it.
+            // browser.new is the person's command, not the agent's: it answers the new pane's id.
+            Request::Control { cmd, reply } if cmd.get("do").and_then(Value::as_str) == Some("browser.new") => {
+                let r = self.open_person_browser(cmd.get("args").unwrap_or(&json!({})));
+                let _ = reply.send(r.unwrap_or_else(|error| json!({ "error": error })));
+                self.flush_documents(false, window, cx);
+                self.sync(window, cx);
+                cx.notify();
+            }
             Request::Control { cmd, reply } if cmd.get("do").and_then(Value::as_str).is_some_and(|n| n.starts_with("browser.")) => {
                 let name = cmd["do"].as_str().unwrap_or_default().to_owned();
                 let args = cmd.get("args").cloned().unwrap_or(json!({}));
@@ -4017,6 +4032,18 @@ impl AppWindow {
             });
         })
         .detach();
+    }
+
+    // HERDR: browser block. The person's browser (browser.new): their profile, raw chords off; a new
+    // tab, or right/down of `pane` (else the focused pane).
+    fn open_person_browser(&mut self, a: &Value) -> Result<Value, String> {
+        if let Some(pane) = Self::arg(a, "pane") {
+            if self.model.tab_of(pane).is_none() {
+                return Err(format!("no pane {pane:?}"));
+            }
+            self.model.focus_pane(pane);
+        }
+        self.open_browser(person_browser(Self::arg(a, "url")), Self::arg(a, "place"))
     }
 
     // HERDR: browser block. A browser pane: a new tab (default) or beside the focused pane.
@@ -4773,6 +4800,13 @@ impl Render for AppWindow {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn the_persons_browser_uses_their_profile_with_raw_chords_off() {
+        let b = super::person_browser(Some("https://example.test/"));
+        assert_eq!((b.url.as_str(), b.profile.as_str(), b.raw_chords, b.launch_url.is_none()), ("https://example.test/", "default", false, true));
+        assert_eq!(super::person_browser(None).url, "");
+    }
+
+    #[test]
     fn the_remote_desktop_bridge_url_is_read_and_its_token_never_reaches_an_error() {
         let dir = std::env::temp_dir().join(format!("hrd-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -5022,6 +5056,11 @@ mod tests {
         assert!(!super::adoptable(&record("live"), "sp1", Some("tb2"), None));
     }
 
+}
+
+// HERDR: browser block. The person's own browser: their cookies and logins, keys as in any app.
+fn person_browser(url: Option<&str>) -> crate::layout::BrowserBlock {
+    crate::layout::BrowserBlock { url: url.unwrap_or_default().to_owned(), profile: "default".into(), ..Default::default() }
 }
 
 /// HERDR: browser block. The bridge's one url (`http://127.0.0.1:<port>/?token=..&machine=..`):

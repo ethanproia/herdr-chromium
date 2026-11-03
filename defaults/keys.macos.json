@@ -20,6 +20,7 @@
     "cmd-,": "app.settings",
     "cmd-d": "pane.split:right",
     "cmd-shift-d": "pane.split:down",
+    "cmd-shift-b": "browser.new",
     "cmd-shift-w": "pane.close",
     "cmd-shift-enter": "pane.zoom",
     "cmd-alt-left": "pane.go:left",
