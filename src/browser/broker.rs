@@ -4,8 +4,10 @@
 //! agents on `$HERDR_APP_HOME/browser/agent.sock` (0600, in a 0700 dir) to callers that show the token in
 //! `browser/broker.token` (0600). Clients name browser blocks, never targets or sessions: the broker
 //! attaches one flatten session per block and refuses browser-level and profile methods outright.
-//! The finer per-block grants (control, cdp, capture), the method allow-list and redaction are applied by
-//! the agent tools on top (scripts/herdr-browser), which are the broker's only expected client.
+//! The person's per-block grants are enforced here, in the app, on every call and every event
+//! (`needs`, `Authorize`): Control to drive a block the person opened, Cdp for network events, Capture
+//! for screenshots of a page marked sensitive. Methods outside `ALLOWED` are refused (default deny).
+//! The agent tools (scripts/herdr-browser) add redaction on top but are not a trust source.
 //!
 //! Wire: newline JSON. First line `{"token": "..."}` (anything else closes the connection). Then
 //! `{"id": n, "block": "<block id>", "method": "...", "params": {...}}`, answered
@@ -26,6 +28,48 @@ use std::time::Duration;
 pub type PipeNow = Arc<dyn Fn() -> Option<Arc<CdpPipe>> + Send + Sync>;
 /// The CDP target that shows a block (from `HostToApp::CdpTarget`).
 pub type TargetOf = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+/// The app's grant check for (block, method): Err is the refusal the agent sees. Asked before every
+/// call and before forwarding every event, so revoking a grant or closing the block stops both.
+pub type Authorize = Arc<dyn Fn(&str, &str) -> Result<(), String> + Send + Sync>;
+
+/// The methods agents may call at all (what the agent tools use); anything else is refused.
+const ALLOWED: &[&str] = &[
+    "Runtime.evaluate", "Runtime.callFunctionOn", "Runtime.getProperties", "Runtime.releaseObject", "Runtime.enable",
+    "Page.captureScreenshot", "Page.getLayoutMetrics", "Page.getFrameTree", "Page.reload", "Page.navigate", "Page.enable",
+    "Emulation.setDeviceMetricsOverride", "Emulation.clearDeviceMetricsOverride", "Emulation.setEmulatedMedia",
+    "Target.getTargetInfo", "Input.dispatchMouseEvent", "Input.dispatchKeyEvent", "Input.dispatchTouchEvent", "Input.insertText",
+    "Network.enable", "Network.disable",
+];
+/// Whole read-only inspection domains the agent tools use.
+const ALLOWED_DOMAINS: &[&str] = &["DOM.", "CSS.", "Accessibility.", "Overlay.", "DOMSnapshot.", "Animation.", "Performance.", "Log.", "Debugger."];
+/// Never, even inside an allowed domain: handing the page local files.
+const NEVER: &[&str] = &["DOM.setFileInputFiles", "Page.setInterceptFileChooserDialog"];
+
+/// What the person must have granted for the call `method` on a block they opened (agent-opened
+/// blocks skip Control): Err when no grant allows it. Events are checked by `event_gate`.
+pub fn needs(method: &str, sensitive: bool) -> Result<Vec<super::agent::Grant>, String> {
+    use super::agent::Grant;
+    if refused(method) || NEVER.contains(&method) {
+        return Err(format!("{method} is not available to agents"));
+    }
+    if !(ALLOWED.contains(&method) || ALLOWED_DOMAINS.iter().any(|d| method.starts_with(d))) {
+        return Err(format!("{method} is not available to agents"));
+    }
+    if method.starts_with("Network.") {
+        // Network events carry request headers (cookies, tokens): raw CDP.
+        return Ok(vec![Grant::Control, Grant::Cdp]);
+    }
+    if method == "Page.captureScreenshot" && sensitive {
+        return Ok(vec![Grant::Control, Grant::Capture]);
+    }
+    Ok(vec![Grant::Control])
+}
+
+/// The call whose grants an event needs: network events as `Network.enable` (Cdp), the rest as
+/// driving the page (Control).
+pub fn event_gate(event: &str) -> &'static str {
+    if event.starts_with("Network.") { "Network.enable" } else { "Runtime.evaluate" }
+}
 
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -45,6 +89,7 @@ pub struct Broker {
     token: String,
     pipe: PipeNow,
     target_of: TargetOf,
+    authorize: Authorize,
     /// block -> (target, session, the pipe it was attached on)
     sessions: Mutex<HashMap<BrowserId, (String, String, usize)>>,
 }
@@ -59,7 +104,7 @@ impl Broker {
     }
 
     /// Writes a fresh token, binds the socket (owner-only) and serves it on a thread.
-    pub fn start(dir: PathBuf, pipe: PipeNow, target_of: TargetOf) -> std::io::Result<Arc<Broker>> {
+    pub fn start(dir: PathBuf, pipe: PipeNow, target_of: TargetOf, authorize: Authorize) -> std::io::Result<Arc<Broker>> {
         use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
         std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
@@ -73,7 +118,7 @@ impl Broker {
         let _ = std::fs::remove_file(&sock);
         let listener = UnixListener::bind(&sock)?;
         std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))?;
-        let broker = Arc::new(Broker { dir, token, pipe, target_of, sessions: Mutex::new(HashMap::new()) });
+        let broker = Arc::new(Broker { dir, token, pipe, target_of, authorize, sessions: Mutex::new(HashMap::new()) });
         let b = broker.clone();
         std::thread::Builder::new().name("herdr-browser-broker".into()).spawn(move || {
             for stream in listener.incoming().flatten() {
@@ -127,17 +172,29 @@ impl Broker {
             return Err(format!("{method} is not available to agents"));
         }
         let block = req["block"].as_str().ok_or("no block")?;
+        // The person's grants, checked in the app before anything reaches the page.
+        (self.authorize)(block, method)?;
         let pipe = (self.pipe)().filter(|p| !p.is_dead()).ok_or("no browser host is running")?;
         let session = self.session(block, &pipe)?;
         // The first use of a block on this connection: its events follow.
         if watched.lock().unwrap().insert(block.to_owned()) {
             let (rx, out, block) = (pipe.subscribe(Some(&session)), out.clone(), block.to_owned());
+            let (authorize, watched) = (self.authorize.clone(), watched.clone());
             std::thread::spawn(move || {
                 for ev in rx {
+                    let method = ev["method"].as_str().unwrap_or("");
+                    match authorize(&block, event_gate(method)) {
+                        Ok(()) => {}
+                        // This event's class isn't granted (network without Cdp): skip it.
+                        Err(_) if authorize(&block, "Runtime.evaluate").is_ok() => continue,
+                        // Control revoked or the block closed: this connection stops hearing it.
+                        Err(_) => break,
+                    }
                     if !send(&out, &json!({ "block": block, "method": ev["method"], "params": ev["params"] })) {
                         break;
                     }
                 }
+                watched.lock().unwrap().remove(&block);
             });
         }
         pipe.call(Some(&session), method, req["params"].clone(), CALL_TIMEOUT)
@@ -180,6 +237,66 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_method_table_defaults_to_deny() {
+        use crate::browser::agent::Grant::*;
+        assert_eq!(needs("Runtime.evaluate", false), Ok(vec![Control]));
+        assert_eq!(needs("Input.dispatchKeyEvent", false), Ok(vec![Control]));
+        assert_eq!(needs("Page.captureScreenshot", false), Ok(vec![Control]));
+        assert_eq!(needs("Page.captureScreenshot", true), Ok(vec![Control, Capture]));
+        assert_eq!(needs("Network.enable", false), Ok(vec![Control, Cdp]));
+        assert_eq!(needs(event_gate("Network.requestWillBeSent"), false), Ok(vec![Control, Cdp]), "network events need Cdp");
+        assert_eq!(needs(event_gate("Page.loadEventFired"), false), Ok(vec![Control]));
+        for m in ["DOM.setFileInputFiles", "Page.setInterceptFileChooserDialog", "Fetch.enable", "Page.printToPDF", "Runtime.compileScript", "Network.getResponseBody", "Security.setIgnoreCertificateErrors", "Storage.getCookies", "Target.createTarget"] {
+            assert!(needs(m, false).is_err(), "{m} must be refused");
+        }
+    }
+
+    /// The real app gate over agent.sock with a real token: a block the person opened, every shield
+    /// toggle off, refuses eval, input, screenshots and network subscription; the same block with
+    /// Control on gets through to the (absent) host; an agent-opened block needs no Control.
+    #[test]
+    fn a_persons_block_with_grants_off_refuses_everything_through_the_socket() {
+        use crate::browser::agent::{Agent, Grant};
+        use crate::browser::BrowserState;
+        let dir = PathBuf::from(format!("/tmp/hbg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let agent = Arc::new(Mutex::new(Agent::new(dir.clone())));
+        let states: Arc<Mutex<HashMap<BrowserId, BrowserState>>> = Default::default();
+        states.lock().unwrap().insert("mine".into(), BrowserState { profile: "default".into(), ..Default::default() });
+        states.lock().unwrap().insert("theirs".into(), BrowserState { profile: "agent".into(), ..Default::default() });
+        let auth = crate::browser::view::broker_authorizer(agent.clone(), states.clone());
+        let b = Broker::start(dir.clone(), Arc::new(|| None), Arc::new(|_| Some("T".into())), auth).unwrap();
+        let token = std::fs::read_to_string(Broker::token_file(&dir)).unwrap();
+        let mut s = UnixStream::connect(Broker::socket(&dir)).unwrap();
+        line(&mut s, json!({ "token": token }));
+        let ask = |s: &mut UnixStream, id: u64, block: &str, method: &str| {
+            line(s, json!({ "id": id, "block": block, "method": method, "params": {} }));
+            read(s).unwrap()["error"].as_str().unwrap_or("").to_string()
+        };
+        for (i, m) in ["Runtime.evaluate", "Input.dispatchMouseEvent", "Input.insertText", "Page.captureScreenshot", "Network.enable", "Page.enable", "DOM.getDocument"].iter().enumerate() {
+            let e = ask(&mut s, i as u64, "mine", m);
+            assert!(e.contains("hasn't allowed agents to drive"), "{m}: {e}");
+        }
+        // An unknown block (closed, or never there) is refused, not passed through.
+        assert!(ask(&mut s, 20, "gone", "Runtime.evaluate").contains("no browser block"));
+        // Control on: drive passes the gate (and only then meets the absent host); network still needs Cdp.
+        agent.lock().unwrap().grants.set(&"mine".into(), Grant::Control, true);
+        assert_eq!(ask(&mut s, 21, "mine", "Runtime.evaluate"), "no browser host is running");
+        assert!(ask(&mut s, 22, "mine", "Network.enable").contains("raw CDP"));
+        // Sensitive: a screenshot needs Capture too.
+        agent.lock().unwrap().grants.set(&"mine".into(), Grant::Sensitive, true);
+        assert!(ask(&mut s, 23, "mine", "Page.captureScreenshot").contains("sensitive"));
+        // Revoked: refused again at once.
+        agent.lock().unwrap().grants.set(&"mine".into(), Grant::Control, false);
+        assert!(ask(&mut s, 24, "mine", "Runtime.evaluate").contains("hasn't allowed"));
+        // The agent's own block needs no Control, but file upload is never allowed.
+        assert_eq!(ask(&mut s, 25, "theirs", "Runtime.evaluate"), "no browser host is running");
+        assert!(ask(&mut s, 26, "theirs", "DOM.setFileInputFiles").contains("not available"));
+        drop(b);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn line(s: &mut UnixStream, v: Value) {
         s.write_all(format!("{v}\n").as_bytes()).unwrap();
     }
@@ -196,7 +313,7 @@ mod tests {
         // Short: macOS caps socket paths at 103 bytes.
         let dir = PathBuf::from(format!("/tmp/hbb-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let b = Broker::start(dir.clone(), Arc::new(|| None), Arc::new(|_| Some("T".into()))).unwrap();
+        let b = Broker::start(dir.clone(), Arc::new(|| None), Arc::new(|_| Some("T".into())), Arc::new(|_, _| Ok(()))).unwrap();
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!((mode(&dir), mode(&Broker::socket(&dir)), mode(&Broker::token_file(&dir))), (0o700, 0o600, 0o600));
         let token = std::fs::read_to_string(Broker::token_file(&dir)).unwrap();

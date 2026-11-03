@@ -2611,6 +2611,15 @@ fn bind_keys(cx: &mut App) {
     }
 }
 
+/// The broker's grant check: the agent's grants and the block's profile, read fresh on every call
+/// and event, so a revoked grant or a closed block takes effect at once.
+pub fn broker_authorizer(agent: Arc<Mutex<Agent>>, states: Arc<Mutex<HashMap<BrowserId, BrowserState>>>) -> super::broker::Authorize {
+    Arc::new(move |block: &str, method: &str| {
+        let profile = states.lock().unwrap().get(block).map(|s| s.profile.clone());
+        agent.lock().unwrap().broker_allowed(&block.to_string(), method, profile.as_deref())
+    })
+}
+
 /// One `BrowserView` per browser block in the layouts. A view lives while its block does (shown
 /// or not: a hidden tab keeps its page); the host page is made at the block's first paint.
 #[derive(Default)]
@@ -2644,7 +2653,7 @@ impl Browsers {
             // HERDR: part 5. CDP on the app's pipe: agents reach it only through the broker (agent.sock + token).
             if cdp_pipe_wanted() {
                 let (l, ag) = (link.clone(), agent.clone());
-                let started = super::broker::Broker::start(link.config().dir.clone(), Arc::new(move || l.cdp()), Arc::new(move |b| ag.lock().unwrap().cdp.target_of(b)));
+                let started = super::broker::Broker::start(link.config().dir.clone(), Arc::new(move || l.cdp()), Arc::new(move |b| ag.lock().unwrap().cdp.target_of(b)), broker_authorizer(agent.clone(), self.states.clone()));
                 if let Err(e) = started {
                     tracing::warn!("the browser broker did not start: {e}");
                 }
