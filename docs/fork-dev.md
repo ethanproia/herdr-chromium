@@ -168,7 +168,7 @@ Bundled now: `fork-core` (with its tool descriptors in `tools/`),
 `clones/mac/`), `fork-notepad` (a tab; notes live in
 `~/Notes`, the real home folder, not the Herdr home), `fork-board` (an
 overlay; `cmd-shift-y`, `ctrl-shift-y` elsewhere; runs `cp`, `mkdir`, `open`,
-`osascript`, `qlmanage`, `rm`, `sips`; cache in `data/herdr-board`). The new
+`osascript`, `qlmanage`, `rm`, `sh` (ffmpeg), `sips`; cache in `data/herdr-board`). The new
 menu has Notepad and Board rows. Their keys are in `defaults/keys*.json`, so
 only homes without a keys.json get them (existing homes add them by hand).
 `remote-desktop` is pinned but not shipped (it duplicates `browser.remote`).
