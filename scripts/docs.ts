@@ -48,20 +48,29 @@ function shellCommands(source: string): string[][] {
 export function checkExample(source: string, ref: Reference): string[] {
   const errors: string[] = [];
   const verbs = new Set([...ref.help.matchAll(/^\s+herdr-app\s+([\w-]+)/gm)].map(m => m[1]));
+  // A verb's own flags are the ones its usage line names (`herdr-app render --layout <file>`).
+  const verbFlags = (verb: string) => new Set([...ref.help.matchAll(new RegExp(`^\\s+herdr-app\\s+${verb}\\b(.*)$`, "gm"))].flatMap(m => m[1].match(/--[\w-]+/g) ?? []));
   verbs.add("--help"); // The help used to build this reference was obtained with this flag.
   for (const words of shellCommands(source)) {
-    const start = words.findIndex(w => /^(?:\.\/|[\w./-]+\/)?herdr-app(?:\.exe)?$/.test(w));
+    // `cargo test --bin herdr-app ...` names a build target, not a run of the app.
+    const start = words.findIndex((w, i) => /^(?:\.\/|[\w./-]+\/)?herdr-app(?:\.exe)?$/.test(w) && !["--bin", "-p", "--package"].includes(words[i - 1]));
     if (start < 0) continue;
     const args = words.slice(start + 1);
     const verb = args.shift();
     if (!verb) continue;
     if (!verbs.has(verb)) { errors.push(`unknown command or flag: ${verb}`); continue; }
     if (verb !== "do") {
-      for (const arg of args) if (arg.startsWith("-")) errors.push(`unknown flag for ${verb}: ${arg}`);
+      const own = verbFlags(verb);
+      for (const arg of args) if (arg.startsWith("-") && !own.has(arg)) errors.push(`unknown flag for ${verb}: ${arg}`);
       continue;
     }
     const name = args.shift();
     if (!name || name.startsWith("<")) continue;
+    // `browser.*` names a family: at least one command must start with `browser.`.
+    if (name.endsWith(".*")) {
+      if (!ref.commands.some(c => c.name.startsWith(name.slice(0, -1)))) errors.push(`unknown app command: ${name}`);
+      continue;
+    }
     const command = ref.commands.find(c => c.name === name);
     if (!command) { errors.push(`unknown app command: ${name}`); continue; }
     if (args.length === 1 && args[0].trimStart().startsWith("{")) continue;
