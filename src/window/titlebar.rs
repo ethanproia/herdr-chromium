@@ -40,6 +40,13 @@ impl AppWindow {
 
     /// Makes the window match the shown layout's title bar. Cheap; runs on every render.
     pub(super) fn apply_titlebar(&mut self, window: &mut Window) {
+        // HERDR: glass blurs what's behind the window (macOS); off, the window is opaque.
+        let glass = cfg!(target_os = "macos") && crate::settings::get().glass;
+        // Off from the start leaves the window as it opened (opaque), untouched.
+        if self.glass_applied.unwrap_or(false) != glass {
+            self.glass_applied = Some(glass);
+            window.set_background_appearance(if glass { WindowBackgroundAppearance::Blurred } else { WindowBackgroundAppearance::Opaque });
+        }
         let want = (self.titlebar(), self.chrome.traffic_lights);
         if self.titlebar_applied == Some(want) {
             return;
