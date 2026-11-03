@@ -129,21 +129,45 @@ pub fn pick_message(id: &str, req: u64, x: f32, y: f32) -> Vec<u8> {
     let js = format!(
         "(()=>{{const X={x},Y={y};let el=document.elementFromPoint(X,Y);if(!el)return{{ok:false}};\
          while(el.shadowRoot){{const inner=el.shadowRoot.elementFromPoint(X,Y);if(!inner||inner===el)break;el=inner}}\
-         const root=el.getRootNode(),esc=s=>CSS.escape(s);\
-         const one=s=>{{try{{return root.querySelectorAll(s).length===1}}catch(e){{return false}}}};\
+         {PICK_DESCRIBE}}})()"
+    );
+    evaluate(id, req, Op::Pick, &js)
+}
+
+// HERDR: what both picks report for the element `el`: a selector that matches only it, a label
+// (never a field's value or a password) and its box. Plain JS, inserted after `el` is chosen.
+const PICK_DESCRIBE: &str = "const root=el.getRootNode(),esc=s=>CSS.escape(s);\
+         const one=s=>{try{return root.querySelectorAll(s).length===1}catch(e){return false}};\
          let selector=null;if(el.id&&one('#'+esc(el.id)))selector='#'+esc(el.id);\
-         else{{const parts=[];let n=el;while(n&&n.nodeType===1){{\
-           if(n!==el&&n.id&&one('#'+esc(n.id))){{parts.unshift('#'+esc(n.id));if(one(parts.join(' > '))){{selector=parts.join(' > ')}};break}}\
+         else{const parts=[];let n=el;while(n&&n.nodeType===1){\
+           if(n!==el&&n.id&&one('#'+esc(n.id))){parts.unshift('#'+esc(n.id));if(one(parts.join(' > '))){selector=parts.join(' > ')};break}\
            let p=n.tagName.toLowerCase()+[...n.classList].slice(0,2).map(c=>'.'+esc(c)).join('');\
-           const par=n.parentElement;if(par){{const same=[...par.children].filter(c=>c.tagName===n.tagName);if(same.length>1)p+=':nth-of-type('+(same.indexOf(n)+1)+')'}}\
-           parts.unshift(p);if(one(parts.join(' > '))){{selector=parts.join(' > ');break}}n=par}}\
-           if(!selector)selector=parts.join(' > ')}}\
+           const par=n.parentElement;if(par){const same=[...par.children].filter(c=>c.tagName===n.tagName);if(same.length>1)p+=':nth-of-type('+(same.indexOf(n)+1)+')'}\
+           parts.unshift(p);if(one(parts.join(' > '))){selector=parts.join(' > ');break}n=par}\
+           if(!selector)selector=parts.join(' > ')}\
          const tag=el.tagName.toLowerCase(),field=/^(input|textarea|select|option)$/.test(tag)||el.isContentEditable;\
-         let t='';if(!(tag==='input'&&(el.type||'').toLowerCase()==='password')){{\
-           t=el.getAttribute('aria-label')||el.getAttribute('alt')||(field?'':[...el.childNodes].filter(c=>c.nodeType===3).map(c=>c.textContent).join(' '))}}\
+         let t='';if(!(tag==='input'&&(el.type||'').toLowerCase()==='password')){\
+           t=el.getAttribute('aria-label')||el.getAttribute('alt')||(field?'':[...el.childNodes].filter(c=>c.nodeType===3).map(c=>c.textContent).join(' '))}\
          t=t.replace(/\\s+/g,' ').trim().slice(0,30);\
          const label=tag==='input'&&(el.type||'').toLowerCase()==='password'?'':(t?tag+' '+t:tag);\
-         const r=el.getBoundingClientRect();return{{ok:true,selector,label,rect:{{x:r.x,y:r.y,w:r.width,h:r.height}}}}}})()"
+         const r=el.getBoundingClientRect();return{ok:true,selector,label,rect:{x:r.x,y:r.y,w:r.width,h:r.height}}";
+
+/// `PickRelative`: step from the element `from` matches to its parent, first element child, or
+/// previous / next element sibling (a shadow host's children are its shadow root's; the parent of
+/// a shadow root's child is its host; never above <body>), then describe it like `PickInfo`.
+/// `from` is looked up in the document, so a pick inside a shadow root cannot be stepped from (ok false).
+pub fn pick_relative_message(id: &str, req: u64, from: &str, step: herdr_browser_protocol::PickStep) -> Vec<u8> {
+    use herdr_browser_protocol::PickStep as S;
+    let from = serde_json::to_string(from).expect("encodes");
+    let step = match step {
+        S::Parent => "let n=el.parentElement||(el.getRootNode() instanceof ShadowRoot?el.getRootNode().host:null);if(n===document.documentElement)n=null;",
+        S::Child => "const kids=el.shadowRoot?el.shadowRoot.children:el.children;let n=kids.length?kids[0]:null;",
+        S::Prev => "let n=el.previousElementSibling;",
+        S::Next => "let n=el.nextElementSibling;",
+    };
+    let js = format!(
+        "(()=>{{let el=null;try{{el=document.querySelector({from})}}catch(e){{}}if(!el)return{{ok:false}};\
+         {step}if(!n)return{{ok:false}};el=n;{PICK_DESCRIBE}}})()"
     );
     evaluate(id, req, Op::Pick, &js)
 }

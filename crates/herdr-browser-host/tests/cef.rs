@@ -666,6 +666,50 @@ fn pick_info_describes_the_element_under_a_point() {
     h.shutdown();
 }
 
+// HERDR: arrow keys while picking walk the DOM from the current pick.
+fn step(h: &mut Host, req: u64, from: &str, step: herdr_browser_protocol::PickStep) -> (bool, String, String, CssRect) {
+    h.send(AppToHost::PickRelative { id: "b1".into(), req, from: from.into(), step });
+    match h.until(10 * SEC, |m| matches!(m, HostToApp::PickInfoResult { req: r, .. } if *r == req)) {
+        HostToApp::PickInfoResult { ok, selector, label, rect, .. } => (ok, selector, label, rect),
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn pick_relative_steps_to_parent_child_and_siblings() {
+    use herdr_browser_protocol::PickStep::*;
+    if real_host().is_none() {
+        return;
+    }
+    let p = pages();
+    let mut h = Host::start("cef-pick-step");
+    create(&mut h, "b1", &p.url("pick"), 400.0, 250.0, 1.0);
+    loaded(&mut h);
+    assert!(h.eval("b1", 1, "1").0);
+    let four = pick(&mut h, 10, 220.0, 70.0 + 15.0);
+    assert!(four.0 && four.2 == "p four", "{four:?}");
+    let t0 = std::time::Instant::now();
+    let card = step(&mut h, 11, &four.1, Parent);
+    println!("METRIC pick_step_ms={}", t0.elapsed().as_millis());
+    assert!(card.0 && card.2 == "div" && (card.3.x, card.3.y, card.3.w) == (200.0, 60.0, 150.0), "{card:?}");
+    let three = step(&mut h, 12, &card.1, Child);
+    assert!(three.0 && three.2 == "p three", "{three:?}");
+    let back = step(&mut h, 13, &three.1, Next);
+    assert!(back.0 && back.2 == "p four" && back.1 == four.1, "{back:?}");
+    assert!(step(&mut h, 14, &three.1, Prev).0 == false, "no element before the first p");
+    assert!(step(&mut h, 15, &four.1, Next).0 == false, "none after the last p");
+    let body = step(&mut h, 16, &card.1, Parent);
+    assert!(body.0 && body.2 == "body", "{body:?}");
+    assert!(!step(&mut h, 17, &body.1, Parent).0, "never above <body>");
+    assert!(!step(&mut h, 18, "#gone", Parent).0, "a selector that no longer matches");
+    // A hostile `from` is data: JSON-encoded into the script, never spliced into its source.
+    let hostile = "#go\"]');window.pwned=1;//</script><script>window.pwned=2</script>\\'`${window.pwned=3}`";
+    assert!(!step(&mut h, 19, hostile, Parent).0, "an invalid selector is ok:false");
+    let (ok, pwned) = h.eval("b1", 20, "typeof window.pwned");
+    assert!(ok && pwned == serde_json::json!("undefined"), "nothing from the selector ran: {pwned}");
+    h.shutdown();
+}
+
 /// Probe (docs/browser-cdp-pipe.md step 1): the host bundle, given fds 3/4 and Hello.cdp_pipe,
 /// answers CDP Browser.getVersion over the pipe (NUL-framed JSON) and listens on no TCP port.
 #[test]
