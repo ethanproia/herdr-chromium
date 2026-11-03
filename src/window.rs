@@ -3693,13 +3693,12 @@ impl AppWindow {
                     let _ = reply.send(r.unwrap_or_else(|error| json!({ "error": error })));
                 }), window, cx);
             }
-            // HERDR: a headless window is never asked to display, so its picture stays the first
-            // frame ("Loading..."): draw it now, outside this view's update, then take the shot.
-            Request::Control { cmd, reply } if crate::control::headless() && cmd.get("shot").and_then(Value::as_str).is_some() => {
+            // HERDR: every window shot is drawn outside this view's update (a headless window is never
+            // asked to display, and a masked draw covers sensitive pages), then saved to a new private file.
+            Request::Control { cmd, reply } if cmd.get("shot").and_then(Value::as_str).is_some() => {
                 let path = PathBuf::from(cmd["shot"].as_str().unwrap_or_default());
                 window.defer(cx, move |window, cx| {
-                    window.draw(cx).clear(cx);
-                    let _ = reply.send(match crate::control::save_shot(window, &path) {
+                    let _ = reply.send(match crate::control::masked_shot(window, cx, &path) {
                         Ok(()) => json!({ "path": path }),
                         Err(error) => json!({ "error": format!("cannot save screenshot: {error:#}") }),
                     });
@@ -3715,12 +3714,6 @@ impl AppWindow {
         if let Some(name) = cmd.get("do").and_then(Value::as_str) {
             let args = cmd.get("args").cloned().unwrap_or(Value::Null);
             return self.run_as(name, args, false, window, cx);
-        }
-        if let Some(path) = cmd.get("shot").and_then(Value::as_str) {
-            return match crate::control::save_shot(window, std::path::Path::new(path)) {
-                Ok(()) => json!({ "path": path }),
-                Err(error) => json!({ "error": format!("cannot save screenshot: {error:#}") }),
-            };
         }
         if cmd.get("commands").is_some() {
             return crate::commands::listing();
