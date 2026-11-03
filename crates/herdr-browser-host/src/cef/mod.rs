@@ -986,7 +986,7 @@ fn browser_msg(m: AppToHost) {
         M::Navigate { id, .. } | M::Back { id } | M::Forward { id } | M::Reload { id, .. } | M::Stop { id } | M::Resize { id, .. }
         | M::Focus { id, .. } | M::SetZoom { id, .. } | M::Input { id, .. } | M::Edit { id, .. } | M::Find { id, .. } | M::StopFind { id, .. }
         | M::DevTools { id, .. } | M::Eval { id, .. } | M::Overlay { id, .. } | M::PickInfo { id, .. } | M::PickRelative { id, .. } | M::Styles { id, .. } | M::SetStyle { id, .. } | M::RevertStyle { id, .. } | M::SetVisible { id, .. } => id.clone(),
-        other => {
+        _ => {
             debug(format_args!("not a browser message, dropped"));
             return;
         }
