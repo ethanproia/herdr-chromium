@@ -4784,6 +4784,8 @@ impl<M: InputModeKind> Render for InputBaseState<M> {
             .id("input-state")
             .key_context(CONTEXT)
             .track_focus(&self.focus_handle)
+            // HERDR: a released key is no longer held (the key hook's auto-repeat flag).
+            .capture_key_up(cx.listener(|s, ev: &gpui::KeyUpEvent, _, _| s.held_keys.retain(|k| *k != ev.keystroke.key)))
             .when(self.is_editable(), |this| {
                 this.on_action(window.listener_for(&entity, InputBaseState::backspace))
                     .on_action(window.listener_for(&entity, InputBaseState::delete))

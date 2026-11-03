@@ -3025,14 +3025,6 @@ impl<M: InputModeKind> Element for TextElement<M> {
         let bounds = prepaint.bounds;
         let text_align = prepaint.last_layout.text_align;
 
-        // HERDR: a released key is no longer held (the key hook's auto-repeat flag).
-        {
-            let state = self.state.clone();
-            window.on_key_event(move |ev: &gpui::KeyUpEvent, _, _, cx| {
-                state.update(cx, |s, _| s.held_keys.retain(|k| *k != ev.keystroke.key));
-            });
-        }
-
         window.handle_input(
             &focus_handle,
             ElementInputHandler::new(bounds, self.state.clone()),
