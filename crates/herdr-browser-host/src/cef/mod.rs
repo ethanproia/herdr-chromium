@@ -73,6 +73,8 @@ pub(crate) struct Host {
     dialogs: HashMap<u64, JsdialogCallback>,
     choosers: HashMap<u64, FileDialogCallback>,
     menus: HashMap<u64, (String, RunContextMenuCallback)>,
+    /// Permission requests waiting on the person: req -> (browser, callback, asked at).
+    perms: HashMap<u64, (String, PermCb, std::time::Instant)>,
     quit: bool,
     /// The Hello profile root; named profiles live in folders under it.
     root: PathBuf,
@@ -187,6 +189,43 @@ pub(crate) fn keep_dialog(req: u64, cb: JsdialogCallback) {
 /// Hold browser `id`'s context-menu callback until the app answers `MenuResult` for `req`.
 pub(crate) fn keep_menu(id: &str, req: u64, cb: RunContextMenuCallback) {
     with_host(|h| h.menus.insert(req, (id.to_string(), cb)));
+}
+
+/// A waiting permission request's CEF callback: a media request answers with the allowed bits.
+pub(crate) enum PermCb {
+    Media(MediaAccessCallback, u32),
+    Prompt(PermissionPromptCallback),
+}
+
+impl PermCb {
+    fn answer(self, allow: bool) {
+        match self {
+            PermCb::Media(cb, mask) if allow => cb.cont(mask),
+            PermCb::Media(cb, _) => cb.cancel(),
+            PermCb::Prompt(cb) => cb.cont(if allow { PermissionRequestResult::from(sys::cef_permission_request_result_t::CEF_PERMISSION_RESULT_ACCEPT) } else { PermissionRequestResult::from(sys::cef_permission_request_result_t::CEF_PERMISSION_RESULT_DENY) }),
+        }
+    }
+}
+
+/// How long a permission request waits for the person before the host denies it.
+const PERMISSION_WAIT: Duration = Duration::from_secs(60);
+
+pub(crate) fn keep_permission(id: &str, req: u64, cb: PermCb) {
+    with_host(|h| h.perms.insert(req, (id.to_string(), cb, std::time::Instant::now())));
+}
+
+/// Deny every waiting request of browser `id` (it closed or left the page); all of them when None
+/// is given with `expired_only`, the ones older than PERMISSION_WAIT.
+pub(crate) fn deny_permissions(id: Option<&str>, expired_only: bool) {
+    let gone: Vec<PermCb> = with_host(|h| {
+        let reqs: Vec<u64> = h.perms.iter().filter(|(_, (owner, _, at))| id.is_none_or(|i| i == owner) && (!expired_only || at.elapsed() >= PERMISSION_WAIT)).map(|(r, _)| *r).collect();
+        reqs.into_iter().filter_map(|r| h.perms.remove(&r)).map(|(_, cb, _)| cb).collect()
+    })
+    .unwrap_or_default();
+    // CEF is called only after the host borrow ends.
+    for cb in gone {
+        cb.answer(false);
+    }
 }
 
 pub(crate) fn keep_chooser(req: u64, cb: FileDialogCallback) {
@@ -585,6 +624,7 @@ fn serve(socket: &Path, listener: UnixListener, args: &Args) -> io::Result<()> {
             dialogs: HashMap::new(),
             choosers: HashMap::new(),
             menus: HashMap::new(),
+            perms: HashMap::new(),
             quit: false,
             stats: BlitStats::open(profile_dir.parent().unwrap_or(&profile_dir)),
         })
@@ -627,6 +667,7 @@ fn serve(socket: &Path, listener: UnixListener, args: &Args) -> io::Result<()> {
             break;
         }
         nudge_waiting();
+        deny_permissions(None, true);
         std::thread::sleep(Duration::from_millis(4));
     }
 
@@ -813,6 +854,12 @@ fn handle(m: AppToHost) {
                 _ => cb.cancel(),
             }
         }
+        M::PermissionResult { id, req, allow } => {
+            // Only the browser that asked may answer; a late answer (timed out, page left) is dropped.
+            if let Some((_, cb, _)) = with_host(|h| if h.perms.get(&req).is_some_and(|(owner, _, _)| *owner == id) { h.perms.remove(&req) } else { None }).flatten() {
+                cb.answer(allow);
+            }
+        }
         M::DialogResult { id, req, accept, text } => {
             let Some(cb) = with_host(|h| h.dialogs.remove(&req)).flatten() else {
                 return send(HostToApp::Error { id: Some(id), message: format!("no dialog {req}") });
@@ -828,6 +875,7 @@ fn handle(m: AppToHost) {
             }
         }
         M::Close { id } => {
+            deny_permissions(Some(&id), false);
             let Some(entry) = with_host(|h| h.browsers.remove(&id)).flatten() else { return unknown(&id) };
             if let Some(host) = entry.browser.as_ref().and_then(|b| b.host()) {
                 host.close_browser(1);

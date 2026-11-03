@@ -34,6 +34,9 @@ plist() { # path, executable, identifier
   <key>LSUIElement</key><true/>
   <key>LSMinimumSystemVersion</key><string>12.0</string>
   <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
+  <key>NSCameraUsageDescription</key><string>A web page in Herdr asked to use the camera.</string>
+  <key>NSMicrophoneUsageDescription</key><string>A web page in Herdr asked to use the microphone.</string>
+  <key>NSLocationUsageDescription</key><string>A web page in Herdr asked for your location.</string>
 </dict></plist>
 PLIST
 }

@@ -248,6 +248,8 @@ pub enum AppToHost {
     Screenshot { id: BrowserId, req: u64, path: String },
     FileChooserResult { id: BrowserId, req: u64, paths: Vec<String> },
     DialogResult { id: BrowserId, req: u64, accept: bool, text: Option<String> },
+    /// The person's answer to `Permission { req }`, covering all of its kinds at once (v1 has no partial grant).
+    PermissionResult { id: BrowserId, req: u64, allow: bool },
     Shutdown,
 }
 
@@ -286,6 +288,11 @@ pub enum HostToApp {
     Download { id: BrowserId, req: u64, url: String, suggested_name: String, state: DownloadState, path: Option<String>, received: u64, total: Option<u64> },
     FileChooser { id: BrowserId, req: u64, multiple: bool, accept: Vec<String> },
     Dialog { id: BrowserId, req: u64, kind: DialogKind, message: String, default_text: Option<String> },
+    /// A page asks for device or site powers. `kinds` uses fixed words: "camera", "microphone",
+    /// "screen", "geolocation", "notifications", "clipboard-read", "midi", "other".
+    /// `origin` is untrusted page text, shown plain. Answered once by `PermissionResult`; the host
+    /// denies it if no answer arrives in 60 s.
+    Permission { id: BrowserId, req: u64, origin: String, kinds: Vec<String> },
     /// Where the text caret is, in DIPs, so the app can place the IME candidate window.
     ImeCaret { id: BrowserId, x: f32, y: f32, w: f32, h: f32 },
     FindResult { id: BrowserId, count: u32, active: u32, final_update: bool },
@@ -346,6 +353,7 @@ mod tests {
         let mods = Modifiers { platform: true, ..Default::default() };
         roundtrip_app(AppToHost::Hello { version: PROTOCOL_VERSION, profile_dir: "/tmp/p".into(), cdp_port: Some(9222), cdp_pipe: true });
         roundtrip_app(AppToHost::Create { id: "b1".into(), url: Some("https://example.com".into()), size: Size { w: 800.0, h: 600.0 }, scale: 2.0, profile: None });
+        roundtrip_app(AppToHost::PermissionResult { id: "b1".into(), req: 3, allow: false });
         roundtrip_app(AppToHost::Resize { id: "b1".into(), size: Size { w: 400.0, h: 300.0 }, scale: 2.0 });
         roundtrip_app(AppToHost::FrameAck { id: "b1".into(), seq: 7 });
         roundtrip_app(AppToHost::Input { id: "b1".into(), event: InputEvent::Mouse { kind: MouseKind::Down, x: 1.5, y: 2.5, button: MouseButton::Left, clicks: 2, mods } });
@@ -382,6 +390,7 @@ mod tests {
         roundtrip_host(HostToApp::Frame { id: "b1".into(), seq: 1, surface: SurfaceRef::GlobalId { id: 42 }, size: PixelSize { w: 1600, h: 1200 }, scale: 2.0 });
         roundtrip_host(HostToApp::Frame { id: "b1".into(), seq: 2, surface: SurfaceRef::MachPort { name: "com.herdr.s".into() }, size: PixelSize { w: 2, h: 2 }, scale: 1.0 });
         roundtrip_host(HostToApp::Loading { id: "b1".into(), loading: true, can_back: false, can_forward: false });
+        roundtrip_host(HostToApp::Permission { id: "b1".into(), req: 3, origin: "https://meet.test".into(), kinds: vec!["camera".into(), "microphone".into()] });
         roundtrip_host(HostToApp::LoadError { id: "b1".into(), url: "http://127.0.0.1:9/".into(), code: -102, kind: "refused".into() });
         roundtrip_host(HostToApp::ImeCaret { id: "b1".into(), x: 1.0, y: 2.0, w: 1.0, h: 16.0 });
         roundtrip_host(HostToApp::EvalResult { id: "b1".into(), req: 1, ok: true, value: serde_json::json!({"n": 2}) });

@@ -136,6 +136,14 @@ impl<A: SurfaceAlloc> StubHost<A> {
                 }
                 self.loaded(&id, out);
                 self.frame(&id, out);
+                let url_now = self.browsers.get(&id).map(|b| b.history[b.pos].clone()).unwrap_or_default();
+                // `?permission=camera,microphone`: the page asks once, as a real page would.
+                if let Some(kinds) = url_now.split_once("permission=").map(|(_, k)| k.split(['&', '#']).next().unwrap_or("")) {
+                    let origin = url_now.split_once("://").map(|(scheme, r)| format!("{scheme}://{}", r.split(['/', '?', '#']).next().unwrap_or(""))).unwrap_or_default();
+                    static REQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    let req = REQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    out.push(HostToApp::Permission { id: id.clone(), req, origin, kinds: kinds.split(',').map(str::to_owned).collect() });
+                }
             }
             M::Back { .. } | M::Forward { .. } => {
                 let back = matches!(msg, M::Back { .. });
@@ -237,7 +245,7 @@ fn browser_id(m: &AppToHost) -> &str {
         M::Create { id, .. } | M::Close { id } | M::Navigate { id, .. } | M::Back { id } | M::Forward { id } | M::Reload { id, .. }
         | M::Stop { id } | M::Resize { id, .. } | M::Focus { id, .. } | M::SetZoom { id, .. } | M::Overlay { id, .. } | M::PickInfo { id, .. } | M::PickRelative { id, .. } | M::Styles { id, .. } | M::SetStyle { id, .. } | M::RevertStyle { id, .. } | M::SetVisible { id, .. } | M::MenuResult { id, .. } | M::Input { id, .. } | M::Edit { id, .. }
         | M::FrameAck { id, .. } | M::Find { id, .. } | M::StopFind { id, .. } | M::DevTools { id, .. } | M::Eval { id, .. }
-        | M::Screenshot { id, .. } | M::FileChooserResult { id, .. } | M::DialogResult { id, .. } => id,
+        | M::Screenshot { id, .. } | M::FileChooserResult { id, .. } | M::DialogResult { id, .. } | M::PermissionResult { id, .. } => id,
         M::Hello { .. } | M::SetColorScheme { .. } | M::Shutdown => "",
     }
 }
