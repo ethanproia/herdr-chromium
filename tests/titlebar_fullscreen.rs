@@ -38,7 +38,8 @@ fn main() {
         let toggled = open(cx, WindowBounds::Windowed(bounds));
         let restored = open(cx, WindowBounds::Fullscreen(bounds));
         cx.spawn(async move |cx| {
-            let wait = |s: u64| cx.background_executor().timer(Duration::from_secs(s));
+            let executor = cx.background_executor().clone();
+            let wait = |s: u64| executor.timer(Duration::from_secs(s));
             let flags = |cx: &mut AsyncApp, w: WindowHandle<Blank>| cx.update_window(w.into(), |_, window, _| native_titlebar::titlebar_flags(window).unwrap()).unwrap();
             let fullscreen = |cx: &mut AsyncApp, w: WindowHandle<Blank>| cx.update_window(w.into(), |_, window, _| window.toggle_fullscreen()).unwrap();
             let windowed = native_titlebar::TitlebarFlags { transparent: true, full_size_content: true, title_hidden: true, fullscreen: false };

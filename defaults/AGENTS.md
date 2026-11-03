@@ -581,7 +581,8 @@ The main ones:
   Add machine lists all named ssh-config hosts in a scrollable list. Setup
   prompts open above the picker; close the setup terminal to return to the
   updated list and any machine-specific guidance.
-- Window: `window.minimize`, `window.maximize` (or back), `window.close`.
+- Window: `window.minimize`, `window.maximize` (or back), `window.close`;
+  `window.native` (macOS) reports the title bar as the system sees it.
 - macOS: `app.quit`, `app.hide`, `app.hide_others`, `app.show_all`.
 
 When the user runs a command without a required name (a key, a click), Herdr
