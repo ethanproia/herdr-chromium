@@ -4741,10 +4741,13 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(" | ")
         };
+        // HERDR: "selection" has its own overload with its own payload type.
+        let plain: Vec<&str> = crate::entities::InputEventName::NAMES.iter().copied().filter(|n| *n != "selection").collect();
         assert!(declarations.contains(&format!(
             "on(event: {}, handler: (event: InputEvent, cx: Context)",
-            union(crate::entities::InputEventName::NAMES)
+            union(&plain)
         )));
+        assert!(declarations.contains("on(event: \"selection\", handler: (event: SelectionEvent, cx: Context) => void): boolean;"));
         assert!(declarations.contains(&format!(
             "on(event: {}, handler: (event: OtpEvent, cx: Context)",
             union(crate::entities::OtpEventName::NAMES)
