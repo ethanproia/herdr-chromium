@@ -210,7 +210,7 @@ mod tests {
         assert!(controls(&state(Owner::Browse)).is_empty());
         assert!(controls(&state(Owner::Agent)).is_empty(), "a lease shows its own strip");
         assert_eq!(ids(&state(Owner::Pick)), ["design-select", "design-draw", "design-styles", "design-comment", "design-done"]);
-        let draw = StripState { count: 3, ..state(Owner::Markup) };
+        let draw = StripState { count: 3, comment_on: false, ..state(Owner::Markup) };
         assert_eq!(ids(&draw), ["design-select", "design-draw", "design-pen", "design-rect", "design-ellipse", "design-arrow", "design-undo", "design-styles", "design-comment", "design-send", "design-done"]);
         let active: Vec<_> = controls(&draw).into_iter().filter(|c| c.3).map(|c| c.0).collect();
         assert_eq!(active, ["design-draw", "design-rect"], "the mode and the tool are lit");
