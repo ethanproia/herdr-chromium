@@ -702,6 +702,11 @@ fn pick_relative_steps_to_parent_child_and_siblings() {
     assert!(body.0 && body.2 == "body", "{body:?}");
     assert!(!step(&mut h, 17, &body.1, Parent).0, "never above <body>");
     assert!(!step(&mut h, 18, "#gone", Parent).0, "a selector that no longer matches");
+    // A hostile `from` is data: JSON-encoded into the script, never spliced into its source.
+    let hostile = "#go\"]');window.pwned=1;//</script><script>window.pwned=2</script>\\'`${window.pwned=3}`";
+    assert!(!step(&mut h, 19, hostile, Parent).0, "an invalid selector is ok:false");
+    let (ok, pwned) = h.eval("b1", 20, "typeof window.pwned");
+    assert!(ok && pwned == serde_json::json!("undefined"), "nothing from the selector ran: {pwned}");
     h.shutdown();
 }
 
