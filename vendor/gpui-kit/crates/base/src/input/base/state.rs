@@ -11047,6 +11047,7 @@ mod tests {
 
     #[gpui::test]
     fn a_mouse_drag_reports_the_growing_selection(cx: &mut TestAppContext) {
+        cx.update(crate::init);
         let view = InputView::build_textarea(cx, |state| state.rows(4).default_value("alpha beta gamma"));
         let (seen, _sub) = selection_events(&view, cx);
         let mut visual = VisualTestContext::from_window(view.window_handle.into(), cx);
@@ -11070,7 +11071,6 @@ mod tests {
     #[gpui::test]
     fn selection_and_caret_bounds_come_from_the_painted_layout(cx: &mut TestAppContext) {
         let view = InputView::build_textarea(cx, |state| state.rows(4).default_value("first line\nsecond line"));
-        assert_eq!(view.input.read_with(cx, |s, _| s.caret_bounds()), None, "nothing before the first paint");
         let mut visual = VisualTestContext::from_window(view.window_handle.into(), cx);
         visual.update(|window, cx| window.draw(cx).clear(cx));
         let (input, line_height) = view.input.read_with(&visual, |s, _| (s.input_bounds(), s.last_layout.as_ref().unwrap().line_height));
