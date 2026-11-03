@@ -196,11 +196,14 @@ pub fn overlay_rects(value: &serde_json::Value) -> Vec<herdr_browser_protocol::C
 fn evaluate(id: &str, req: u64, op: Op, expr: &str) -> Vec<u8> {
     let msg = NEXT_MSG.get();
     NEXT_MSG.set(if msg == i32::MAX { FIRST_EVAL_MSG } else { msg + 1 });
+    // Only an agent's own eval acts as the person (it may click or open a popup). Passive probes
+    // (readiness, overlay, pick, styles) never grant the page a user activation.
+    let user_gesture = op == Op::Eval;
     EVALS.with_borrow_mut(|e| e.insert(msg, (id.to_string(), req, op)));
     let call = serde_json::json!({
         "id": msg,
         "method": "Runtime.evaluate",
-        "params": { "expression": expr, "awaitPromise": true, "returnByValue": true, "userGesture": true },
+        "params": { "expression": expr, "awaitPromise": true, "returnByValue": true, "userGesture": user_gesture },
     });
     serde_json::to_vec(&call).expect("json encodes")
 }
@@ -910,5 +913,13 @@ mod tests {
         EVALS.with_borrow(|e| assert_eq!(e.get(&msg), Some(&("b1".to_string(), 9, Op::Eval))));
         assert_eq!(eval_unsent("b1"), Some(9));
         EVALS.with_borrow(|e| assert!(e.get(&msg).is_none()));
+    }
+
+    #[test]
+    fn only_an_agent_eval_carries_a_user_gesture() {
+        let gesture = |m: Vec<u8>| serde_json::from_slice::<serde_json::Value>(&m).unwrap()["params"]["userGesture"].clone();
+        assert_eq!(gesture(eval_message("b1", 1, "1")), true);
+        assert_eq!(gesture(ready_message("b1", 1)), false);
+        assert_eq!(gesture(overlay_message("b1", 2, 1, &herdr_browser_protocol::OverlayQuery::HitTest { x: 1.0, y: 1.0 })), false);
     }
 }
