@@ -130,6 +130,10 @@ impl<A: SurfaceAlloc> StubHost<A> {
                 b.history.push(url);
                 b.pos += 1;
                 out.push(HostToApp::Loading { id: id.clone(), loading: true, can_back: b.pos > 0, can_forward: false });
+                // A `.invalid` host never resolves (RFC 2606): the stub's failed load.
+                if url_host(&b.history[b.pos]).ends_with(".invalid") {
+                    out.push(HostToApp::LoadError { id: id.clone(), url: b.history[b.pos].clone(), code: -105, kind: "dns".into() });
+                }
                 self.loaded(&id, out);
                 self.frame(&id, out);
             }
@@ -250,4 +254,10 @@ fn send(out: &mut UnixStream, msg: &HostToApp) -> io::Result<()> {
     let mut line = encode(msg);
     line.push('\n');
     out.write_all(line.as_bytes())
+}
+
+/// The host part of a url ("" when it has none).
+fn url_host(url: &str) -> &str {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    rest.split(['/', ':', '?', '#']).next().unwrap_or("")
 }

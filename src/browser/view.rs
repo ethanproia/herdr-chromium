@@ -512,6 +512,7 @@ fn target(msg: &HostToApp) -> Option<&BrowserId> {
         | H::Loading { id, .. }
         | H::Cursor { id, .. }
         | H::Favicon { id, .. }
+        | H::LoadError { id, .. }
         | H::NewWindow { id, .. }
         | H::Download { id, .. }
         | H::FileChooser { id, .. }
@@ -583,6 +584,8 @@ pub struct BrowserView {
     pub state: BrowserState,
     /// The host or the page died; the block shows a reload card until clicked.
     crashed: Option<String>,
+    /// The main frame's failed load (kind, code, url): an error card over the page until the next load.
+    load_error: Option<(String, i32, String)>,
     /// Size and scale the host was last told; None: no page made yet.
     sized: Option<(Dips, f32)>,
     /// The newest frame from the host, painted into the page area (part 3).
@@ -828,6 +831,7 @@ impl BrowserView {
             link,
             state,
             crashed: None,
+            load_error: None,
             sized: None,
             frames: FrameView::new(),
             acked: None,
@@ -979,7 +983,16 @@ impl BrowserView {
                     cx.emit(BrowserEvent::PageInfo);
                 }
             }
+            // The card shows from the failed load until the next load starts.
+            H::LoadError { url, code, kind, .. } => {
+                self.state.load_error = Some((kind.clone(), code));
+                self.load_error = Some((kind, code, url));
+            }
             H::Loading { loading, can_back, can_forward, .. } => {
+                if loading {
+                    self.load_error = None;
+                    self.state.load_error = None;
+                }
                 (self.state.loading, self.state.can_back, self.state.can_forward) = (loading, can_back, can_forward);
             }
             H::Cursor { name, .. } => self.state.cursor = name,
@@ -1110,6 +1123,42 @@ impl BrowserView {
     }
 
     /// The reload card's button: a new page at the last url (starting the host again if needed).
+    /// The failed load's card: plain text only (the url is page-chosen), the url capped, Back and Reload.
+    fn load_error_card(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (kind, code, url) = self.load_error.as_ref()?;
+        let (title, hint) = load_error_words(kind, url);
+        let id = self.id.clone();
+        let button = |name: &'static str| div().id(name).px_3().py_1().rounded_md().bg(rgb(0x3a3a3a)).cursor_pointer().child(name);
+        Some(
+            div()
+                .id("load-error")
+                .absolute()
+                .size_full()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .items_center()
+                .justify_center()
+                .bg(rgb(0x202020))
+                .text_color(rgb(0xe0e0e0))
+                .text_sm()
+                .child(div().text_base().child(title))
+                .child(div().text_xs().opacity(0.7).child(hint))
+                .child(div().text_xs().opacity(0.5).child(format!("{} · error {code}", capped(url, 120))))
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .when(self.state.can_back, |d| {
+                            let id = id.clone();
+                            d.child(button("Back").on_click(cx.listener(move |v, _, _, _| v.link.send(AppToHost::Back { id: id.clone() }))))
+                        })
+                        .child(button("Reload").on_click(cx.listener(move |v, _, _, _| v.link.send(AppToHost::Reload { id: id.clone(), ignore_cache: false })))),
+                )
+                .into_any_element(),
+        )
+    }
+
     pub fn reload(&mut self, cx: &mut Context<Self>) {
         self.crashed = None;
         self.sized = None;
@@ -2082,7 +2131,7 @@ impl Render for BrowserView {
             });
         }
         let page = match (&self.crashed, frame) {
-            (None, Some(frame)) => page.child(div().absolute().size_full().child(frame)),
+            (None, Some(frame)) => page.child(div().absolute().size_full().child(frame)).children(self.load_error_card(cx)),
             (None, None) => page.child(
                 div().absolute().size_full().flex().items_center().justify_center().text_color(rgb(0x606060)).text_sm().child(self.shown_url()),
             ),
@@ -2388,6 +2437,26 @@ impl BrowserRegistry for Browsers {
     }
 }
 
+/// A failed load's title and hint, by kind (`url` names a dead localhost).
+pub fn load_error_words(kind: &str, url: &str) -> (String, String) {
+    let host = url.split_once("://").map_or(url, |(_, r)| r).split(['/', '?', '#']).next().unwrap_or("");
+    let local = host.starts_with("127.0.0.1") || host.starts_with("localhost") || host.starts_with("[::1]");
+    match kind {
+        "dns" => ("This site can't be found".into(), format!("{} doesn't resolve. Check the address.", capped(host, 80))),
+        "offline" => ("You're offline".into(), "Check your connection, then reload.".into()),
+        "refused" if local => (format!("Nothing is running at {}", capped(host, 80)), "Start the server, then reload.".into()),
+        "refused" => ("The site refused to connect".into(), format!("{} isn't accepting connections.", capped(host, 80))),
+        "timeout" => ("The site took too long".into(), "It didn't answer in time. Try again.".into()),
+        "certificate" => ("This connection isn't private".into(), "The site's certificate isn't valid, so it wasn't opened.".into()),
+        _ => ("This page couldn't load".into(), "Reload to try again.".into()),
+    }
+}
+
+/// At most `n` characters, with an ellipsis when cut.
+fn capped(s: &str, n: usize) -> String {
+    if s.chars().count() <= n { s.to_string() } else { s.chars().take(n).collect::<String>() + "…" }
+}
+
 /// Socket path checks for tests and `herdr-app doctor`-style reports.
 pub fn socket_of(dir: &Path) -> PathBuf {
     dir.join("host.sock")
@@ -2397,6 +2466,17 @@ pub fn socket_of(dir: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use herdr_browser_protocol::Size;
+
+    #[test]
+    fn load_error_cards_name_the_kind_and_cap_the_url() {
+        assert_eq!(load_error_words("refused", "http://127.0.0.1:3000/x").0, "Nothing is running at 127.0.0.1:3000");
+        assert_eq!(load_error_words("refused", "https://a.test/").0, "The site refused to connect");
+        assert_eq!(load_error_words("certificate", "https://self.test/").0, "This connection isn't private");
+        assert_eq!(load_error_words("dns", "http://nope.invalid/").1, "nope.invalid doesn't resolve. Check the address.");
+        assert_eq!(load_error_words("weird", "x").0, "This page couldn't load");
+        let long = format!("https://a.test/{}", "x".repeat(300));
+        assert_eq!(capped(&long, 120).chars().count(), 121);
+    }
 
     fn tmp(name: &str) -> PathBuf {
         // Short: macOS socket paths stop at 104 bytes.

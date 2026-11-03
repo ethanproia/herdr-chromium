@@ -53,6 +53,8 @@ pub struct BrowserState {
     pub cursor: String,
     /// The page's icon url (`Favicon`), empty until the page names one.
     pub favicon: String,
+    /// The page's failed load: (kind, net error code) only, never page text ("dns", -105).
+    pub load_error: Option<(String, i32)>,
     /// The block's profile ("agent": an agent opened it; "default": the person's).
     pub profile: String,
 }
