@@ -1812,7 +1812,7 @@ impl BrowserView {
             }
             A::Draw => self.toggle_mode(Owner::Markup, cx),
             A::Tool(t) => self.markup.update(cx, |m, _| m.tool = t),
-            A::Undo => self.markup.update(cx, |m, _| m.undo()),
+            A::Undo => self.markup.update(cx, |m, _| { m.undo(); }),
             A::ToggleStyles => {
                 let on = !self.styles_on_pick;
                 self.set_styles_on_pick(on, cx);
