@@ -24,6 +24,8 @@ pub mod frame;
 pub mod geometry;
 // HERDR: part 4, the S27 inbox formatter.
 pub mod handoff;
+// HERDR: part 4, S27 inbox core.
+pub mod inbox;
 pub mod input;
 // HERDR: part 4, design slice S9.
 pub mod markup;
