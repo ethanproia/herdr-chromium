@@ -176,6 +176,10 @@ fn module(values: BTreeMap<String, Value>, calls: Rc<RefCell<Calls>>) -> HostMod
                 "exec" if first == "sh" && a.get(1).map(from_host).and_then(|v| v.get(2).cloned()) == Some(json!("files")) => {
                     Some(json!({"code":0,"stdout":"d\u{0}src\u{0}f\u{0}README.md\u{0}","stderr":""}))
                 }
+                // HERDR: the bundled fork-notepad makes its notes folder on start.
+                "exec" if first == "mkdir" && a.get(1).map(from_host).and_then(|v| v.get(0).cloned()) == Some(json!("-p")) => {
+                    Some(json!({"code":0,"stdout":"","stderr":""}))
+                }
                 "exec"
                     if first == "git"
                         && [
@@ -647,7 +651,8 @@ fn shipped_layouts_and_keys() {
         layouts.insert(path.file_stem().unwrap().to_str().unwrap().to_owned());
     }
     assert_eq!(layouts, crate::window::shipped_layouts().into_iter().map(str::to_owned).collect());
-    let mod_commands = ["ribbon.next"];
+    // HERDR: the bundled notepad's own command (defaults/keys.macos.json).
+    let mod_commands = ["ribbon.next", "fork-notepad.select-all"];
     for text in [
         include_str!("../../defaults/keys.json"),
         include_str!("../../defaults/keys.macos.json"),

@@ -1,5 +1,6 @@
 {
   "global": {
+    "cmd-shift-y": "mod.open:fork-board",
     "cmd-q": "app.quit",
     "cmd-h": "app.hide",
     "cmd-alt-h": "app.hide_others",
@@ -60,6 +61,7 @@
     "ctrl-9": "space.select:9"
   },
   "terminal": {
+    "cmd-shift-y": "mod.open:fork-board",
     "cmd-c": "terminal.copy",
     "cmd-v": "terminal.paste",
     "ctrl-v": "terminal.paste_image",
@@ -69,5 +71,8 @@
     "cmd-left": "send:\u0001",
     "cmd-right": "send:\u0005",
     "cmd-backspace": "send:\u0015"
+  },
+  "mod:fork-notepad": {
+    "cmd-a": "fork-notepad.select-all"
   }
 }

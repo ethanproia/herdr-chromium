@@ -1,5 +1,6 @@
 {
   "global": {
+    "ctrl-shift-y": "mod.open:fork-board",
     "alt-1": "space.select:1",
     "alt-2": "space.select:2",
     "alt-3": "space.select:3",
@@ -60,6 +61,7 @@
     "shift-f2": "space.rename"
   },
   "terminal": {
+    "ctrl-shift-y": "mod.open:fork-board",
     "ctrl-backspace": "send:\u0017",
     "ctrl-left": "send:\u001bb",
     "ctrl-right": "send:\u001bf",
