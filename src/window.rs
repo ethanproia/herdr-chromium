@@ -135,6 +135,8 @@ const LAYOUTS: &[(&str, &str)] = &[
     ("main", include_str!("../defaults/layouts/main.json")),
     ("terminals", include_str!("../defaults/layouts/terminals.json")),
     ("win98", include_str!("../defaults/layouts/win98.json")),
+    // HERDR: the fork's own layout, built from the bundled fork-* mods (defaults/bundled-mods.lock.json).
+    ("fork", include_str!("../defaults/layouts/fork.json")),
 ];
 
 /// Pictures shipped layouts name as their `preview`, written beside them.
