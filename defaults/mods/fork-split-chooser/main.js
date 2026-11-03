@@ -48,15 +48,16 @@ export default class SplitChooser extends View {
     if (pane) run("pane.close", { pane });
   }
   // Same look as the Notepad / menu: one label, 32px rows with a 16px icon, name and faint number key; one
-  // highlight that follows the pointer and the arrow keys; a hairline between Herdr's panels and the agents.
+  // highlight that follows the pointer and the arrow keys; "Tools" and "Agents" labels for the two groups.
   render() {
     const t = theme();
     const list = this.choices();
     if (this.at >= list.length) this.at = 0;
     const builtIn = 3;   // Terminal, Browser, Notepad
-    const rows = [];
+    const label = (text) => div().px(8).pt(4).pb(6).text_size(12).font_weight(500).text_color(t.dim).child(text);
+    const rows = [label("Tools")];
     list.forEach(([id, icon, name, extra], i) => {
-      if (i === builtIn) rows.push(div().h(1).mx(-4).my(4).bg(t.border));
+      if (i === builtIn) rows.push(div().h(8), label("Agents"));   // labels alone separate the groups
       rows.push(h_flex().id(`sc-${id}`).h(32).px(8).gap(10).rounded(6).items_center().flex_none().cursor_pointer()
         .when(i === this.at, (el) => el.bg(t.hover))
         .on_hover((h, cx) => { if (h && this.at !== i) { this.at = i; cx.notify(); } })
@@ -78,8 +79,8 @@ export default class SplitChooser extends View {
         else return;
         cx.notify();
       })
-      .child(v_flex().w_full().max_w(300).p(4).rounded(8).border(1).border_color(t.border).bg(t.popover).shadow_md()
-        .child(div().px(8).pt(4).pb(6).text_size(12).font_weight(500).text_color(t.dim).child(props()?.replace ? "Turn this pane into" : "Open in this pane"))
+      // No card: the pane already contains it (Ethan); the / and right-click menus keep theirs, they're popovers.
+      .child(v_flex().w_full().max_w(300).p(4)
         .children(rows));
   }
 }
