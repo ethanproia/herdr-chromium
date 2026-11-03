@@ -155,15 +155,16 @@ re-pin the commit, run `scripts/sync-bundled-mods.py` (any labs clone with the
 commit: `LABS_GIT=<clone>`), commit `defaults/`. `--check` fails if
 `defaults/mods/fork-*` or `defaults/layouts/fork.json` drifted from the pins.
 
-The sync also writes the `fork` layout: `main` with Ethan's pane header
-(`fork-pane-browser`: split buttons open `fork-split-chooser`, Notepad's
-header menu) and his right-click menu (`"terminal_menu": "fork-menu-browser"`).
-Without pane-browser in the lockfile it derives `fork-pane` from the shipped
-`pane` instead. Pick it
-with `layout.switch fork`; `main` is unchanged.
+The sync also writes the `fork` layout from the labs layout pinned under
+`"layout"` (Ethan's Mac layout, `clones/mac/layouts/main-browser.json`), with
+each bundled mod under its `fork-` name: `fork-core` serves the tab strip,
+pane header, right-click menu (`"terminal_menu": "fork-core"`), sidebar header
+and footer, side panel strip and status bar (hidden to start). Pick it with
+`layout.switch fork`; `main` is unchanged.
 
-Bundled now: `fork-pane-browser`, `fork-menu-browser` (from labs
-`clones/mac/`), `fork-split-chooser`, `fork-notepad` (a tab; notes live in
+Bundled now: `fork-core` (with its tool descriptors in `tools/`),
+`fork-spaces-browser` and `fork-agents-named` (the sidebar, from labs
+`clones/mac/`), `fork-notepad` (a tab; notes live in
 `~/Notes`, the real home folder, not the Herdr home), `fork-board` (an
 overlay; `cmd-shift-y`, `ctrl-shift-y` elsewhere; runs `cp`, `mkdir`, `open`,
 `osascript`, `qlmanage`, `rm`, `sips`; cache in `data/herdr-board`). The new

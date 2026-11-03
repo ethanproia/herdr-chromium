@@ -1,6 +1,13 @@
 {
   "repo": "essexlabs/labs",
   "mods": {
+    "agents-named": {
+      "branch": "ethan/herdr-core-retire",
+      "commit": "00f55b2830c131e0a992285281ce2cb593355236",
+      "version": "0.1.0",
+      "pr": "essexlabs/labs#1303 (on #1298)",
+      "path": "projects/herdr-mods/clones/mac/agents-named"
+    },
     "board": {
       "branch": "ethan/herdr-board-mod",
       "commit": "1bae883e8629b09f0a38e5b35746b75f6b70e40d",
@@ -17,12 +24,12 @@
         "sips"
       ]
     },
-    "menu-browser": {
-      "branch": "ethan/herdr-notepad-virtual",
-      "commit": "6b9163c3bad568356c49640740d54c0c4e174a9e",
-      "path": "projects/herdr-mods/clones/mac/menu-browser",
+    "core": {
+      "branch": "ethan/herdr-core-retire",
+      "commit": "00f55b2830c131e0a992285281ce2cb593355236",
       "version": "0.1.0",
-      "pr": "essexlabs/labs#1294"
+      "pr": "essexlabs/labs#1303 (on #1298)",
+      "path": "projects/herdr-mods/core"
     },
     "notepad": {
       "branch": "ethan/herdr-notepad-virtual",
@@ -38,13 +45,6 @@
       "commit": "6b9163c3bad568356c49640740d54c0c4e174a9e",
       "pr": "essexlabs/labs#1294"
     },
-    "pane-browser": {
-      "branch": "ethan/herdr-notepad-virtual",
-      "commit": "6b9163c3bad568356c49640740d54c0c4e174a9e",
-      "path": "projects/herdr-mods/clones/mac/pane-browser",
-      "version": "0.1.0",
-      "pr": "essexlabs/labs#1294"
-    },
     "remote-desktop": {
       "branch": "ethan/herdr-mods-notepad",
       "commit": "9bfdce0a9fbb95e66e70f289f1fed51bb9862171",
@@ -53,12 +53,19 @@
       "ship": false,
       "why": "duplicates the native browser.remote entry; held until Ethan picks one"
     },
-    "split-chooser": {
-      "branch": "ethan/herdr-notepad-virtual",
-      "commit": "6b9163c3bad568356c49640740d54c0c4e174a9e",
-      "path": "projects/herdr-mods/split-chooser",
+    "spaces-browser": {
+      "branch": "ethan/herdr-core-retire",
+      "commit": "00f55b2830c131e0a992285281ce2cb593355236",
       "version": "0.1.0",
-      "pr": "essexlabs/labs#1294"
+      "pr": "essexlabs/labs#1303 (on #1298)",
+      "path": "projects/herdr-mods/clones/mac/spaces-browser"
     }
+  },
+  "layout": {
+    "branch": "ethan/herdr-core-retire",
+    "commit": "00f55b2830c131e0a992285281ce2cb593355236",
+    "version": "0.1.0",
+    "pr": "essexlabs/labs#1303 (on #1298)",
+    "path": "projects/herdr-mods/clones/mac/layouts/main-browser.json"
   }
 }

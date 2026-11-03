@@ -1,0 +1,11 @@
+{
+  "place": "none",
+  "title": "Spaces",
+  "version": "0.1.0",
+  "source": {
+    "repo": "essexlabs/labs",
+    "branch": "ethan/herdr-core-retire",
+    "commit": "00f55b2830c131e0a992285281ce2cb593355236",
+    "path": "projects/herdr-mods/clones/mac/spaces-browser"
+  }
+}
