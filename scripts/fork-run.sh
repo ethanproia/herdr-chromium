@@ -36,7 +36,15 @@ export HC_SESSION=herdr-fork-$name
 export XDG_STATE_HOME=/tmp/hf-$name
 export HERDR_APP_ID=herdr-app-fork-$name
 export HERDR_APP_NO_SOUND=1
-mkdir -p "$home" "$XDG_STATE_HOME" "$root/bin"
+mkdir -p "$home" "$root/bin"
+# The name is predictable, so the state dir must be ours and private: never follow one
+# someone else made (a symlink or a dir they own) into their hands.
+mkdir -m 700 "$XDG_STATE_HOME" 2>/dev/null || true
+if [[ -L $XDG_STATE_HOME || ! -O $XDG_STATE_HOME ]]; then
+  echo "fork-run: $XDG_STATE_HOME is not a directory you own; refusing" >&2
+  exit 1
+fi
+chmod 700 "$XDG_STATE_HOME"
 # Opening a link would reach the real browser: log it instead.
 printf '#!/bin/sh\nprintf "%%s\\n" "$*" >>%q\n' "$root/opened" >"$root/bin/open"
 chmod +x "$root/bin/open"

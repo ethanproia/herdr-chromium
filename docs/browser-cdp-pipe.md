@@ -27,7 +27,7 @@ herdr-browser CLI/MCP --(0600 unix socket + token)--> app broker (src/browser/br
 -    Ready { version: u32, cef_version: String, cdp_port: Option<u16> },
 +    Ready { version: u32, cef_version: String, cdp_port: Option<u16>, #[serde(default)] cdp_pipe: bool },
 ```
-`cdp_port` stays for the stand-in and old hosts. The app sends `cdp_port: None, cdp_pipe: true` by default; `HERDR_BROWSER_CDP_PORT=<n>` remains a dev-only opt-in (documented as unsafe).
+`cdp_port` stays for the stand-in and old hosts. The app sends `cdp_port: None, cdp_pipe: true` by default; `HERDR_BROWSER_CDP_PORT=<n>` remains a dev-only opt-in (documented as unsafe): only a port number opens it (`0` any free port; anything else, a misspelled `off` included, keeps the pipe), and release builds ignore it.
 
 ### fork-block: `src/browser/view.rs` (host client)
 - Before `Command::new(program)` (view.rs:261), make two pipes with `libc::pipe`: app-to-host and host-to-app. In `CommandExt::pre_exec`, `dup2` the host's read end to fd 3 and its write end to fd 4, and close the app's ends in the child. The app keeps the other two ends with `FD_CLOEXEC` set.

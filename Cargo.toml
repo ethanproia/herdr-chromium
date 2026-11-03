@@ -184,6 +184,7 @@ swash = "=0.2.10"
 tiny-skia = { version = "=0.11.4", default-features = false, features = ["std", "simd"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 gpui_linux = { package = "gpui-pre-linux", version = "=0.3.8", features = ["render-to-image"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]

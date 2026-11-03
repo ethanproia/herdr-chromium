@@ -28,12 +28,51 @@ pub fn listen(tx: async_channel::Sender<Request>) {
         Ok(l) => l,
         Err(e) => return tracing::warn!("cannot serve {}: {e}", path.display()),
     };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
     let _ = std::thread::Builder::new().name("herdr-app-control".into()).spawn(move || {
         for stream in listener.incoming().flatten() {
+            #[cfg(unix)]
+            if !same_user(&stream) {
+                tracing::warn!("control socket: refused a connection from another user");
+                continue;
+            }
             let tx = tx.clone();
             std::thread::spawn(move || serve(stream, tx));
         }
     });
+}
+
+/// HERDR: the socket drives the whole window (terminals, browsers): only this user may connect.
+#[cfg(unix)]
+fn same_user(stream: &UnixStream) -> bool {
+    peer_uid(stream).is_some_and(|uid| uid == unsafe { libc::geteuid() })
+}
+
+#[cfg(target_os = "macos")]
+fn peer_uid(stream: &UnixStream) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+    let (mut uid, mut gid) = (0, 0);
+    // SAFETY: a connected socket fd and two out-params.
+    (unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } == 0).then_some(uid)
+}
+
+#[cfg(target_os = "linux")]
+fn peer_uid(stream: &UnixStream) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+    let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: SO_PEERCRED fills a ucred of the given length on a connected unix socket.
+    let ok = unsafe { libc::getsockopt(stream.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED, (&mut cred as *mut libc::ucred).cast(), &mut len) } == 0;
+    ok.then_some(cred.uid)
+}
+
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+fn peer_uid(_: &UnixStream) -> Option<u32> {
+    None
 }
 
 fn serve(stream: UnixStream, tx: async_channel::Sender<Request>) {
