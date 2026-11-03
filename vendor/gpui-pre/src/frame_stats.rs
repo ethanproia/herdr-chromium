@@ -14,17 +14,45 @@ static SINK: OnceLock<Box<dyn Fn(FrameSample) + Send + Sync>> = OnceLock::new();
 pub enum FrameSample {
     /// A drawn and presented frame of `window`: CPU time of `Window::draw` (layout and scene) and
     /// of `Window::present` (renderer encode and commit), and when the present finished.
-    Frame { window: u64, draw_ms: f64, present_ms: f64, at: Instant },
+    Frame {
+        /// The window's id (`WindowId::as_u64`).
+        window: u64,
+        /// CPU time of `Window::draw`.
+        draw_ms: f64,
+        /// CPU time of `Window::present`.
+        present_ms: f64,
+        /// When the present returned.
+        at: Instant,
+    },
     /// A present without a new draw (presentation kept alive during fast input).
-    PresentOnly { window: u64, present_ms: f64, at: Instant },
+    PresentOnly {
+        /// The window's id.
+        window: u64,
+        /// CPU time of `Window::present`.
+        present_ms: f64,
+        /// When the present returned.
+        at: Instant,
+    },
     /// A frame request held back by the inactive-window or thermal frame-rate limit.
-    Throttled { window: u64 },
+    Throttled {
+        /// The window's id.
+        window: u64,
+    },
     /// A frame request with nothing to draw.
-    Skipped { window: u64 },
+    Skipped {
+        /// The window's id.
+        window: u64,
+    },
     /// The renderer waited `ms` for a drawable from the layer (GPU or display back-pressure).
-    DrawableWait { ms: f64 },
+    DrawableWait {
+        /// Milliseconds blocked in `next_drawable`.
+        ms: f64,
+    },
     /// GPU execution time of one frame's command buffer (GPUEndTime - GPUStartTime).
-    Gpu { ms: f64 },
+    Gpu {
+        /// Milliseconds on the GPU clock.
+        ms: f64,
+    },
 }
 
 /// True once a sink is installed.
@@ -40,6 +68,7 @@ pub fn set_sink(sink: impl Fn(FrameSample) + Send + Sync + 'static) {
     }
 }
 
+/// Hand `sample` to the installed sink, if any.
 pub fn record(sample: FrameSample) {
     if let Some(sink) = SINK.get() {
         sink(sample);
