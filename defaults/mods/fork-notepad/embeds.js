@@ -8,9 +8,10 @@
 import { div, image } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { exec, readTextFile, home, appHome, run } from "herdr";
-import { parseMeta, hashKey, extOf, isRemote, excerpt, lineOf, fit, cover, clampText, domainOf, cacheGet, cacheSet, FAIL_TTL } from "./embeds-core.js";
+import { parseMeta, hashKey, extOf, isRemote, excerpt, lineOf, fit, cover, clampText, domainOf, cacheGet, cacheSet, FAIL_TTL, isSafeFetchUrl, CURL_SAFE, fetchHops } from "./embeds-core.js";
 import { openableUrl } from "./rows.js";
 
+const FILE_RECHECK_MS = 2000;
 const CACHE_REL = "mods/fork-notepad/.cache";   // image() paths are relative to ~/.config/herdr-app
 const FETCH_MS = 5000, FETCH_CAP = 512 * 1024, FILE_LINES = 20;
 const MAX_IMG_H = 520;
@@ -29,14 +30,19 @@ async function dims(path) {
 
 // Download a remote image once; returns {path (relative to appHome), w, h} or null.
 async function cached(url) {
+  if (!isSafeFetchUrl(url)) return null;
   try {
     const name = `${hashKey(url)}.${extOf(url)}`;
     const abs = `${appHome()}/${CACHE_REL}/${name}`;
     let d = await dims(abs);
     if (!d) {
       await exec("mkdir", ["-p", `${appHome()}/${CACHE_REL}`]);
-      await exec("curl", ["-sL", "-m", "10", "-o", abs, url]);
-      d = await dims(abs);
+      // Each redirect is checked before it is followed; -w prints the next hop (the body goes to the file).
+      const got = await fetchHops(url, async (u) => {
+        const r = await exec("curl", ["-s", ...CURL_SAFE, "-m", "10", "-o", abs, "-w", "%{redirect_url}", "--", u]);
+        return { redirect: r?.stdout ?? "", result: r };
+      });
+      d = got ? await dims(abs) : null;
       if (!d) { await exec("rm", ["-f", abs]); return null; }   // not an image (html error page etc.)
     }
     return { path: `${CACHE_REL}/${name}`, ...d };
@@ -64,9 +70,15 @@ async function load(e, cx) {
     try {
       // curl, not fetch: fetch can't be aborted here and buffers the whole body. 5 s cap, refuse bodies declared
       // over 5 MB, and stop reading at FETCH_CAP (head closes the pipe). The URL is an argument, never shell text.
-      const r = await withTimeout(exec("sh", ["-c", 'curl -sL -m 5 --max-filesize 5242880 -- "$1" | head -c "$2"', "sh", e.url, String(FETCH_CAP)]), FETCH_MS + 1000, cx);
-      const html = r && typeof r.stdout === "string" ? r.stdout : "";
-      meta = parseMeta(html.slice(0, FETCH_CAP), e.url);
+      // Only public http(s) pages (no file://, no localhost or LAN services), redirects included.
+      // Redirects too: curl doesn't follow them; fetchHops checks each hop first (%{redirect_url} goes to stderr).
+      const got = await fetchHops(e.url, async (u) => {
+        const r = await withTimeout(exec("sh", ["-c", `curl -s ${CURL_SAFE.join(" ")} -m 5 --max-filesize 5242880 -w '%{stderr}%{redirect_url}' -- "$1" | head -c "$2"`, "sh", u, String(FETCH_CAP)]), FETCH_MS + 1000, cx);
+        return { redirect: r?.stderr ?? "", result: r };
+      });
+      if (!got) throw new Error("not a public web address");
+      const html = got.result && typeof got.result.stdout === "string" ? got.result.stdout : "";
+      meta = parseMeta(html.slice(0, FETCH_CAP), got.url);
     } catch { /* offline or slow: the card still shows the url */ }
     const [thumb, icon] = await Promise.all([meta.image ? cached(meta.image) : null, meta.favicon ? cached(meta.favicon) : null]);
     return { ok: true, ...meta, thumb, icon };
@@ -81,7 +93,7 @@ async function load(e, cx) {
 }
 
 export class Embeds {
-  constructor() { this.cache = new Map(); this.busy = new Set(); }
+  constructor() { this.cache = new Map(); this.busy = new Set(); this.checked = new Map(); }
   // At most 3 loads at once (the rest start as these finish and redraw); keep the newest 200 results.
   static MAX_LOADS = 3;
   static MAX_CACHE = 200;
@@ -90,7 +102,23 @@ export class Embeds {
     try {
       const k = keyOf(embed);
       const hit = cacheGet(this.cache, k, Date.now());
-      if (hit) return hit;
+      if (hit) {
+        // An embedded file on screen is re-read at most every 2 s; it redraws only when its text changed.
+        if (embed.kind === "file" && hit.ok && Date.now() - (this.checked.get(k) ?? 0) > FILE_RECHECK_MS && !this.busy.has(k)
+          && this.busy.size < Embeds.MAX_LOADS) {
+          this.checked.set(k, Date.now());
+          this.busy.add(k);
+          cx.spawn(async (cx) => {
+            let data;
+            try { data = await load(embed, cx); } catch { data = null; }
+            this.busy.delete(k);
+            // A failed re-read (an editor saving by rename) keeps the last good excerpt.
+            if (data?.ok && JSON.stringify(data) !== JSON.stringify(hit)) { cacheSet(this.cache, k, data, Date.now(), Embeds.MAX_CACHE); cx.notify(); }
+            if (this.checked.size > Embeds.MAX_CACHE) for (const key of this.checked.keys()) if (!this.cache.has(key)) this.checked.delete(key);
+          });
+        }
+        return hit;
+      }
       if (!this.busy.has(k) && this.busy.size < Embeds.MAX_LOADS) {
         this.busy.add(k);
         cx.spawn(async (cx) => {

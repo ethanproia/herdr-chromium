@@ -8,6 +8,7 @@ import { SELF } from "../self.js";
 import { icon, menuRow, keysym, copyText, groupLabel } from "../look.js";
 import { menuHeight } from "../pure.js";
 import { sectionLocked } from "../sections-pure.js";
+import { escapeLabel, tabLeaf } from "../labels.js";
 import { sideMenuItems, runSideAction } from "./side-strip.js";
 import { sections, toggleFromClick, toggleSidebar, isCollapsed } from "./sections.js";
 
@@ -99,10 +100,10 @@ function items(p, git) {
     }
     case "machine": {
       // Right-click on a machine heading in the Spaces list: tg = { key (fold key), machine (name | null | absent), online }.
-      // An offline machine keeps New space here as a disabled row (a 4th item field of false), same size; hosts have none.
+      // An offline machine keeps New Space as a disabled row (a 4th item field of false), same size; hosts have none.
       const folded = (shared("machines.folded") ?? []).includes(tg.key);
       return [
-        ...(tg.machine !== undefined ? [["New Space Here", "space.new", tg.machine ? { machine: tg.machine } : {}, tg.online !== false]] : []),
+        ...(tg.machine !== undefined ? [["New Space", "space.new", tg.machine ? { machine: tg.machine } : {}, tg.online !== false]] : []),
         [folded ? "Expand" : "Collapse", "machine.fold", { key: tg.key }],
       ];
     }
@@ -172,16 +173,14 @@ function menuIcon(command, args) {
 function copyLink({ pane, terminal }) {
   const p = panes().find((x) => x.pane === pane);
   const term = terminal && terminals().find((x) => x.address === terminal);
-  const label = (term?.name || p?.title || terminal || pane || "panel").replace(/[\\\]]/g, "\\$&");
+  const label = escapeLabel(term?.name || p?.title || terminal || pane || "panel");
   copyText(terminal ? `[${label}](herdr:agent/${terminal})` : `[${label}](herdr:pane/${pane})`);
 }
 
 // A tab's link, as Notepad tab mentions: "[Space › Tab](herdr:tab/<tab id>)".
 function copyTabLink({ id, space }) {
   const sp = spaces().find((s) => s.id === space) ?? spaces().find((s) => (s.tabs ?? []).some((t) => t.id === id));
-  const tabs = sp?.tabs ?? [];
-  const tab = tabs.find((t) => t.id === id);
-  const label = `${sp?.name ?? "Space"} › ${tab?.name || String(tabs.indexOf(tab) + 1)}`.replace(/[\\\]]/g, "\\$&");
+  const label = escapeLabel(`${sp?.name ?? "Space"} › ${tabLeaf(sp?.tabs, id)}`);
   copyText(`[${label}](herdr:tab/${id})`);
 }
 
