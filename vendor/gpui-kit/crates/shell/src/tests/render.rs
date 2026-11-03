@@ -5830,7 +5830,7 @@ export default class Board extends View {
     };
     frame(context);
     let (inside, outside) = (point(px(20.), px(20.)), point(px(600.), px(400.)));
-    let paths = || ExternalPaths::new(vec![(std::path::PathBuf::from("/tmp/a.png"), false)]);
+    let paths = || ExternalPaths(std::iter::once(std::path::PathBuf::from("/tmp/a.png")).collect());
     for event in [
         FileDropEvent::Entered { position: inside, paths: paths() },
         FileDropEvent::Pending { position: point(px(30.), px(30.)) },
