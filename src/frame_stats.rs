@@ -151,25 +151,24 @@ mod tests {
     fn summary_lines_from_samples() {
         let path = std::env::temp_dir().join(format!("herdr-frame-stats-{}.log", std::process::id()));
         let out = std::fs::File::create(&path).unwrap();
-        let start = Instant::now() - Duration::from_secs(3);
-        let mut s = State { out, per_frame: true, start, since: start, windows: HashMap::new(), gpu: Vec::new(), wait: Vec::new() };
-        let t0 = Instant::now();
-        for i in 0..10 {
-            s.windows.entry(7).or_default();
-            s.gpu.push(2.0);
-            s.wait.push(0.5);
-            s.since = start; // keep the window open until the last sample
-            if i == 9 {
-                s.since = Instant::now() - WINDOW;
-            }
-            s.record(FrameSample::Frame { window: 7, draw_ms: 3.0, present_ms: 1.0, at: t0 + Duration::from_millis(16 * i) });
+        let now = Instant::now();
+        let mut s = State { out, per_frame: true, start: now, since: now, windows: HashMap::new(), gpu: Vec::new(), wait: Vec::new() };
+        for i in 0..10u64 {
+            s.record(FrameSample::Frame { window: 7, draw_ms: 3.0, present_ms: 1.0, at: now + Duration::from_millis(16 * i) });
+            s.record(FrameSample::Gpu { ms: 2.0 });
+            s.record(FrameSample::DrawableWait { ms: 0.5 });
         }
+        // The 2 s window ends: the next sample writes the summaries.
+        s.since = now - WINDOW;
         s.record(FrameSample::Throttled { window: 7 });
         let log = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert_eq!(log.lines().filter(|l| l.contains(" frame ")).count(), 10, "{log}");
         let summary = log.lines().find(|l| l.contains("window=7 summary")).expect("window summary");
-        assert!(summary.contains("draw_p50_ms=3.00") && summary.contains("interval_p50_ms=16.00"), "{summary}");
-        assert!(log.lines().any(|l| l.contains("gpu summary") && l.contains("gpu_p95_ms=2.00")), "{log}");
+        for want in ["draw_p50_ms=3.00", "present_p95_ms=1.00", "interval_p50_ms=16.00", "throttled=1"] {
+            assert!(summary.contains(want), "{want} missing: {summary}");
+        }
+        let gpu = log.lines().find(|l| l.contains("gpu summary")).expect("gpu summary");
+        assert!(gpu.contains("gpu_p95_ms=2.00") && gpu.contains("drawable_wait_p50_ms=0.50") && gpu.contains("gpu_frames=10"), "{gpu}");
     }
 }
