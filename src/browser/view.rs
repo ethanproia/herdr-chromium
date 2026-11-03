@@ -1721,6 +1721,15 @@ impl BrowserView {
         cx.notify();
     }
 
+    /// S27: the person picked `terminal` in the popover (the consent): Send goes to its inbox.
+    pub fn choose_recipient(&mut self, terminal: &str, cx: &mut Context<Self>) {
+        if let Some(to) = self.send_to.choose(terminal) {
+            self.send_target = Some(to);
+            self.send_annotations(cx);
+        }
+        cx.notify();
+    }
+
     /// While the sent batch is unread, redraw once a second so the chip moves to Read / Not read yet.
     fn poll_chip(&mut self, cx: &mut Context<Self>) {
         self.chip_poll = Some(cx.spawn(async move |this, cx| loop {
@@ -1890,12 +1899,7 @@ impl BrowserView {
         let chip = self.send_to.chip(&send_to_root(&self.link.config().dir), now_ms()).map(|c| c.text());
         let popover = send_to::popover(&self.send_to, count, cx, |v, choice, _, cx| {
             match choice {
-                Some(t) => {
-                    if let Some(to) = v.send_to.choose(&t) {
-                        v.send_target = Some(to);
-                        v.send_annotations(cx);
-                    }
-                }
+                Some(t) => v.choose_recipient(&t, cx),
                 None => v.send_to.open = None,
             }
             cx.notify();
