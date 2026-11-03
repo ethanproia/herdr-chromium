@@ -2644,6 +2644,11 @@ impl Browsers {
         self.views.get(id).map(|(v, _)| v)
     }
 
+    /// A block's profile as the app made it (None: no such block).
+    pub fn profile_of(&self, id: &str) -> Option<String> {
+        self.states.lock().unwrap().get(id).map(|s| s.profile.clone())
+    }
+
     pub fn link_arc(&mut self) -> Arc<HostClient> {
         if self.link.is_none() {
             let link = HostClient::new(HostConfig::from_env());
