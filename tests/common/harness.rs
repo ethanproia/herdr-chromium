@@ -171,12 +171,21 @@ impl Page {
             }
         });
         cx.update(|cx| view.update(cx, |v, _| v.set_frame_probe(Some(probe))));
+        // The person's block: the harness drives it as an agent, so it stands in for the person
+        // turning Control on in the shield (S29). `grant` changes it.
+        cx.update(|cx| view.update(cx, |v, cx| v.set_grant(crate::browser::agent::Grant::Control, true, cx)));
         let mut page = Page { cx, window, view, link, frames, hashing, dir, host, size: (w, h) };
         page.wait_loaded(Duration::from_secs(30));
         Some(page)
     }
 
     /// Draw the window (lays the block out, paints the newest frame, acks it) and run what's due.
+    /// The person flips a grant in the block's shield (S29).
+    pub fn grant(&mut self, g: crate::browser::agent::Grant, on: bool) {
+        let view = self.view.clone();
+        self.cx.update(|cx| view.update(cx, |v, cx| v.set_grant(g, on, cx)));
+    }
+
     pub fn pump(&mut self) {
         self.cx
             .update_window(self.window.into(), |_, window, cx| {

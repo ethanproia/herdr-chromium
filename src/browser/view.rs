@@ -6,7 +6,7 @@
 //! send, replaying every open browser. Each block gets a `BrowserView` that turns host events into
 //! `BrowserState`, sizes the page to the block, hands frames to a `FrameSink` and shows a reload
 //! card after a crash. `Browsers` keeps one view per browser block in the layouts.
-use super::agent::{Agent, Focus, Reply, Step};
+use super::agent::{Agent, Focus, Grant, Reply, Step};
 use super::cdp::CdpPipe;
 
 /// CDP on a pipe only the app holds, served to agents by the broker (the default). A dev-only TCP port
@@ -645,6 +645,10 @@ pub struct BrowserView {
     /// The app's downloads (shared by every block); the bar's ⬇ opens the list.
     downloads: Downloads,
     downloads_open: bool,
+    /// S29: the shield popover (what agents may do here) is open.
+    shield_open: bool,
+    /// The agents' side (its grants); set by `Browsers` when it makes the view.
+    agent: Option<Arc<Mutex<Agent>>>,
     _dialogs: Subscription,
 }
 
@@ -816,7 +820,7 @@ impl BrowserView {
                 cx.notify();
             }
         });
-        let state = BrowserState { url: block.url.clone(), ..Default::default() };
+        let state = BrowserState { url: block.url.clone(), profile: block.profile.clone(), ..Default::default() };
         states.lock().unwrap().insert(id.to_owned(), state.clone());
         Self {
             id: id.to_owned(),
@@ -864,6 +868,8 @@ impl BrowserView {
             dialogs,
             downloads,
             downloads_open: false,
+            shield_open: false,
+            agent: None,
             _dialogs: dialogs_sub,
         }
     }
@@ -1174,6 +1180,72 @@ impl BrowserView {
     /// The page's dialogs (a JS dialog on screen, tests answer it).
     pub fn dialogs(&self) -> &Entity<PageDialogs> {
         &self.dialogs
+    }
+
+    /// S29: a grant (or the sensitive mark) as the person set it in the shield; never an agent's.
+    pub fn grant(&self, g: Grant) -> bool {
+        self.agent.as_ref().is_some_and(|a| a.lock().unwrap().grants.get(&self.id, g))
+    }
+
+    /// The person flips a grant in the shield (only this view's UI calls it).
+    pub fn set_grant(&mut self, g: Grant, on: bool, cx: &mut Context<Self>) {
+        if let Some(a) = &self.agent {
+            a.lock().unwrap().grants.set(&self.id, g, on);
+        }
+        cx.notify();
+    }
+
+    pub fn toggle_shield(&mut self, cx: &mut Context<Self>) {
+        self.shield_open = !self.shield_open;
+        cx.notify();
+    }
+
+    fn shield_panel(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.shield_open {
+            return None;
+        }
+        let row = |g: Grant, label: &'static str, hint: &'static str| {
+            let on = self.grant(g);
+            div()
+                .id(label)
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .py_1()
+                .cursor_pointer()
+                .hover(|d| d.bg(hsla(0., 0., 0.5, 0.12)))
+                .on_click(cx.listener(move |v, _, _, cx| v.set_grant(g, !on, cx)))
+                .child(div().w(px(26.)).text_center().rounded_full().text_xs().bg(if on { rgb(0x0a84ff) } else { rgb(0xc8c8c8) }).text_color(rgb(0xffffff)).child(if on { "on" } else { "off" }))
+                .child(div().flex().flex_col().child(div().text_sm().child(label)).child(div().text_xs().opacity(0.6).child(hint)))
+        };
+        Some(
+            div()
+                .id("shield-panel")
+                .absolute()
+                .top(px(4.))
+                .right(px(8.))
+                .w(px(300.))
+                .py_1()
+                .bg(rgb(0xffffff))
+                .text_color(rgb(0x1a1a1a))
+                .border_1()
+                .border_color(rgb(0xc8c8c8))
+                .rounded_md()
+                .shadow_lg()
+                .occlude()
+                .on_mouse_down_out(cx.listener(|v, _, _, cx| {
+                    v.shield_open = false;
+                    cx.notify();
+                }))
+                .child(div().px_2().text_xs().opacity(0.6).child("What agents may do in this browser"))
+                .child(row(Grant::Control, "Control", "Navigate, click, type, read and run scripts here"))
+                .child(row(Grant::Cdp, "CDP", "Raw DevTools access (inspection only)"))
+                .child(row(Grant::Capture, "Capture", "Screenshots even when the page is sensitive"))
+                .child(div().h(px(1.)).mx_2().my_1().bg(rgb(0xe0e0e0)))
+                .child(row(Grant::Sensitive, "Mark page sensitive", "Agents' screenshots need Capture"))
+                .into_any_element(),
+        )
     }
 
     pub fn toggle_downloads(&mut self, cx: &mut Context<Self>) {
@@ -1918,6 +1990,20 @@ impl BrowserView {
                 d.child(div().id("zoom-label").px_1().rounded_sm().cursor_pointer().bg(hsla(0., 0., 0.5, 0.15)).child(zoom::percent(self.zoom_level)).on_click(cx.listener(|v, _, _, cx| v.set_zoom(0.0, cx))))
             })
             .child(button("⬇", true).on_click(cx.listener(|v, _, _, cx| v.toggle_downloads(cx))))
+            // S29: what agents may do here. Tinted while any grant is on; "Agent" while one drives it.
+            .child({
+                let granted = [Grant::Control, Grant::Cdp, Grant::Capture].iter().any(|g| self.grant(*g));
+                let driving = self.input.read(cx).lease().is_some();
+                div()
+                    .id("shield")
+                    .px_1()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .when(granted, |d| d.bg(rgb(0x0a84ff)).text_color(rgb(0xffffff)))
+                    .when(!granted, |d| d.hover(|d| d.bg(hsla(0., 0., 0.5, 0.15))))
+                    .child(if driving { "🛡 Agent" } else { "🛡" })
+                    .on_click(cx.listener(|v, _, _, cx| v.toggle_shield(cx)))
+            })
     }
 
     fn shown_url(&self) -> String {
@@ -2049,7 +2135,8 @@ impl Render for BrowserView {
             .min_h_0()
             .child(page)
             .child(self.dialogs.clone())
-            .children(self.downloads_panel(cx));
+            .children(self.downloads_panel(cx))
+            .children(self.shield_panel(cx));
         // S10: the style panel in its own column beside the page.
         if let Some(panel) = self.style_panel.clone() {
             for (req, ok, rows) in std::mem::take(&mut self.style_results) {
@@ -2268,12 +2355,14 @@ impl Browsers {
             }
             let (link, states) = (self.link_arc(), self.states.clone());
             let downloads = self.downloads.clone();
+            let agent = self.agent.clone();
             let dir = link.config().dir.clone();
             let prefs = self.zoom.get_or_insert_with(|| Arc::new(Mutex::new(zoom::ZoomPrefs::load(dir.join("zoom.json"))))).clone();
             let view = cx.new(|cx| {
                 let mut v = BrowserView::new(&id, block, link, states, window, cx);
                 v.use_downloads(downloads, cx);
                 v.use_zoom_prefs(prefs);
+                v.agent = agent.clone();
                 v
             });
             let key = id.clone();
