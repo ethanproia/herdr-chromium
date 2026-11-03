@@ -4144,6 +4144,8 @@ impl AppWindow {
                     return;
                 }
                 crate::browser::view::BrowserEvent::Region(_) => return,
+                // S27: fork-input's arm answers with show_recipients; a no-op until it lands.
+                crate::browser::view::BrowserEvent::PickRecipient => return,
                 // HERDR: browser block. Send's batch goes to the agent side (fork-agent's S8).
                 crate::browser::view::BrowserEvent::Annotations(batch) => {
                     this.browsers.annotations(batch.clone());
