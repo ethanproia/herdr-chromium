@@ -3,7 +3,7 @@
 // ↑/↓ move, Enter runs, Esc closes. An item is [label, command, args]; a command "worktree" opens the worktree dialog.
 import { div, svg } from "gpui-kit";
 import { v_flex } from "gpui-base";
-import { run, props, closeOverlay, openOverlay, theme, keys, terminals, spaces, panes, exec } from "herdr";
+import { run, props, closeOverlay, openOverlay, theme, keys, terminals, spaces, panes, agents, exec, shared, setShared } from "herdr";
 import { SELF } from "../self.js";
 import { icon, menuRow, keysym, copyText, groupLabel } from "../look.js";
 import { menuHeight } from "../pure.js";
@@ -62,19 +62,55 @@ function items(p, git) {
         ["Copy link to tab", "copy-tab-link", { id: tg.id, space: tg.space }],
         ["Close", "tab.close", { id: tg.id }],
       ];
-    case "space":
+    case "space": {
+      // Move up / down stay inside the space's machine (Herdr's own rule); space.move takes a 1-based index.
+      const all = spaces();
+      const at = all.findIndex((s) => s.id === tg.id);
+      const mine = all[at]?.machine ?? null;
+      const up = at > 0 && (all[at - 1].machine ?? null) === mine;
+      const down = at >= 0 && at < all.length - 1 && (all[at + 1].machine ?? null) === mine;
       return [
-        ["Rename", "space.rename", { id: tg.id }],
+        ["Open", "space.select", { id: tg.id }],
+        ["Rename…", "space.rename", { id: tg.id }],
+        ["Change color…", "space.color-menu", { id: tg.id }],
+        ["New tab here", "tab.new", { space: tg.id }],
+        ["Copy link to space", "copy-space-link", { id: tg.id }],
+        ...(up ? [["Move up", "space.move", { id: tg.id, index: at }]] : []),
+        ...(down ? [["Move down", "space.move", { id: tg.id, index: at + 2 }]] : []),
         ...(git ? [["New worktree", "worktree", { space: tg.id, action: "new" }], ["Open worktree", "worktree", { space: tg.id, action: "open" }]] : []),
         ...(git === "linked" ? [["Remove worktree", "worktree", { space: tg.id, action: "remove" }]] : []),
-        ["Close", "space.close", { id: tg.id }],
+        ["Close space…", "space.close", { id: tg.id }],
       ];
+    }
+    case "space-color":
+      // The six avatar colors the Spaces list uses; the current one is checked.
+      return Object.keys(SPACE_COLORS).map((c) => [SPACE_COLORS[c][0], "space.color", { id: tg.id, color: c }]);
+    case "agent": {
+      // Right-click on an agent row (Agents list, expanded or rail). Close only for an agent that is not working or blocked.
+      const a = agents().find((x) => x.address === tg.terminal);
+      const quiet = a && a.status !== "working" && a.status !== "blocked";
+      return [
+        ["Focus", "pane.focus", { pane: a?.pane ?? tg.pane }],
+        ["Copy link to agent", "copy-link", { terminal: tg.terminal }],
+        ["Rename…", "tab.rename", { id: a?.tab ?? tg.tab }],
+        a?.pinned ? ["Unpin", "terminal.pin", { terminal: tg.terminal, pinned: false }] : ["Pin to top", "terminal.pin", { terminal: tg.terminal, pinned: true }],
+        ...(quiet ? [["Close…", "agent.close", { terminal: tg.terminal }]] : []),
+      ];
+    }
+    case "machine": {
+      // Right-click on a machine heading in the Spaces list: tg = { key (fold key), machine (name | null | absent), online }.
+      const folded = (shared("machines.folded") ?? []).includes(tg.key);
+      return [
+        ...(tg.online && tg.machine !== undefined ? [["New space here", "space.new", tg.machine ? { machine: tg.machine } : {}]] : []),
+        [folded ? "Expand" : "Collapse", "machine.fold", { key: tg.key }],
+      ];
+    }
     case "side":
       // A side panel strip tab: Pin / Unpin, Open as tab, Close.
       return sideMenuItems(tg);
     case "sidebar":
       // Checkable toggles for the left sidebar's sections.
-      return [[isCollapsed() ? "Expand sidebar" : "Collapse sidebar", "sidebar.collapse", {}], ["Spaces", "sidebar.toggle", { key: "spaces" }], ["Agents", "sidebar.toggle", { key: "agents" }], ["Add machine", "sidebar.toggle", { key: "addMachine" }], ["Status bar", "sidebar.toggle", { key: "statusBar" }]];
+      return [[isCollapsed() ? "Expand sidebar" : "Collapse sidebar", "sidebar.collapse", {}], ["Spaces", "sidebar.toggle", { key: "spaces" }], ["Agents", "sidebar.toggle", { key: "agents" }], ["Status bar", "sidebar.toggle", { key: "statusBar" }], ["Add machine…", "machine.add", {}]]   // an action, not a switch (Ethan: "add machine here should not be a toggle");
     default:
       return [
         ["New space", "space.new", {}],
@@ -97,6 +133,9 @@ function toggleSwitch(t, on, locked) {
     .child(div().size(12).rounded(6).bg(t.foreground));
 }
 
+// The Spaces list's avatar colors (same hexes as spaces-browser's MARK).
+const SPACE_COLORS = { ansi6: ["Teal", "#22a99a"], ansi3: ["Orange", "#e3814f"], ansi4: ["Blue", "#5b8def"], ansi5: ["Violet", "#8b7cf6"], ansi2: ["Green", "#3fae6a"], ansi1: ["Pink", "#d9649a"] };
+
 // The height of a groupLabel (6 top + 12 text + 6 bottom, as the + menu counts it).
 export const LABEL_H = 30;
 
@@ -104,10 +143,16 @@ function menuIcon(command, args) {
   if (command === "pane.split") return icon(args?.direction === "down" ? "split-down" : "split-right");
   if (command === "pane.zoom") return icon("zoom");
   if (command === "turn-into") return icon("turn-into");
-  if (command === "copy-link" || command === "copy-tab-link") return icon("link");
+  if (command === "copy-link" || command === "copy-tab-link" || command === "copy-space-link") return icon("link");
+  if (command === "space.select" || command === "pane.focus") return icon("spaces");
+  if (command === "space.color-menu") return icon("theme");
+  if (command === "terminal.pin") return icon(args?.pinned ? "pin" : "unpin");
+  if (command === "machine.fold") return icon("sidebar");
+  if (command === "space.move") return icon("send-back");
   if (command === "terminal.right_click") return icon("mouse");
   if (command === "terminal.park") return icon("send-back");
   if (command === "sidebar.collapse") return icon("sidebar");
+  if (command === "machine.add") return icon("plus");
   if (command === "sidebar.toggle") return icon({ spaces: "spaces", agents: "agents", addMachine: "plus", statusBar: "status-bar" }[args?.key] ?? "panel");
   if (command === "side.pin") return icon("pin");
   if (command === "side.unpin") return icon("unpin");
@@ -140,6 +185,12 @@ function copyTabLink({ id, space }) {
   copyText(`[${label}](herdr:tab/${id})`);
 }
 
+// A space's link: "[name](herdr:space/<space id>)".
+function copySpaceLink({ id }) {
+  const label = (spaces().find((s) => s.id === id)?.name ?? "Space").replace(/[\\\]]/g, "\\$&");
+  copyText(`[${label}](herdr:space/${id})`);
+}
+
 // The key bound to a command, for the hint on the right.
 function shortcut(name, args) {
   // `pane.split:right` binds pane.split with { direction: "right" }.
@@ -149,7 +200,7 @@ function shortcut(name, args) {
 }
 
 // A hairline sits before some items, which groups them.
-const breaksBefore = (list, i) => i > 0 && ((list[i][1] === "sidebar.toggle" && list[i - 1][1] === "sidebar.collapse") || list[i][1].endsWith(".close") || list[i][1] === "app.help" || list[i][1] === "terminal.right_click" || list[i][1] === "copy-link" || list[i][1] === "tab.rename" || (list[i][1] === "app.theme" && list[i - 1][1] !== "app.theme"));
+const breaksBefore = (list, i) => i > 0 && ((list[i][1] === "sidebar.toggle" && list[i - 1][1] === "sidebar.collapse") || list[i][1] === "machine.add" || list[i][1].endsWith(".close") || list[i][1] === "app.help" || list[i][1] === "terminal.right_click" || list[i][1] === "copy-link" || (list[i][1] === "space.move" && list[i - 1][1] !== "space.move") || list[i][1] === "tab.rename" || (list[i][1] === "app.theme" && list[i - 1][1] !== "app.theme"));
 
 export default class Menu {
   init(_props, cx) {
@@ -173,7 +224,18 @@ export default class Menu {
     // A switch flips in place and the menu stays open; the last list on can't be switched off (the click does nothing).
     if (it[1] === "sidebar.toggle") { toggleFromClick(it[2].key); return cx?.notify?.(); }
     if (it[1] === "sidebar.collapse") { closeOverlay(props()?.overlay); return toggleSidebar(); }
+    if (it[1] === "machine.add") { closeOverlay(props()?.overlay); return run("mod.open", { name: "machine-add" }); }
     closeOverlay(props()?.overlay);
+    if (it[1] === "machine.fold") { const cur = shared("machines.folded") ?? []; return setShared("machines.folded", cur.includes(it[2].key) ? cur.filter((k) => k !== it[2].key) : [...cur, it[2].key]); }
+    if (it[1] === "space.color") return setShared("space.colors", { ...(shared("space.colors") ?? {}), [it[2].id]: it[2].color });
+    if (it[1] === "space.color-menu") return openOverlay({ mod: SELF, kind: "popup", width: 260, height: menuHeight(Object.keys(SPACE_COLORS).length, 0), props: { role: "menu", tab: "space-color", target: it[2] } });
+    if (it[1] === "agent.close") {
+      // Never closes a working agent: re-read its status now, then ask first.
+      const a = agents().find((x) => x.address === it[2].terminal);
+      if (!a || a.status === "working" || a.status === "blocked") return;
+      return openOverlay({ mod: "confirm", kind: "dialog", width: 380, height: 170, props: { title: "Close agent?", detail: `${a.space_name ? `${a.space_name} · ` : ""}${a.program?.name ?? it[2].terminal} will end.`, command: { name: "terminal.kill", args: { terminal: it[2].terminal } } } });
+    }
+    if (it[1] === "copy-space-link") return copySpaceLink(it[2]);
     if (it[1] === "worktree") openOverlay({ mod: "worktree", kind: "dialog", ...(it[2].action === "open" ? { width: 560, height: 480 } : { width: 440, height: 260 }), props: it[2] });
     // Splits open their new pane as the New panel; Turn into opens one beside the pane, which replaces it.
     else if (it[1] === "pane.split") run("pane.split", { ...it[2], mod: SELF, props: { role: "new-panel", direction: it[2].direction } });
@@ -214,9 +276,12 @@ export default class Menu {
             .when(Boolean(label) && it[1] === "sidebar.toggle" && list[i - 1]?.[1] !== "sidebar.toggle", (el) => el.child(groupLabel(t, label)))
             .child(menuRow({
               t, id: `mi-${i}`,
-              icon: svg(menuIcon(it[1], it[2])).size(16), name: it[0], active: i === this.at,
+              // Show / hide rows (shadcn DropdownMenuCheckboxItem, no switches in menus): a clear check on the right when
+              // on, the row's icon dimmed when off.
+              icon: it[1] === "space.color" ? div().size(12).rounded(6).bg(SPACE_COLORS[it[2].color][1]) : svg(menuIcon(it[1], it[2])).size(16).when(it[1] === "sidebar.toggle" && !sections()[it[2].key], (el) => el.text_color(t.dim)),
+              name: it[0], active: i === this.at,
               // A toggle shows its state as a check on the right, where other menus show a shortcut.
-              hint: it[1] === "sidebar.collapse" ? shortcut(`${SELF}.toggle-sidebar`) : it[1] === "sidebar.toggle" ? toggleSwitch(t, sections()[it[2].key], sectionLocked(sections(), it[2].key)) : shortcut(it[1], it[2]),
+              hint: it[1] === "space.color" ? (((shared("space.colors") ?? {})[it[2].id] ?? "ansi6") === it[2].color ? svg(icon("check")).size(14).text_color(t.foreground) : "") : it[1] === "sidebar.collapse" ? shortcut(`${SELF}.toggle-sidebar`) : it[1] === "sidebar.toggle" ? (sections()[it[2].key] ? svg(icon("check")).size(14).text_color(t.foreground).when(sectionLocked(sections(), it[2].key), (el) => el.tooltip("At least one list stays on")) : "") : shortcut(it[1], it[2]),
               onClick: (_e, cx) => this.choose(i, cx),
               onHover: (cx) => { if (this.at !== i) { this.at = i; cx.notify(); } },
             }))),

@@ -7,6 +7,7 @@ import { div, svg, image } from "gpui-kit";
 import { h_flex } from "gpui-base";
 import { panes, agents, props, run, theme, home, shared, setShared, openOverlay, watchFolder, appHome } from "herdr";
 import { SELF } from "../self.js";
+import { fadeLabel, over } from "../scroll.js";
 import { icon, registryIO, runCopy, openRegistry } from "../look.js";
 import { createRegistry, normalizeTool } from "../registry.js";
 import { copyPlan } from "../pure.js";
@@ -156,7 +157,7 @@ export default class PaneHeader {
       : head?.icon ? svg(head.icon).size(14).flex_none().text_color(t.dim) : head ? null : (progIcon(p.program, 14, t.dim) ?? svg(icon("shell")).size(14).flex_none().text_color(t.dim));
     const st = p.status;
     const pane = p.pane;
-    // Narrow panes: the title shrinks to an ellipsis (min 48px) and the folder text goes first; a mod's own buttons
+    // Narrow panes: the title shrinks, fading out at its edge (min 48px) and the folder text goes first; a mod's own buttons
     // fold into one ••• button; only then stock buttons drop, close last. Nothing overlaps.
     const BTN = 20, GAP = 8;
     const copySrc = copyPlan({ terminal: p.terminal, copy: tool?.copy, viewPath }, shared);
@@ -172,6 +173,7 @@ export default class PaneHeader {
       () => this.button(t, `ph-z-${pane}`, p.zoomed ? "unzoom" : "zoom", "pane.zoom", { pane }),
       () => this.button(t, `ph-x-${pane}`, "close", "pane.close", { pane }),
     ].slice(4 - stockN);
+    const headBg = over(t.background, isLead ? t.accent + "1a" : null);   // what the header shows, for the fading labels
     return h_flex()
       .id(`pane-head-${pane}`)
       .size_full()
@@ -192,13 +194,13 @@ export default class PaneHeader {
         openOverlay({ mod: SELF, kind: "popup", props: { role: "menu", tab: "pane", target: { pane, terminal: p.terminal } }, width: 260, height: 272 });
       })
       .when(Boolean(pic), (el) => el.child(pic))
-      .child(div().min_w(48).max_w(260).truncate().font_medium().text_color(t.foreground).child(name))
+      .child(fadeLabel(this, `ph-name-${pane}`, { text: name, bg: headBg, style: (el) => el.font_medium().text_color(t.foreground), outer: (el) => el.min_w(48).max_w(260) }))
       // Backlink: the Notepad mentions this chat or tab; click lists the lines (Notepad as a popup).
       .when(Boolean(backlinks.length), (el) => el.child(div().id(`ph-bl-${pane}`).p(3).rounded(4).flex_none().text_color(t.dim)
         .hover((s) => s.bg(t.hover).text_color(t.foreground)).cursor_pointer()
         .on_click((_e, cx) => { cx.stop_propagation(); openOverlay({ mod: noteMod, kind: "popup", props: { backlinks }, width: 320, height: 200 }); })
         .child(svg(icon("note")).size(12))))
-      .child(div().flex_1().min_w(0).truncate().text_color(t.dim).child(dirLabel))
+      .child(fadeLabel(this, `ph-dir-${pane}`, { text: dirLabel, bg: headBg, style: (el) => el.text_color(t.dim) }))
       .when(st === "working", (el) => el.child(svg("mods/workspace-chrome/spinner.svg").size(12).flex_none().text_color(t.working).spin(900)))
       .when(st === "blocked", (el) => el.child(div().flex_none().px(6).h(18).flex().items_center().rounded(5).bg(t.blocked + "26").text_size(10.5).font_semibold().text_color(t.blocked).child("Needs you")))
       .when(st === "done", (el) => el.child(div().size(7).flex_none().rounded(4).bg(t.done)))

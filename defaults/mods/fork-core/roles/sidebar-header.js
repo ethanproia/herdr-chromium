@@ -3,9 +3,13 @@
 // style as search and sidebar buttons"). Always shown, so it also re-applies the saved sidebar sections at start.
 import { div, image, svg } from "gpui-kit";
 import { h_flex } from "gpui-base";
-import { theme, run, window, shared, setShared, layout, updates } from "herdr";
+import { theme, run, window, shared, setShared, layout, updates, settings } from "herdr";
 import { icon } from "../self.js";
 import { applySections, openSectionsMenu, toggleSidebar, applySidebarState, isCollapsed } from "./sections.js";
+// With the fork's "glass" setting the sidebar's layout background draws translucent over a blurred window; painting
+// our own opaque chrome here would hide it, so sidebar roots leave the background to the layout then.
+const glassOn = () => settings()?.glass === true;
+
 
 function find(node, id) {
   if (node?.id === id) return node;
@@ -53,13 +57,13 @@ export default class SidebarHeader {
     // before"). In a windowed macOS the traffic lights hold this row, so the rail shows it first instead.
     // Equal margin top, left and right: (44 rail - 26 button) / 2 = 9 (Ethan: "outer margin around the rail top sidebar
     // button is equidistant"); the button sits on the space tiles' center line.
-    if (collapsed) return h_flex().size_full().bg(t.chrome).items_center().justify_center().on_size_change((sz) => this.onSize(sz.width)).on_mouse_down("right", () => openSectionsMenu())
+    if (collapsed) return h_flex().size_full().when(!glassOn(), (el) => el.bg(t.chrome)).items_center().justify_center().on_size_change((sz) => this.onSize(sz.width)).on_mouse_down("right", () => openSectionsMenu())
       .when(!mac || window()?.fullscreen, (el) => el.child(this.button(t, "sidebar-toggle", "sidebar", toggleSidebar).tooltip("Expand sidebar")));
-    return h_flex().size_full().bg(t.chrome).pl(14).pr(10).gap(4).items_center().text_size(13.5)
+    return h_flex().size_full().when(!glassOn(), (el) => el.bg(t.chrome)).pl(14).pr(10).gap(4).items_center().text_size(13.5)
       .on_size_change((sz) => this.onSize(sz.width))
       .on_mouse_down("right", () => openSectionsMenu())
       .when(mac && !window()?.fullscreen, (el) => el.pl(76))
-      .child(h_flex().flex_1().gap(8).items_center().child(image("frame/welcome/herdr.png").size(20).rounded(5)).child(div().font_semibold().text_color(t.foreground).child("Herdr")))
+      .child(div().flex_1())   // no mark or wordmark (Ethan: "remove the herdr logo and text altogether"); buttons sit right
       .child(this.button(t, "search", "search", () => run("mod.open", { name: "picker" })))
       .child(this.button(t, "settings", "settings", () => run("app.settings"), updates()?.app?.ready))
       .child(this.button(t, "sidebar-toggle", "sidebar", toggleSidebar));

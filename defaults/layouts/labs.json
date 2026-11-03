@@ -31,7 +31,7 @@
                 "mod": "fork-spaces-browser"
               },
               "size": {
-                "weight": 1
+                "weight": 0.8753741979598999
               },
               "min": 90
             },
@@ -42,7 +42,7 @@
                 "mod": "fork-agents-named"
               },
               "size": {
-                "weight": 0.9490220546722412
+                "weight": 1.0736478567123413
               },
               "min": 90
             }
@@ -60,11 +60,12 @@
           },
           "size": {
             "px": 75
-          }
+          },
+          "hidden": true
         }
       ],
       "size": {
-        "px": 210
+        "px": 237
       },
       "min": 200,
       "max": 480,
@@ -211,5 +212,6 @@
     12,
     16
   ],
+  "preview": "layouts/labs.svg",
   "terminal_menu": "fork-core"
 }

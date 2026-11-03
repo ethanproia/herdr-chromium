@@ -4,8 +4,9 @@ import { openInSide } from "./side-strip.js";
 import { toggleSidebar } from "./sections.js";
 import { div, svg, image } from "gpui-kit";
 import { h_flex } from "gpui-base";
-import { spaces, panes, run, openOverlay, theme, window, shared, setShared, layout, nextCommand } from "herdr";
+import { spaces, panes, run, openOverlay, theme, window, shared, setShared, layout, nextCommand, settings } from "herdr";
 import { SELF } from "../self.js";
+import { fadeLabel, over } from "../scroll.js";
 import { icon, registryIO, openInTab, openRegistry } from "../look.js";
 import { createRegistry } from "../registry.js";
 
@@ -123,9 +124,11 @@ export default class Tabs {
       const worker = (agentPane?.title || "").replace(/^[^\p{L}\p{N}]+/u, "").trim();
       const fallback = (worker && worker !== program?.name) ? worker : program?.name ?? "Terminal";
       const name = /^tb\d+$/.test(c.name) ? fallback : c.name;
+      const hot = this.hoverTab === c.id;   // tracked, not the host's :hover, so the fading name matches the chip
+      const chip = hot ? t.hover : c.active ? t.raised : t.chrome;
       return h_flex().id(`tab-${c.id}`).h(29).px(10).gap(7).rounded(7).items_center().flex_none().text_size(12.8)
-        .border(1).border_color(c.active ? t.border : t.chrome).bg(c.active ? t.raised : t.chrome).text_color(c.active ? t.foreground : t.muted)
-        .hover((s) => s.bg(t.hover))
+        .border(1).border_color(c.active ? t.border : t.chrome).bg(chip).text_color(c.active ? t.foreground : t.muted)
+        .on_hover((h, cx) => { const next = h ? c.id : (this.hoverTab === c.id ? null : this.hoverTab); if (next !== this.hoverTab) { this.hoverTab = next; cx.notify(); } })
         .on_mouse_down("left", (e, cx) => { cx.stop_propagation(); this.pressed = i; if (e.click_count === 2) run("tab.rename", { id: c.id }); })
         .on_mouse_up("left", () => {
           const from = this.pressed; this.pressed = null;
@@ -134,7 +137,7 @@ export default class Tabs {
         })
         .on_mouse_down("right", () => openOverlay({ mod: SELF, kind: "popup", width: 260, height: 220, props: { role: "menu", tab: "tab", target: { id: c.id, space: space.id } } }))
         .child(this.tabIcon(c, agentPane, program, t))
-        .child(div().max_w(170).truncate().child(c.zoomed ? `${name} Z` : name))
+        .child(fadeLabel(this, `tabname-${c.id}`, { text: c.zoomed ? `${name} Z` : name, bg: over(t.chrome, chip), outer: (el) => el.min_w(0).max_w(170) }))
         .when(c.status === "working", (el) => el.child(svg("mods/workspace-chrome/spinner.svg").size(12).flex_none().text_color(t.working).spin(900)))
         .when(c.status === "blocked" || c.status === "done", (el) => el.child(div().size(6).rounded(3).bg(t[c.status])))
         .when(c.active, (el) => el.child(div().id(`close-${c.id}`).text_color(t.dim).on_mouse_down("left", stop).on_click((_e, cx) => { cx.stop_propagation(); run("tab.close", { id: c.id }); }).child(svg(icon("close")).size(12))));
@@ -152,7 +155,13 @@ export default class Tabs {
           else { run("layout.select", { stack: "panel-body", child: id }); run("layout.show", { id: "panel" }); }
         }).child(svg(ico).size(14)).child(label);
     };
-    return h_flex().size_full().min_w(0).px(10).gap(3).items_center().bg(t.chrome).border_b(1).border_color(t.border)
+    // Stock 0.1.12's rule: in a windowed macOS (titlebar none) the window buttons sit over the layout at
+    // traffic_lights; when the sidebar is narrower than them (the 44px rail), the tabs start after them.
+    const root = layout(), bar = find(root, "sidebar"), w = window();
+    const lightsPadding = w?.platform === "macos" && w.titlebar === "none" && !w.fullscreen && root?.traffic_lights
+      ? Math.max(10, (root.traffic_lights[0] + 64) / (settings()?.zoom || 1) - (bar?.hidden ? 0 : bar?.size?.px ?? 0))
+      : 10;
+    return h_flex().size_full().min_w(0).pl(lightsPadding).pr(10).gap(3).items_center().bg(t.chrome).border_b(1).border_color(t.border)
       .on_mouse_up("left", () => { this.pressed = null; })
       .on_scroll_wheel((e) => { if (Math.abs(e.delta.y) >= 1) run(e.delta.y > 0 ? "tab.prev" : "tab.next"); })
       // + sits right after the last tab, as in Chrome, Figma and Paper (it scrolls with the tabs).

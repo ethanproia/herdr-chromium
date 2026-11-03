@@ -135,12 +135,23 @@ const LAYOUTS: &[(&str, &str)] = &[
     ("main", include_str!("../defaults/layouts/main.json")),
     ("terminals", include_str!("../defaults/layouts/terminals.json")),
     ("win98", include_str!("../defaults/layouts/win98.json")),
-    // HERDR: the fork's own layout, built from the bundled fork-* mods (defaults/bundled-mods.lock.json).
-    ("fork", include_str!("../defaults/layouts/fork.json")),
+    // HERDR: the fork's own layout "labs" (Ethan's), built from the bundled fork-* mods (defaults/bundled-mods.lock.json).
+    ("labs", include_str!("../defaults/layouts/labs.json")),
 ];
 
 /// Pictures shipped layouts name as their `preview`, written beside them.
-const LAYOUT_PREVIEWS: &[(&str, &str)] = &[("win98.svg", include_str!("../defaults/layouts/win98.svg"))];
+const LAYOUT_PREVIEWS: &[(&str, &str)] = &[
+    ("win98.svg", include_str!("../defaults/layouts/win98.svg")),
+    // HERDR
+    ("labs.svg", include_str!("../defaults/layouts/labs.svg")),
+];
+
+// HERDR: the fork starts on its own layout; homes left on the old name "fork" open "labs".
+pub(crate) const FORK_DEFAULT_LAYOUT: &str = "labs";
+
+pub(crate) fn renamed_layout(name: String) -> String {
+    if name == "fork" { FORK_DEFAULT_LAYOUT.to_owned() } else { name }
+}
 
 pub fn shipped_layouts() -> Vec<&'static str> {
     LAYOUTS.iter().map(|(n, _)| *n).collect()
@@ -550,11 +561,11 @@ impl AppWindow {
         crate::programs::install_icons();
         w.reload_config(window, cx);
         install_layouts();
-        let name = mods::shared("layout").and_then(|v| v.as_str().map(str::to_owned)).filter(|n| layout_path(n).exists());
+        let name = mods::shared("layout").and_then(|v| v.as_str().map(str::to_owned)).map(renamed_layout).filter(|n| layout_path(n).exists());
         // A layout whose mods are gone (Zen, T4, ADE after the update took
         // theirs) starts on Herdr's instead of a wall of "did not load".
         let gone = name.as_deref().map(missing_mods).unwrap_or_default();
-        w.load_layout(if gone.is_empty() { name.as_deref().unwrap_or("main") } else { "main" });
+        w.load_layout(if gone.is_empty() { name.as_deref().unwrap_or(FORK_DEFAULT_LAYOUT) } else { "main" });
         w.apply_look(window, cx);
         w.show_layout_notes(window, cx);
         if let (Some(n), false) = (&name, gone.is_empty()) {
@@ -3012,7 +3023,8 @@ impl AppWindow {
             }
             // ---- layout
             "layout.switch" => {
-                self.switch_layout(Self::arg(a, "name"), window, cx);
+                // HERDR: "fork" is the old name of "labs".
+                self.switch_layout(Self::arg(a, "name").map(|n| if n == "fork" { FORK_DEFAULT_LAYOUT } else { n }), window, cx);
                 return;
             }
             "layout.clone" => {

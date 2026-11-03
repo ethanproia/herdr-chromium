@@ -3,9 +3,13 @@
 // default off: Ethan 2026-11-03 "please also hide the new machine button in the bottom left").
 import { div, svg } from "gpui-kit";
 import { h_flex, v_flex } from "gpui-base";
-import { theme, run, updates, layout, shared } from "herdr";
+import { theme, run, updates, layout, shared, settings } from "herdr";
 import { icon } from "../self.js";
 import { openSectionsMenu } from "./sections.js";
+// With the fork's "glass" setting the sidebar's layout background draws translucent over a blurred window; painting
+// our own opaque chrome here would hide it, so sidebar roots leave the background to the layout then.
+const glassOn = () => settings()?.glass === true;
+
 
 function find(node, id) {
   if (node?.id === id) return node;
@@ -31,13 +35,13 @@ export default class SidebarFooter {
     if (collapsed) {
       const ctl = (id, ic, tip, action) => div().id(id).size(26).flex_none().flex().items_center().justify_center().rounded(6)
         .text_color(t.muted).hover((s) => s.bg(t.hover).text_color(t.foreground)).tooltip(tip).on_click(action).child(svg(icon(ic)).size(15));
-      return v_flex().size_full().bg(t.chrome).items_center().pt(9).gap(4)   // no top border in the rail: no stray hairline
+      return v_flex().size_full().when(!glassOn(), (el) => el.bg(t.chrome)).items_center().pt(9).gap(4)   // no top border in the rail: no stray hairline
         .on_mouse_down("right", () => openSectionsMenu())
         .when(showAddMachine(), (el) => el.child(ctl("rail-machine", "plus", "Add machine", () => run("mod.open", { name: "machine-add" }))))
         .child(ctl("rail-search", "search", "Search", () => run("mod.open", { name: "picker" })))
         .child(ctl("rail-settings", "settings", "Settings", () => run("app.settings")));
     }
-    return v_flex().size_full().bg(t.chrome).border_t(1).border_color(t.border).p(8).text_size(13)
+    return v_flex().size_full().when(!glassOn(), (el) => el.bg(t.chrome)).border_t(1).border_color(t.border).p(8).text_size(13)
       .on_mouse_down("right", () => openSectionsMenu())
       .when(showAddMachine(), (el) => el.child(row("machine", icon("plus"), "Add machine", true, () => run("mod.open", { name: "machine-add" }))));
   }

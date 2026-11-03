@@ -11,7 +11,8 @@ The lockfile (defaults/bundled-mods.lock.json) names, per mod: the labs
 branch and commit, the folder in labs, "ship": false to hold one back,
 "keys" for a keys.json written into the mod, and "rename": "paths" to rename
 only folder references (mods/<n>/, mod:<n>), never plain strings such as tool ids;
-"layout" pins the labs layout that becomes defaults/layouts/fork.json.
+"layout" pins the labs layout that becomes defaults/layouts/labs.json (and its
+preview picture, defaults/layouts/labs.svg).
 LABS_GIT (default ~/work.noindex/herdr-board/labs-wt) is any labs clone that
 has the commits; nothing is fetched here.
 
@@ -28,6 +29,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOCK = os.path.join(ROOT, "defaults", "bundled-mods.lock.json")
 MODS = os.path.join(ROOT, "defaults", "mods")
 PREFIX = "fork-"
+LABS = os.path.join(ROOT, "defaults", "layouts", "labs.json")
+LABS_SVG = os.path.join(ROOT, "defaults", "layouts", "labs.svg")
 # Never shipped: editor typings Herdr writes itself, tests, plans, launchers.
 SKIP = re.compile(r"(^|/)(gpui-kit\.d\.ts|jsconfig\.json|node_modules|test[^/]*|tests|refs|reviews|bin|PLAN[^/]*\.md|README\.md|\.gitignore|\.cache)(/|$)")
 TEXT = (".js", ".mjs", ".json", ".md", ".txt", ".svg", ".html", ".css")
@@ -82,13 +85,16 @@ def build(lock, git):
     return out
 
 
+def show(git, commit, path):
+    return subprocess.run(["git", "-C", git, "show", f"{commit}:{path}"], check=True, capture_output=True).stdout
+
+
 def fork_layout(lock, git):
-    """defaults/layouts/fork.json: the pinned labs layout (Ethan's Mac layout, built on
+    """defaults/layouts/labs.json: the pinned labs layout (Ethan's Mac layout, built on
     core roles) with every bundled mod under its fork- name. The status bar starts hidden."""
     names = {n for n, m in lock["mods"].items() if m.get("ship", True)}
     pin = lock["layout"]
-    raw = subprocess.run(["git", "-C", git, "show", f"{pin['commit']}:{pin['path']}"], check=True, capture_output=True).stdout
-    layout = json.loads(raw)
+    layout = json.loads(show(git, pin["commit"], pin["path"]))
     layout.pop("cloned_from", None)
     if layout.get("terminal_menu") in names:
         layout["terminal_menu"] = PREFIX + layout["terminal_menu"]
@@ -140,8 +146,10 @@ def main():
                     have[os.path.relpath(p, d)] = open(p, "rb").read()
             if digest(have) != digest(files):
                 bad.append(name)
-        if open(os.path.join(ROOT, "defaults", "layouts", "fork.json")).read() != fork_layout(lock, git):
-            bad.append("layouts/fork.json")
+        if open(LABS).read() != fork_layout(lock, git):
+            bad.append("layouts/labs.json")
+        if open(LABS_SVG, "rb").read() != show(git, lock["layout"]["commit"], lock["layout"]["preview"]):
+            bad.append("layouts/labs.svg")
         print("sync-bundled-mods: " + ("in sync" if not bad else "differs: " + ", ".join(bad)))
         sys.exit(1 if bad else 0)
     # Drop fork-* copies no longer in the lockfile, then write each fresh.
@@ -156,8 +164,9 @@ def main():
             os.makedirs(os.path.dirname(p), exist_ok=True)
             open(p, "wb").write(data)
         print(f"{name}: {len(files)} files, {sum(map(len, files.values()))} bytes, digest {digest(files)}")
-    open(os.path.join(ROOT, "defaults", "layouts", "fork.json"), "w").write(fork_layout(lock, git))
-    print("layouts/fork.json: the pinned labs layout with fork- names")
+    open(LABS, "w").write(fork_layout(lock, git))
+    open(LABS_SVG, "wb").write(show(git, lock["layout"]["commit"], lock["layout"]["preview"]))
+    print("layouts/labs.json: the pinned labs layout with fork- names (preview labs.svg)")
 
 
 if __name__ == "__main__":

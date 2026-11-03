@@ -3,8 +3,16 @@
 
 import { View, div, image, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { scroller } from "./scroll.js";
-import { agents, terminals, panes, focused, spaces, run, theme, shared, setShared, setAgentOrder, openOverlay, closeOverlay, props, window, layout } from "herdr";
+import { scroller, fadeLabel, over } from "./scroll.js";
+import { agents, terminals, panes, focused, spaces, run, theme, shared, setShared, setAgentOrder, openOverlay, closeOverlay, props, window, layout, settings } from "herdr";
+// With the fork's "glass" setting the sidebar's layout background draws translucent over a blurred window; painting
+// our own opaque chrome here would hide it, so sidebar roots leave the background to the layout then.
+const glassOn = () => settings()?.glass === true;
+
+
+// Right-click on an agent row opens core's agent menu (core may be swapped for fork-core).
+const coreMod = () => { const off = settings()?.mods_disabled; return Array.isArray(off) && off.includes("fork-core") ? "fork-core" : "fork-core"; };
+const agentMenu = (a) => openOverlay({ mod: coreMod(), kind: "popup", width: 260, height: 220, props: { role: "menu", tab: "agent", target: { terminal: a.address, pane: a.pane, tab: a.tab } } });
 
 function find(node, id) {
   if (node?.id === id) return node;
@@ -59,7 +67,7 @@ const SECTION_STATUS = { 4: "blocked", 3: "done", 2: "working" };
 
 function duration(ms) {
   const m = Math.floor(ms / 60000);
-  if (m < 1) return "<1m";
+  if (m < 1) return "Now";   // Ethan: "instead of <1m ... it should say Now"
   if (m < 60) return `${m}m`;
   const h = Math.floor(m / 60);
   return h < 24 ? `${h}h` : `${Math.floor(h / 24)}d`;
@@ -197,12 +205,19 @@ export default class Agents extends View {
       .text_size(12.5)
       .when(on, (el) => el.bg(t.raised))
       .hover((s) => s.bg(t.hover))
+      .on_hover((h, cx) => {
+        if (h) this.hovered = k.address;
+        else if (this.hovered === k.address) this.hovered = null;
+        cx.notify();
+      })
       .on_click(() => this.peek(k.address))
       .children(s.lines.map(l => div().self_start().mt(-4).w(9).h(17).mr(4).flex_none()
         .when(Boolean(l), el => el.border_l(1.5).border_color(t.input))
         .when(l === "└" || l === "├", el => el.border_b(1.5).rounded_bl(6))))
       .when(Boolean(pic), el => el.child(div().mr(8).child(pic)))
-      .child(div().flex_1().truncate().text_color(on ? t.foreground : t.muted).child(k.name || k.template || k.program?.name || k.address))
+      .child(fadeLabel(this, `sub-${k.address}`, { text: k.name || k.template || k.program?.name || k.address,
+        bg: over(t.chrome, this.hovered === k.address ? t.hover : on ? t.raised : null),   // what the row shows: hover wins over selected, as the host's hover style does
+        style: (el) => el.text_color(on ? t.foreground : t.muted) }))
       .child(this.status(t, { status: st }, compact));
   }
 
@@ -304,6 +319,7 @@ export default class Agents extends View {
             .hover((s) => s.bg(t.hover)).cursor_pointer()
             .tooltip(label(a))
             .on_click(() => run("pane.focus", { pane: a.pane }))
+            .on_mouse_down("right", (_e, cx) => { cx.stop_propagation(); agentMenu(a); })
             .child(pic)
             .when(a.status && a.status !== "idle", (el) => el.child(div().absolute().right(1).bottom(1).child(this.status(t, a, true)))));
       }
@@ -348,16 +364,19 @@ export default class Agents extends View {
           cx.notify();
         })
         .on_click(() => run("pane.focus", { pane: a.pane }))
+        .on_mouse_down("right", (_e, cx) => { cx.stop_propagation(); agentMenu(a); })
         .when(Boolean(pic), el => el.child(div().id(`agent-fold-${a.address}`)
           .when(subs.length > 0, el => el.on_click((_e, cx) => {
             cx.stop_propagation();
             this.folded.has(a.address) ? this.folded.delete(a.address) : this.folded.add(a.address);
             cx.notify();
           })).child(pic)))
-        // The name (and its space detail) is the one part that gives way: it truncates with an ellipsis as one line, so
+        // The name (and its space detail) is the one part that gives way: it fades out at its right edge (no ellipsis) as one line, so
         // no "·" is ever left dangling; the machine tag, time and status keep fixed room and never overlap it
         // (Ethan: "this is not truncating properly").
-        .child(div().flex_1().min_w(0).truncate().text_color(idle ? t.muted : t.foreground).child(full && more ? `${name} \u00b7 ${more}` : name))
+        .child(fadeLabel(this, `ag-${a.address}`, { text: full && more ? `${name} \u00b7 ${more}` : name,
+          bg: over(t.chrome, this.hovered === a.address ? t.hover : a.focused ? t.selected : null),
+          style: (el) => el.text_color(idle ? t.muted : t.foreground) }))
         .when(Boolean(machine), el => el.child(div().flex_none().text_size(10).text_color(t.dim).child(machine)))
         .when(subs.length > 0, el => el.child(fold(a, subs)))
         .when(this.hovered === a.address, el => el.child(pin))
@@ -395,7 +414,7 @@ export default class Agents extends View {
           open ? this.folded.add(g.id) : this.folded.delete(g.id);
           cx.notify();
         })
-        .child(div().truncate().text_color(t[g.status] ?? t.dim).child(g.label))
+        .child(fadeLabel(this, `hd-${g.id}`, { text: g.label, bg: t.chrome, style: (el) => el.text_color(t[g.status] ?? t.dim), outer: (el) => el.min_w(0) }))
         .when(byPriority || !open, (el) => el.child(div().text_color(t.dim).child(String(g.members.length))))
         .child(div().flex_1())
         .when(!open, (el) => el
@@ -409,7 +428,7 @@ export default class Agents extends View {
     return v_flex()
       .size_full()
       .min_h(0)
-      .bg(t.chrome)
+      .when(!glassOn(), (el) => el.bg(t.chrome))
       .border_t(1)
       .border_color(t.border)
       .text_size(13)

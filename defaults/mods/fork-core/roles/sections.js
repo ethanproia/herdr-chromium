@@ -32,7 +32,7 @@ export function toggleFromClick(key) {
   applySections();
 }
 export const openSectionsMenu = () =>
-  openOverlay({ mod: SELF, kind: "popup", width: 260, height: menuHeight(SECTION_KEYS.length + 1, 1) + 30 /* collapse row, hairline, "Show" label */, props: { role: "menu", tab: "sidebar" } });
+  openOverlay({ mod: SELF, kind: "popup", width: 260, height: menuHeight(5, 2) + 30 /* collapse, 3 switches, Add machine…; 2 hairlines; "Show" label */, props: { role: "menu", tab: "sidebar" } });
 
 // The sidebar's one switch between its two states, used by the top-bar button, the right-click menu and the key
 // (<core>.toggle-sidebar, cmd-b). Open -> remember the open width, go to the 44px rail; rail -> back to that width.

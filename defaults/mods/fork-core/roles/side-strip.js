@@ -10,6 +10,7 @@ import { div, svg } from "gpui-kit";
 import { h_flex } from "gpui-base";
 import { spaces, run, openOverlay, theme, shared, setShared, layout } from "herdr";
 import { SELF, icon } from "../self.js";
+import { fadeLabel, over } from "../scroll.js";
 import { openRegistry, openInTab } from "../look.js";
 import { menuHeight } from "../pure.js";
 import { BODY, DEFAULT_PINS, find, contentFor, withSideTools, sideIds, stripModel, reduce, sideMenuRows } from "../side-model.js";
@@ -123,11 +124,13 @@ export default class SideStrip {
       .on_mouse_down("right", () => menu(id))
       .child(glyph(tool, on));
     const open = ({ id, tool, on }) => h_flex().id(`side-tab-${id}`).h(26).px(8).gap(6).flex_none().items_center().rounded(6).text_size(12)
-      .when(on, (el) => el.bg(t.hover)).hover((s) => s.bg(t.hover)).text_color(on ? t.foreground : t.muted)
+      .when(on || this.hoverTab === id, (el) => el.bg(t.hover)).text_color(on ? t.foreground : t.muted)   // hover tracked so the fading name matches
+      .on_hover((h, c) => { const next = h ? id : (this.hoverTab === id ? null : this.hoverTab); if (next !== this.hoverTab) { this.hoverTab = next; c.notify(); } })
       .on_mouse_down("left", stop).on_click(() => showTool(id))
       .on_mouse_down("right", () => menu(id))
       .child(glyph(tool, on))
-      .child(div().max_w(120).truncate().when(id === temp, (el) => el.italic()).child(tool.name ?? id))
+      .child(fadeLabel(this, `sidename-${id}`, { text: tool.name ?? id, bg: over(t.chrome, on || this.hoverTab === id ? t.hover : null),
+        style: (el) => el.when(id === temp, (e) => e.italic()), outer: (el) => el.min_w(0).max_w(120) }))
       .child(div().id(`side-close-${id}`).size(16).flex_none().flex().items_center().justify_center().rounded(4).text_color(t.dim)
         .hover((s) => s.bg(t.raised).text_color(t.foreground))
         .on_mouse_down("left", stop)

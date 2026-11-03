@@ -11,8 +11,10 @@ export { keysym, icon };
 export const KEYFONT = ".SystemUIFont";   // the bundled UI font has no bold or symbols: macOS menus use the system one
 
 // A group label ("Tools", "Agents", "Workspace").
+// A fixed height (top + 24: an 18px line + 6 below), so every popup's height sum is exact and its bottom padding
+// stays equal to the top (Ethan: "look at the bottom inside spacing, not correct, too short").
 export function groupLabel(t, text, top = 6) {
-  return div().px(8).pt(top).pb(6).text_size(12).font_weight(500).text_color(t.dim).child(text);
+  return div().h(top + 24).flex_none().flex().items_end().px(8).pb(6).text_size(12).line_height("18px").font_weight(500).text_color(t.dim).child(text);
 }
 
 // One 32px menu row: 16px icon, name, faint hint on the right; the highlight follows pointer and arrows.

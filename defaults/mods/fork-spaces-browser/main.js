@@ -7,11 +7,24 @@ import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { spaces, machines, panes, run, openOverlay, exec, hc, theme, shared, setShared, watchFolder, window, layout, settings } from "herdr";
 import { labelOf, groupByHost } from "./hosts.js";
-import { scroller } from "./scroll.js";
+import { scroller, fadeLabel, over, tint } from "./scroll.js";
+// With the fork's "glass" setting the sidebar's layout background draws translucent over a blurred window; painting
+// our own opaque chrome here would hide it, so sidebar roots leave the background to the layout then.
+const glassOn = () => settings()?.glass === true;
+
 const MACHINE_ICONS = { null: "mods/fork-spaces-browser/laptop.svg", basis: "mods/fork-spaces-browser/laptop.svg", laptop: "mods/fork-spaces-browser/laptop.svg", studio: "mods/fork-spaces-browser/studio.svg", "studio-agent": "mods/fork-spaces-browser/studio.svg", "exe-labs": "mods/fork-spaces-browser/cloud.svg" };
 // Sidebar sections menu: core's menu role. Core's folder is "fork-core"; the fork's is "fork-core" (used when "fork-core" is switched off).
 const coreMod = () => { const off = settings()?.mods_disabled; return Array.isArray(off) && off.includes("fork-core") ? "fork-core" : "fork-core"; };
-const openSectionsMenu = () => openOverlay({ mod: coreMod(), kind: "popup", width: 260, height: 8 + 5 * 32 + 9 + 30, props: { role: "menu", tab: "sidebar" } });
+const openSectionsMenu = () => openOverlay({ mod: coreMod(), kind: "popup", width: 260, height: 8 + 5 * 32 + 2 * 9 + 30, props: { role: "menu", tab: "sidebar" } });
+// Expanded list geometry (px). Levels: machine/host heading -> user (a host's other machines) -> spaces. Each nested
+// group sits in a box with a 1px guide on its left (shadcn SidebarMenuSub): the host's guide is 14px in from its heading
+// (about under the heading's icon), the user's 12px in from the user's own guide. Controls are ONE column at the right
+// edge in fixed slots, so > + dot chevron line up on machine, user and host rows alike; space rows keep the chevron slot
+// empty so their git tail ends where the dots do.
+const IND = { host: 14, user: 12 };
+const SLOT = { remote: 20, add: 20, dot: 12, chev: 16 };
+// The pane divider token exactly (layout divider: 1px "border"), so guides read as secondary (Ethan: "same as what the divs look like between panels").
+const guideColor = (t) => t.border;
 const machineIcon = m => MACHINE_ICONS[m ?? null] ?? "mods/workspace-chrome/server.svg";
 
 function find(node, id) {
@@ -52,6 +65,14 @@ const GRACE_MS = 1500;   // longest a new space waits for its git before it is s
 
 // What a stored color name looks like on an avatar (the same in every mod
 // that draws space avatars): one strong color per hue, light and dark alike.
+// The hover text of an offline machine: "Offline since 3h ago" (since_ms is when `hc machine ls` last changed its state; there is no last-seen time).
+const offlineTip = (m) => {
+  const label = !m || m.state === "unreachable" ? "Offline" : m.state.replace(/_/g, " ").replace(/^./, (c) => c.toUpperCase());
+  const s = m?.since_ms ? Math.max(0, Math.round((Date.now() - m.since_ms) / 1000)) : null;
+  if (s == null) return label;
+  const ago = s < 90 ? "just now" : s < 5400 ? `${Math.round(s / 60)}m ago` : s < 129600 ? `${Math.round(s / 3600)}h ago` : `${Math.round(s / 86400)}d ago`;
+  return `${label} since ${ago}`;
+};
 const MARK = { ansi6: "#22a99a", ansi3: "#e3814f", ansi4: "#5b8def", ansi5: "#8b7cf6", ansi2: "#3fae6a", ansi1: "#d9649a" };
 
 // A space speaks up only when something in it needs you.
@@ -80,7 +101,8 @@ export default class Spaces extends View {
     this.pressed = null;
     this.over = null;
     this.machines = [];
-    this.folded = new Set(JSON.parse(localStorage.getItem("machines.folded") ?? "[]"));
+    // Folded machines live in shared "machines.folded" so core's machine menu can fold them too; the old local list moves over once.
+    if (shared("machines.folded") == null) { try { setShared("machines.folded", JSON.parse(localStorage.getItem("machines.folded") ?? "[]")); } catch { setShared("machines.folded", []); } }
     this.refreshMachines(cx);
     cx.timer.every(15000, cx => this.refreshMachines(cx));
     // `git status` walks the whole tree, on another machine a process there:
@@ -266,7 +288,7 @@ export default class Spaces extends View {
 
   menu(w) {
     // A popup is as tall as its items; height is only the most.
-    openOverlay({ mod: coreMod(), kind: "popup", width: 260, height: 260, props: { role: "menu", tab: "space", target: { id: w.id } } });
+    openOverlay({ mod: coreMod(), kind: "popup", width: 260, height: 400, props: { role: "menu", tab: "space", target: { id: w.id } } });
   }
 
   // Spaces in order, each worktree space moved under its main checkout's.
@@ -290,10 +312,67 @@ export default class Spaces extends View {
     return out;
   }
 
+  // Hover is tracked (not left to the host's :hover) so a fading name can match the row it sits on.
+  hoverOn(key) {
+    return (h, cx) => {
+      const next = h ? key : (this.hoverKey === key ? null : this.hoverKey);
+      if (next !== this.hoverKey) { this.hoverKey = next; cx.notify(); }
+    };
+  }
+
+  get folded() { return new Set(shared("machines.folded") ?? []); }
+
+  toggleFold(m, cx) {
+    const next = this.folded;
+    next.has(m) ? next.delete(m) : next.add(m);
+    setShared("machines.folded", [...next]);
+    cx.notify();
+  }
+
+  // Right-click on a machine heading: core's machine menu. o = { key (fold key), machine (name | null | undefined for a host), online }
+  machineMenu(o) {
+    openOverlay({ mod: coreMod(), kind: "popup", width: 260, height: 80, props: { role: "menu", tab: "machine", target: o } });
+  }
+
+  // The right-hand controls column: four fixed slots, right-aligned, always all four wide (an absent one is blank), so
+  // it lines up on every heading. o = { id, remote (machine name or null), add (machine name | null | undefined = none), dot, folded, chevron }
+  controls(t, o) {
+    const slot = (w, el) => div().w(w).h(20).flex_none().flex().items_center().justify_center().child(el ?? "");
+    const btn = (id, w, label, action) => div().id(id).w(w).h(20).flex_none().flex().items_center().justify_center().rounded(4).text_color(t.dim)
+      .hover(s => s.bg(t.raised).text_color(t.foreground)).on_click((_e, cx) => { cx.stop_propagation(); action(); }).child(label);
+    // A disconnected machine has no > or +: those slots stay blank (the heading dims instead of saying why).
+    return h_flex().flex_none().items_center()
+      .child(o.remote ? btn(`machine-remote-${o.remote}`, SLOT.remote, ">", () => run("tab.new", { name: `${o.remote} desktop`, mod: "remote-desktop", props: { id: `rd${Date.now().toString(36)}`, machine: o.remote } })) : slot(SLOT.remote))
+      .child(o.add !== undefined ? btn(`machine-add-${o.add ?? "local"}`, SLOT.add, "+", () => run("space.new", o.add ? { machine: o.add } : {})) : slot(SLOT.add))
+      .child(slot(SLOT.dot, o.dot ? div().size(6).rounded(3).bg(o.dot) : null))
+      .child(slot(SLOT.chev, svg(`mods/workspace-chrome/chevron-${o.folded ? "right" : "down"}.svg`).size(11).flex_none().text_color(t.dim)));
+  }
+
+  // One heading row. level 0: machine / host (icon, 11.5 medium); level 1: a host's user (no icon, 11, lighter).
+  // o = { id, key (fold key), level, icon, label, off (offline: whole row dims), tip (hover text), menu, controls }
+  head(t, o) {
+    const hot = this.hoverKey === o.id;
+    const one = o.level === 1;
+    return h_flex().id(o.id).h(one ? 24 : 26).flex_none().pl(one ? 13 : 8).pr(8).gap(7).items_center().rounded(6)
+      .cursor_pointer().when(hot, s => s.bg(t.hover)).on_hover(this.hoverOn(o.id))
+      .when(Boolean(o.tip), el => el.tooltip(o.tip))
+      .on_click((_e, cx) => this.toggleFold(o.key, cx))
+      .on_mouse_down("right", (_e, cx) => { cx.stop_propagation(); this.machineMenu(o.menu); })
+      .when(Boolean(o.icon), el => el.child(o.icon))
+      .child(fadeLabel(this, `hd-${o.id}`, { text: o.label, bg: over(t.chrome, hot ? t.hover : null),
+        style: (el) => el.text_size(one ? 11 : 11.5).text_color(one || o.off ? t.dim : t.muted).when(!one, e => e.font_medium()) }))
+      .child(o.controls);
+  }
+
+  // A guide-lined box for a nested group (shadcn SidebarMenuSub): 1px line in the theme border at reduced alpha.
+  nest(t, id, ml, kids) {
+    return v_flex().id(id).flex_none().ml(ml).border_l(1).border_color(guideColor(t)).children(kids);
+  }
+
   // The rows, under a header per machine once one isn't this computer.
   grouped(t, collapsed) {
     const rows = this.ordered();
-    const draw = (r) => (collapsed ? this.compact(r, t) : this.row(r, t));
+    const draw = (r, col) => (collapsed ? this.compact(r, t) : this.row(r, t, col));
     const remote = [...new Set([...rows.map(r => r.w.machine).filter(Boolean), ...this.machines.map(m => m.name)])].sort();
     const loading = m => {
       const layout = machines().find(k => k.name === m)?.layout;
@@ -301,57 +380,47 @@ export default class Spaces extends View {
         || spaces().some(s => (s.machine ?? null) === m && !this.shown.has(s.id));
     };
     const loadingRow = m => div().id(`machine-loading-${m ?? "local"}`).h(28).flex_none().px(8).text_size(12).text_color(t.dim).child(collapsed ? "…" : "Loading…");
-    if (!remote.length) return loading(null) && !rows.length ? [loadingRow(null)] : rows.map(draw);
+    if (!remote.length) return loading(null) && !rows.length ? [loadingRow(null)] : rows.map(r => draw(r, false));
     const { shared: hostMembers, sharedHost, order: machineNames } = groupByHost(remote, this.machines, collapsed);
-    return machineNames.flatMap((m) => {
+    const empty = m => h_flex().id(`machine-new-${m ?? "local"}`).h(28).flex_none().px(8).gap(7).items_center().rounded(7)
+      .text_size(12).text_color(t.dim).hover(s => s.bg(t.hover).text_color(t.foreground))
+      .on_click(() => run("space.new", m ? { machine: m } : {}))
+      .child(svg("mods/workspace-chrome/plus.svg").size(12)).when(!collapsed, el => el.child("New space there"));
+    const out = [];
+    let nest = null;   // the open host box: its heading's key, and the rows collected into it
+    const flush = () => { if (nest && !nest.skip) { out.push(this.nest(t, `host-box-${nest.h}`, IND.host, nest.kids)); } nest = null; };
+    for (const m of machineNames) {
       if (m?.startsWith("host:")) {
-        const h = m.slice(5);
-        const folded = this.folded.has(m);
+        flush();
+        const h = m.slice(5), folded = this.folded.has(m);
         const online = hostMembers[h].some(n => this.machines.find(k => k.name === n)?.state === "connected");
-        return [h_flex().id(`host-${h}`).h(26).flex_none().px(8).gap(7).items_center().text_size(11).text_color(t.dim)
-          .cursor_pointer().hover(s => s.bg(t.hover))
-          .on_click((_e, cx) => {
-            folded ? this.folded.delete(m) : this.folded.add(m);
-            localStorage.setItem("machines.folded", JSON.stringify([...this.folded]));
-            cx.notify();
-          })
-          .child(svg(machineIcon(hostMembers[h][0])).size(13).flex_none())
-          .child(div().flex_1().truncate().child(h))
-          .child(div().size(6).rounded(3).flex_none().bg(online ? t.ansi2 : t.dim))
-          .child(svg(`mods/workspace-chrome/chevron-${folded ? "right" : "down"}.svg`).size(11).flex_none())];
+        out.push(this.head(t, { id: `host-${h}`, key: m, level: 0, icon: svg(machineIcon(hostMembers[h][0])).size(13).flex_none().text_color(online ? t.muted : t.dim), label: h, off: !online,
+          tip: online ? null : offlineTip(hostMembers[h].map(n => this.machines.find(k => k.name === n)).filter(Boolean)[0]), menu: { key: m, online },
+          controls: this.controls(t, { dot: online ? t.ansi2 : t.dim, folded }) }));
+        nest = { h, kids: [], skip: folded };   // a folded host hides its users with it
+        continue;
       }
       const host = m && sharedHost(m);
-      // A member of a folded host heading is hidden with it.
-      if (host && this.folded.has(`host:${host}`)) return [];
       const mine = rows.filter((r) => (r.w.machine ?? null) === m);
       const machine = this.machines.find(k => k.name === m);
       const connected = !m || machine?.state === "connected";
       const folded = this.folded.has(m);
-      const head = h_flex().id(`machine-${m ?? "local"}`).h(26).flex_none().px(collapsed ? 2 : 8).when(host, el => el.pl(22)).gap(7).items_center().text_size(11).text_color(t.dim)
-        .cursor_pointer().hover(s => s.bg(t.hover))
-        .on_click((_e, cx) => {
-          folded ? this.folded.delete(m) : this.folded.add(m);
-          localStorage.setItem("machines.folded", JSON.stringify([...this.folded]));
-          cx.notify();
-        })
-        .when(!host, el => el.child(svg(machineIcon(m)).size(13).flex_none()))
-        .when(!collapsed, el => el.child(div().flex_1().truncate().child(host ? labelOf(m, host) : m ?? "This computer"))
-          .when(!connected, el => el.child(div().flex_none().child((machine?.state ?? "asleep").replace(/_/g, " "))))
-          // Remote desktop (chevron) sits flush left of the + and is styled exactly like it; opens that machine's screen as a tab.
-          .when(connected, el => el.child(h_flex().flex_none().items_center()
-            .when(!!m, e => e.child(div().id(`machine-remote-${m}`).flex_none().px(4).rounded(4).hover(s => s.bg(t.hover).text_color(t.foreground))
-              .on_click((_e, cx) => { cx.stop_propagation(); run("tab.new", { name: `${m} desktop`, mod: "remote-desktop", props: { id: `rd${Date.now().toString(36)}`, machine: m } }); })
-              .child(">")))
-            .child(div().id(`machine-add-${m ?? "local"}`).flex_none().px(4).rounded(4).hover(s => s.bg(t.hover).text_color(t.foreground))
-            .on_click((_e, cx) => { cx.stop_propagation(); run("space.new", m ? { machine: m } : {}); }).child("+"))))
-          .child(div().size(6).rounded(3).flex_none().bg(connected ? t.ansi2 : t.dim))
-          .child(svg(`mods/workspace-chrome/chevron-${folded ? "right" : "down"}.svg`).size(11).flex_none()));
-      const empty = h_flex().id(`machine-new-${m ?? "local"}`).h(28).flex_none().px(8).gap(7).items_center().rounded(7)
-        .text_size(12).text_color(t.dim).hover(s => s.bg(t.hover).text_color(t.foreground))
-        .on_click(() => run("space.new", m ? { machine: m } : {}))
-        .child(svg("mods/workspace-chrome/plus.svg").size(12)).when(!collapsed, el => el.child("New space there"));
-      return [head, ...(folded ? [] : mine.length ? mine.map(draw) : [loading(m) ? loadingRow(m) : empty])];
-    });
+      const tip = connected ? null : offlineTip(machine);
+      const ctl = this.controls(t, { remote: connected && m ? m : null, add: connected ? (m ?? null) : undefined, dot: connected ? t.ansi2 : t.dim, folded });
+      if (host) {
+        // A host's user: under its host's guide, its spaces under its own (hidden with a folded host heading).
+        if (!nest || nest.h !== host) { flush(); nest = { h: host, kids: [] }; }
+        if (nest.skip) continue;
+        nest.kids.push(this.head(t, { id: `machine-${m}`, key: m, level: 1, label: labelOf(m, host), off: !connected, tip, menu: { key: m, machine: m, online: connected }, controls: ctl }));
+        if (!folded) nest.kids.push(this.nest(t, `user-box-${m}`, IND.user, mine.length ? mine.map(r => draw(r, true)) : [loading(m) ? loadingRow(m) : empty(m)]));
+        continue;
+      }
+      flush();
+      out.push(this.head(t, { id: `machine-${m ?? "local"}`, key: m, level: 0, icon: svg(machineIcon(m)).size(13).flex_none().text_color(connected ? t.muted : t.dim), label: m ?? "This computer", off: !connected, tip, menu: { key: m, machine: m ?? null, online: connected }, controls: ctl }));
+      if (!folded) out.push(...(mine.length ? mine.map(r => draw(r, true)) : [loading(m) ? loadingRow(m) : empty(m)]));
+    }
+    flush();
+    return out;
   }
 
   // Only what's unusual, after the name: "herdr \u00b7 spike \u21912 \u21931". The repo or
@@ -394,21 +463,24 @@ export default class Spaces extends View {
         .when(g.behind > 0, (el) => el.child(div().flex_none().text_color(t.ansi1).child(`\u2193${g.behind}`))));
   }
 
-  row({ w, i, g, tree }, t) {
+  row({ w, i, g, tree }, t, col = false) {
     const on = w.active;
     const colors = shared("space.colors") ?? {};
     const color = colors[w.id] ?? "ansi6";
     const fill = color.startsWith("#") ? color : (MARK[color] ?? t[color]);
+    const hot = this.hoverKey === `space-${w.id}`;
     return v_flex()
       .relative()
       .id(`space-${w.id}`)
-      .px(8)
+      .pl(8)
+      .pr(col ? 8 + SLOT.chev : 8)
       .h(rowHeight({ tree }))
       .flex_none()
       .justify_center()
       .rounded(8)
       .when(on, (el) => el.bg(t.selected))
-      .when(!on, (el) => el.hover((s) => s.bg(t.hover)))
+      .when(!on && hot, (el) => el.bg(t.hover))
+      .on_hover(this.hoverOn(`space-${w.id}`))
       .when(this.pressed !== null && this.over === i && this.pressed !== i, (el) => el.border_t(2).border_color(t.accent))
       .on_mouse_down("left", () => {
         this.pressed = i;
@@ -428,7 +500,8 @@ export default class Spaces extends View {
           .items_center()
           .when(Boolean(tree), el => el.pl(22).child(svg("mods/workspace-chrome/branch.svg").size(13).text_color(t.dim)))
           .when(!tree, el => el.child(h_flex().size(18).flex_none().rounded(5).bg(fill).items_center().justify_center().text_size(10.5).font_bold().text_color("#ffffff").child([...w.name][0]?.toUpperCase() ?? "?")))
-          .child(div().flex_shrink(0).max_w(150).truncate().text_color(t.foreground).child(w.name))
+          .child(fadeLabel(this, `sp-${w.id}`, { text: w.name, bg: over(t.chrome, on ? t.selected : hot ? t.hover : null),
+            style: (el) => el.text_color(t.foreground), outer: (el) => el.min_w(0).max_w(150) }))
           .child(g ? this.gitTail(g, tree, w.name, t, w.id) : div().flex_1()),
       );
   }
@@ -487,7 +560,7 @@ export default class Spaces extends View {
         .text_color(t.muted).hover((s) => s.bg(t.hover).text_color(t.foreground)).tooltip(tip)
         .on_mouse_down("left", (_e, cx) => cx.stop_propagation()).on_click(action)
         .child(svg(`mods/workspace-chrome/${ic}.svg`).size(15));
-      return v_flex().size_full().min_h(0).bg(t.chrome).items_center().text_size(13)
+      return v_flex().size_full().min_h(0).when(!glassOn(), (el) => el.bg(t.chrome)).items_center().text_size(13)
         // The sidebar button lives in the top bar; only a windowed macOS (traffic lights in that row) shows it here.
         .when(window()?.platform === "macos" && !window()?.fullscreen, (el) => el.child(div().pt(2).pb(4).flex_none().child(ctl("rail-expand", "sidebar", "Expand sidebar", () => expandSidebar()))))
         .child(scroller(this, "rail", { id: "spaces-rail", bg: t.chrome, children: this.rail(t),   // just the spaces; search and settings are the sidebar footer (core), the true bottom
@@ -496,7 +569,7 @@ export default class Spaces extends View {
             .on_mouse_up("left", (_e, cx) => { this.pressed = null; cx.notify(); }),
           inner: (el) => el.items_center().pb(8).pt(3) }));
     }
-    return v_flex().size_full().min_h(0).bg(t.chrome).text_size(13)
+    return v_flex().size_full().min_h(0).when(!glassOn(), (el) => el.bg(t.chrome)).text_size(13)
       .child(h_flex().id("spaces-title").on_mouse_down("right", () => openSectionsMenu()).h(31).pl(16).pr(10).items_center().justify_between().text_size(11.5).text_color(t.dim)
         .child("Spaces")
         .child(div().id("space-new").p(4).rounded(5).hover(s => s.bg(t.hover).text_color(t.foreground)).on_click(() => run("space.new")).child("+")))

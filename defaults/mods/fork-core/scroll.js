@@ -8,7 +8,7 @@
 // The owner (the View) keeps the state in owner._scroll[key]. The host has no way to read a native scroll offset, so
 // this owns it: the outer box clips, the inner box is shifted up by the offset, the wheel moves the offset.
 import { div } from "gpui-kit";
-import { v_flex } from "gpui-base";
+import { v_flex, h_flex } from "gpui-base";
 
 export const FADE_H = 20;      // px, tall enough to read as a fade, short enough to hide little
 const STRIPS = 10;             // the host's background takes a colour, not a gradient: the fade is stacked tints
@@ -34,6 +34,20 @@ export function tint(color, a) {
 }
 // Alpha of strip i (0 = the edge) of n: smooth from opaque at the edge to clear.
 export const stripAlpha = (i, n) => { const x = (i + 0.5) / n; return (1 - x) * (1 - x) * (1 + 2 * x) * 0.9; };   // 1 - smoothstep(x), a touch under solid
+
+// "#rrggbb" or "#rrggbbaa" composited over an opaque base: the colour a translucent row background really shows.
+// top absent/null gives base. null when base isn't a hex colour.
+export function over(base, top) {
+  const hex = (c) => { let h = String(c ?? "").replace("#", ""); if (h.length === 3 || h.length === 4) h = [...h].map((x) => x + x).join(""); return h.length === 6 || h.length === 8 ? (/[^0-9a-f]/i.test(h) ? null : h) : null; };
+  const b = hex(base), f = hex(top);
+  if (!b) return null;
+  if (!f) return `#${b.slice(0, 6)}`;
+  const a = f.length === 8 ? parseInt(f.slice(6, 8), 16) / 255 : 1;
+  const mix = (i) => Math.round(parseInt(f.slice(i, i + 2), 16) * a + parseInt(b.slice(i, i + 2), 16) * (1 - a)).toString(16).padStart(2, "0");
+  return `#${mix(0)}${mix(2)}${mix(4)}`;
+}
+// Does text of natural width `need` overflow a box `room` wide? Unmeasured (0 room or no need) is no overflow.
+export const overflows = (need, room) => Number.isFinite(need) && Number.isFinite(room) && room > 0 && need - room > EPS;
 
 // ---- element ---------------------------------------------------------------------------------------------------------
 function fade(bg, top) {
@@ -70,4 +84,41 @@ export function scroller(owner, key, o) {
   if (f.top && o.bg) outer.child(fade(o.bg, true));
   if (f.bottom && o.bg) outer.child(fade(o.bg, false));
   return o.outer ? o.outer(outer) : outer;
+}
+
+// ---- horizontal text fade (instead of an ellipsis) ----------------------------------------------------------------------
+export const FADE_W = 24;      // px, the last stretch of an overflowing name fades into the row's background
+const H_STRIPS = 8;            // 3px each
+
+function fadeRight(bg) {
+  const w = FADE_W / H_STRIPS;
+  const el = h_flex().absolute().top(0).bottom(0).right(0).w(FADE_W);
+  for (let k = 0; k < H_STRIPS; k++) {
+    const c = tint(bg, stripAlpha(H_STRIPS - 1 - k, H_STRIPS));   // clear at the left, near solid at the right edge
+    el.child(div().w(w).h_full().flex_none().bg(c ?? "#00000000"));
+  }
+  return el;
+}
+
+// A one-line name that, when it is wider than its room, fades out to `bg` instead of ending in an ellipsis.
+//   fadeLabel(this, `ag-${a.address}`, { text: name, bg: over(t.chrome, hovered ? t.hover : null), style: (el) => el.text_color(c), outer: (el) => el.flex_1().min_w(0) })
+// bg = the colour the row really shows right now (the caller tracks hover: normal, hover, selected). The text is measured
+// at its natural width (inner) against the room it has (outer); state lives on owner._fit[key], and a redraw is asked only
+// when the answer flips. Nothing shared is written from render.
+export function fadeLabel(owner, key, o) {
+  const fit = (owner._fit ??= new Map());
+  const k = fit.get(key) ?? { room: 0, need: 0 };
+  const note = (patch, cx) => {
+    const was = fit.get(key) ?? k, next = { ...was, ...patch };
+    fit.set(key, next);
+    if (overflows(next.need, next.room) !== overflows(was.need, was.room)) cx.notify();
+  };
+  const text = div().id(`${o.id ?? key}-txt`).flex_none().whitespace_nowrap()
+    .on_size_change((z, cx) => note({ need: z.width }, cx))
+    .child(o.text);
+  const outer = h_flex().id(`${o.id ?? key}-fade`).relative().overflow_hidden().items_center()
+    .on_size_change((z, cx) => note({ room: z.width }, cx))
+    .child(o.style ? o.style(text) : text);
+  if (overflows(k.need, k.room) && o.bg) outer.child(fadeRight(o.bg));
+  return o.outer ? o.outer(outer) : outer.flex_1().min_w(0);
 }

@@ -153,14 +153,15 @@ essexlabs/labs `projects/herdr-mods`; `defaults/bundled-mods.lock.json` pins
 each to a labs branch and commit (`"ship": false` holds one back). To update:
 re-pin the commit, run `scripts/sync-bundled-mods.py` (any labs clone with the
 commit: `LABS_GIT=<clone>`), commit `defaults/`. `--check` fails if
-`defaults/mods/fork-*` or `defaults/layouts/fork.json` drifted from the pins.
+`defaults/mods/fork-*` or `defaults/layouts/labs.json` drifted from the pins.
 
-The sync also writes the `fork` layout from the labs layout pinned under
-`"layout"` (Ethan's Mac layout, `clones/mac/layouts/main-browser.json`), with
+The sync also writes the `labs` layout (and its preview `labs.svg`) from the
+labs layout pinned under `"layout"` (Ethan's, `clones/mac/layouts/Labs.json`), with
 each bundled mod under its `fork-` name: `fork-core` serves the tab strip,
 pane header, right-click menu (`"terminal_menu": "fork-core"`), sidebar header
-and footer, side panel strip and status bar (hidden to start). Pick it with
-`layout.switch fork`; `main` is unchanged.
+and footer, side panel strip and status bar (hidden to start). It is the fork's
+default layout; a home still on the old name `fork` opens `labs`, and
+`layout.switch fork` reaches it too. `main` is unchanged.
 
 Bundled now: `fork-core` (with its tool descriptors in `tools/`),
 `fork-spaces-browser` and `fork-agents-named` (the sidebar, from labs
