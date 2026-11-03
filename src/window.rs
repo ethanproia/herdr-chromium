@@ -3943,7 +3943,20 @@ impl AppWindow {
                 }
                 crate::browser::view::BrowserEvent::Region(_) => return,
                 // S27: fork-input's arm answers with show_recipients; a no-op until it lands.
-                crate::browser::view::BrowserEvent::PickRecipient => return,
+                // HERDR: S27. The Send badge asks who to send to: the live agents, as in the panes list.
+                crate::browser::view::BrowserEvent::PickRecipient => {
+                    let m = &this.model;
+                    let rows = m.agents.iter().filter(|(a, _)| this.live.contains_key(*a) && m.status(a).is_some()).map(|(addr, a)| {
+                        let name = this.live.get(addr).and_then(|r| r["name"].as_str()).filter(|s| !s.is_empty()).map(str::to_owned)
+                            .or_else(|| a.app.as_deref().map(agent_name)).unwrap_or_else(|| addr.to_owned());
+                        (addr.clone(), name, a.word.clone())
+                    });
+                    let list = crate::browser::send_to::candidates(rows.collect::<Vec<_>>());
+                    if let Some(view) = this.browsers.view(id).cloned() {
+                        view.update(cx, |v, cx| v.show_recipients(list, cx));
+                    }
+                    return;
+                }
                 // HERDR: browser block. Send's batch goes to the agent side (fork-agent's S8).
                 crate::browser::view::BrowserEvent::Annotations(batch) => {
                     this.browsers.annotations(batch.clone());
