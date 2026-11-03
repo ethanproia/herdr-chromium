@@ -53,7 +53,7 @@ export function encodeLink(item) {
 export function parseHref(href) {
   const h = String(href || "");
   let m;
-  if ((m = /^date:(\d{4}-\d{2}-\d{2})$/.exec(h))) return { kind: "date", date: m[1] };
+  if ((m = /^date:(\d{4}-\d{2}-\d{2})(?:T(\d{2}:\d{2}))?$/.exec(h))) return m[2] ? { kind: "date", date: m[1], time: m[2] } : { kind: "date", date: m[1] };
   if ((m = /^herdr:agent\/(.+)$/.exec(h))) return { kind: "agent", id: m[1] };
   if ((m = /^herdr:tab\/(.+)$/.exec(h))) return { kind: "tab", id: m[1] };
   if (/^[a-z][a-z0-9+.-]*:\/\//i.test(h) || /^mailto:/i.test(h)) return { kind: "url", id: h };

@@ -7,9 +7,11 @@
 //    refs/embeds/notion-quote-leftborder.webp, with a small "filename ... Open" header row.
 import { div, image } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { exec, readTextFile, home, appHome } from "herdr";
-import { parseMeta, hashKey, extOf, isRemote, excerpt, lineOf, fit, cover, clampText, domainOf } from "./embeds-core.js";
+import { exec, readTextFile, home, appHome, run } from "herdr";
+import { parseMeta, hashKey, extOf, isRemote, excerpt, lineOf, fit, cover, clampText, domainOf, cacheGet, cacheSet, FAIL_TTL } from "./embeds-core.js";
+import { openableUrl } from "./rows.js";
 
+const FILE_RECHECK_MS = 2000;
 const CACHE_REL = "mods/fork-notepad/.cache";   // image() paths are relative to ~/.config/herdr-app
 const FETCH_MS = 5000, FETCH_CAP = 512 * 1024, FILE_LINES = 20;
 const MAX_IMG_H = 520;
@@ -77,7 +79,7 @@ async function load(e, cx) {
 }
 
 export class Embeds {
-  constructor() { this.cache = new Map(); this.busy = new Set(); }
+  constructor() { this.cache = new Map(); this.busy = new Set(); this.checked = new Map(); }
   // At most 3 loads at once (the rest start as these finish and redraw); keep the newest 200 results.
   static MAX_LOADS = 3;
   static MAX_CACHE = 200;
@@ -85,15 +87,30 @@ export class Embeds {
   get(embed, cx) {
     try {
       const k = keyOf(embed);
-      if (this.cache.has(k)) return this.cache.get(k);
+      const hit = cacheGet(this.cache, k, Date.now());
+      if (hit) {
+        // An embedded file on screen is re-read at most every 2 s; it redraws only when its text changed.
+        if (embed.kind === "file" && hit.ok && Date.now() - (this.checked.get(k) ?? 0) > FILE_RECHECK_MS && !this.busy.has(k)) {
+          this.checked.set(k, Date.now());
+          this.busy.add(k);
+          cx.spawn(async (cx) => {
+            let data;
+            try { data = await load(embed, cx); } catch { data = null; }
+            this.busy.delete(k);
+            if (data && JSON.stringify(data) !== JSON.stringify(hit)) { cacheSet(this.cache, k, data, Date.now(), Embeds.MAX_CACHE); cx.notify(); }
+          });
+        }
+        return hit;
+      }
       if (!this.busy.has(k) && this.busy.size < Embeds.MAX_LOADS) {
         this.busy.add(k);
         cx.spawn(async (cx) => {
           let data;
           try { data = await load(embed, cx); } catch { data = { ok: false, why: "Could not load" }; }
-          this.cache.set(k, data);
-          if (this.cache.size > Embeds.MAX_CACHE) this.cache.delete(this.cache.keys().next().value);
+          cacheSet(this.cache, k, data, Date.now(), Embeds.MAX_CACHE);
           this.busy.delete(k);
+          // A failure is shown until it expires, then one redraw tries again. Successes stay cached.
+          if (!data?.ok) cx.timer.after(FAIL_TTL, (cx) => cx.notify());
           cx.notify();
         });
       }
@@ -143,7 +160,7 @@ function bookmark(t, id, embed, d, width) {
   const title = d.title || d.domain || embed.url;
   const card = h_flex().id(id).w_full().h(H).rounded(6).border(1).border_color(t.border).overflow_hidden()
     .cursor_pointer().hover((s) => s.bg(t.hover))
-    .on_click(() => { exec("open", [embed.url]).catch(() => {}); });
+    .on_click(() => { const url = openableUrl(embed.url); if (url) exec("open", [url]).catch(() => {}); });
   const col = v_flex().flex_1().min_w(0).h_full().px(14).py(10).gap(4).justify_between()
     .child(v_flex().gap(2)
       .child(div().text_size(14).line_height("20px").text_color(t.foreground).truncate().child(title))
@@ -176,7 +193,7 @@ function fileBlock(t, id, embed, d, width) {
     return base.child(l.text || " ");
   };
   const open = h_flex().id(id + "-open").h(20).px(6).items_center().rounded(4).cursor_pointer().flex_none()
-    .hover((s) => s.bg(t.hover)).on_click(() => { exec("open", [d.path]).catch(() => {}); })
+    .hover((s) => s.bg(t.hover)).on_click(() => { run("pane.split", { direction: "right", mod: "fork-notepad-view", props: { view: d.path } }); })
     .child(div().text_size(12).text_color(t.muted).child("Open"));
   return div().w_full().py(4).child(
     v_flex().id(id).w_full().border_l(3).border_color(t.border).pl(14).pr(4).py(2).gap(2)
