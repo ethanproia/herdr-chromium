@@ -1,6 +1,0 @@
-{
-  "global": {
-    "cmd-d": "fork-core.split-right",
-    "cmd-shift-d": "fork-core.split-down"
-  }
-}
