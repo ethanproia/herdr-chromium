@@ -448,6 +448,17 @@ fn drop_stale_input(queued: &mut Vec<InputEvent>) -> usize {
     n
 }
 
+/// What a debug line may say about an input event: its type, never what was typed or where.
+fn input_kind(event: &InputEvent) -> &'static str {
+    match event {
+        InputEvent::Mouse { .. } => "mouse",
+        InputEvent::Wheel { .. } => "wheel",
+        InputEvent::Key { .. } => "key",
+        InputEvent::Text { .. } => "text",
+        InputEvent::Ime(_) => "ime",
+    }
+}
+
 /// Browsers whose readiness probe is waiting get a mouse move at the pointer's position every
 /// 100 ms until one reaches the page (harmless: a hover where the pointer already is).
 fn nudge_waiting() {
@@ -976,7 +987,7 @@ fn browser_msg(m: AppToHost) {
         | M::Focus { id, .. } | M::SetZoom { id, .. } | M::Input { id, .. } | M::Edit { id, .. } | M::Find { id, .. } | M::StopFind { id, .. }
         | M::DevTools { id, .. } | M::Eval { id, .. } | M::Overlay { id, .. } | M::PickInfo { id, .. } | M::PickRelative { id, .. } | M::Styles { id, .. } | M::SetStyle { id, .. } | M::RevertStyle { id, .. } | M::SetVisible { id, .. } => id.clone(),
         other => {
-            debug(format_args!("not a browser message, dropped: {}", encode(&other)));
+            debug(format_args!("not a browser message, dropped"));
             return;
         }
     };
@@ -1056,7 +1067,7 @@ fn browser_msg(m: AppToHost) {
                     .is_some()
             })
             .unwrap_or(false);
-            debug(format_args!("{id}: input {} {}", if queued { "held" } else { "sent" }, encode(&event).chars().take(60).collect::<String>()));
+            debug(format_args!("{id}: input {} {}", if queued { "held" } else { "sent" }, input_kind(&event)));
             if !queued {
                 input(&host, event);
             }
@@ -1262,6 +1273,13 @@ fn write_png(s: &Surface, path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::popup_place;
+
+    #[test]
+    fn input_debug_lines_name_the_type_only() {
+        let typed = herdr_browser_protocol::InputEvent::Text { text: "hunter2".into() };
+        assert_eq!(super::input_kind(&typed), "text");
+        assert!(!format!("input sent {}", super::input_kind(&typed)).contains("hunter2"));
+    }
 
     #[test]
     fn a_new_load_drops_input_held_for_the_old_document() {
