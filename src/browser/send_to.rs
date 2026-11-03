@@ -69,6 +69,8 @@ pub struct SendTo {
     /// The batch on its way: recipient, batch id, when it was written.
     pub sent: Option<(Recipient, u64, u64)>,
     pub failed: Option<String>,
+    /// Why the last send went without its picture, said on the chip.
+    pub picture_note: Option<String>,
 }
 
 impl SendTo {
@@ -84,7 +86,8 @@ impl SendTo {
         Some(to)
     }
 
-    pub fn delivered(&mut self, result: Result<(Recipient, u64), String>, now_ms: u64) {
+    pub fn delivered(&mut self, result: Result<(Recipient, u64), String>, now_ms: u64, picture_note: Option<String>) {
+        self.picture_note = picture_note;
         match result {
             Ok((to, id)) => {
                 self.sent = Some((to, id, now_ms));
@@ -106,6 +109,15 @@ impl SendTo {
             Chip::NotRead(to.name.clone())
         } else {
             Chip::Queued(to.name.clone())
+        })
+    }
+
+    /// The chip's words: where the batch stands, and why the picture was left out if it was.
+    pub fn chip_line(&self, inbox_root: &Path, now_ms: u64) -> Option<String> {
+        let chip = self.chip(inbox_root, now_ms)?.text();
+        Some(match &self.picture_note {
+            Some(why) => format!("{chip} · no picture: {why}"),
+            None => chip,
         })
     }
 
@@ -216,14 +228,15 @@ mod tests {
         assert!(d.dir.join("note.md").exists());
         let root = inbox::root(&home);
         let mut s = SendTo::default();
-        s.delivered(Ok((to.clone(), 5)), 1_000);
+        s.delivered(Ok((to.clone(), 5)), 1_000, None);
         assert_eq!(s.chip(&root, 1_000).unwrap().text(), "Queued for Claude Code");
         assert_eq!(s.chip(&root, 1_000 + NOT_READ_MS).unwrap().text(), "Not read yet by Claude Code");
         assert!(s.waiting(&root));
         inbox::mark_read(&root, "t7", 5, 2_000).unwrap();
         assert_eq!(s.chip(&root, 1_000 + NOT_READ_MS).unwrap().text(), "Read by Claude Code");
         assert!(!s.waiting(&root));
-        s.delivered(Err("disk full".into()), 3_000);
+        s.delivered(Err("disk full".into()), 3_000, Some("the region was off screen".into()));
+        assert_eq!(s.chip_line(&root, 3_000).unwrap(), "Not sent: disk full · no picture: the region was off screen");
         assert_eq!(s.chip(&root, 3_000), Some(Chip::Failed("disk full".into())));
         std::fs::remove_dir_all(home).unwrap();
     }

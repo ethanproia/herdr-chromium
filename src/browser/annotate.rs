@@ -110,6 +110,13 @@ impl Annotations {
         batch
     }
 
+    /// An addressed Send failed: pins `ns` are pending again, so nothing is lost.
+    pub fn restore(&mut self, ns: &[u32]) {
+        for a in self.list.iter_mut().filter(|a| ns.contains(&a.n)) {
+            a.state = State::Pending;
+        }
+    }
+
     /// Clear without sending.
     pub fn discard(&mut self) {
         self.list.retain(|a| a.state != State::Pending);
