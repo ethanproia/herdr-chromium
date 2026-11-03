@@ -95,6 +95,11 @@ pub(crate) fn current(action: &str) -> String {
 /// A mod's command whose mod is gone (0.1.x's `ribbon.next`): bound to nothing.
 fn gone_mod(action: &str) -> bool {
     let name = action.split_once(':').map_or(action, |(n, _)| n);
+    // HERDR: keys of a mod turned off (settings mods_disabled) are skipped like a missing mod's.
+    let off = crate::mods::disabled();
+    if action.strip_prefix("mod.open:").is_some_and(|m| off.contains(m)) || name.split_once('.').is_some_and(|(m, _)| off.contains(m)) {
+        return true;
+    }
     crate::commands::find(name).is_none()
         && name.split_once('.').is_some_and(|(m, _)| !m.starts_with("frame-") && !crate::mods::mods_dir().join(m).is_dir())
 }

@@ -21,6 +21,7 @@ mod persist;
 mod macos;
 mod mods;
 mod mod_files;
+mod mod_keys;
 mod process_cwd;
 mod programs;
 mod settings;

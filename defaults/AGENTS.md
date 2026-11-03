@@ -411,6 +411,15 @@ Narrower than 160px, the sidebar mods draw a compact rail; folding resizes
 `sidebar` to 44 (76 on macOS, room for the traffic lights). On macOS,
 the tabs also leave room for the window buttons when the sidebar is narrower.
 
+### Turning a mod off
+
+`"mods_disabled": ["fork-board"]` in `settings.json` turns those mods off
+without deleting them: Herdr no longer finds them, so `mod.open`,
+`tab.new` and `pane.split` with one say it is turned off, keys that open
+or call it do nothing, the new menu hides its row, and a layout that
+shows it falls back like one with a missing mod. Their files stay (and
+keep updating); remove the name to turn it back on, no restart needed.
+
 ### Layouts and mods other people made
 
 People share layouts at herdr.dev/layouts and mods at herdr.dev/mods. Each
@@ -433,8 +442,11 @@ folder on GitHub):
    program, a name clash) or the person asks. If the files don't work on
    this version, or the person wants it different, build it from the
    recipe instead.
-4. A mod's `keys.json`: merge it into the person's. Add its sections and
-   keys, and ask before replacing a key they already use.
+4. A mod's `keys.json` stays in its folder: on start Herdr adds its keys
+   to the person's `keys.json`, never replacing a key they already use
+   (a toast says which it skipped) and never re-adding one they deleted.
+   The first time it changes `keys.json` it keeps the old file as
+   `keys.json.bak`; what it added is in `keys-merged.json`.
 5. `herdr-app check` each mod; for a layout, then `layout.switch {name}`.
    The person's own layout stays as it was; `ctrl-shift-l` switches back,
    and deleting the files removes it.
