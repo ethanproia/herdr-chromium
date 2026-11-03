@@ -92,7 +92,7 @@ export function parseInline(str) {
   while ((m = re.exec(str))) {
     if (m.index > at) out.push({ t: "text", s: str.slice(at, m.index) });
     const s = m[0];
-    if (m[6]) out.push({ t: "mark", s: "[" }, { t: "link", s: m[7].replace(/\\(.)/g, "$1"), href: m[8].replace(/^<(.*)>$/, "$1") }, { t: "mark", s: `](${m[8]})` });
+    if (m[6]) out.push({ t: "mark", s: "[" }, { t: "link", s: m[7].replace(/\\(.)/g, "$1"), href: m[8].replace(/^<(.*)>$/, "$1"), start: m.index }, { t: "mark", s: `](${m[8]})` });
     else if (m[1]) out.push({ t: "mark", s: "`" }, { t: "code", s: s.slice(1, -1) }, { t: "mark", s: "`" });
     else if (m[2] || m[3]) out.push({ t: "mark", s: s.slice(0, 2) }, { t: "bold", s: s.slice(2, -2) }, { t: "mark", s: s.slice(-2) });
     else out.push({ t: "mark", s: s[0] }, { t: "italic", s: s.slice(1, -1) }, { t: "mark", s: s[0] });
@@ -130,14 +130,43 @@ export function ageOf(ms, now) {
   return `${Math.floor(s / (86400 * 7))}w`;
 }
 
+// A line an agent added (`notepad add`). The editor hides it; plain text and PDF drop it too.
+// Copy as Markdown keeps the raw note, marker included.
+export const BY_MARK = /\s*<!-- by (.+?) -->$/;
+export const stripBy = (row) => row.replace(BY_MARK, "");
+
+// Join an append-only disk update onto local text. `disk` starts with `loaded` (the caller's isAppend check).
+// bin/notepad writes its own newline when the base had none. A second Notepad pane saving a keystroke at the
+// end of the last row is also an append, and must stay on that line. Insert a break only when the base ended
+// with one and the local text no longer does (the local edit removed that break).
+export function mergeAppend(loaded, text, disk) {
+  const base = typeof loaded === "string" ? loaded : "";
+  let add = String(disk).slice(base.length);
+  if (text.endsWith("\n") && add.startsWith("\n")) add = add.slice(1);
+  else if (base.endsWith("\n") && text !== "" && !text.endsWith("\n") && !add.startsWith("\n")) add = "\n" + add;
+  return text + add;
+}
+
+// What Restore should do with a draft. `base` is the text the draft was edited from
+// (null: the file did not exist; undefined: a draft with no recorded base).
+// "save" writes the draft. "merge" keeps an append that landed on that base. "conflict" does not overwrite.
+export function draftRestore(base, draft, disk) {
+  if (disk === draft) return "save";
+  if (base === undefined) return disk === null ? "save" : "conflict";
+  if (disk === base) return "save";
+  if (typeof base === "string" && typeof disk === "string" && disk.length > base.length && disk.startsWith(base)) return "merge";
+  return "conflict";
+}
+
 // ---- export ----
 const stripInline = (s) => parseInline(s).filter((r) => r.t !== "mark").map((r) => r.s).join("");
 
 // Plain text: markdown marks removed, lists keep a bullet or number, to-dos keep a box.
 export function toPlain(text) {
   return splitRows(text).map((row) => {
-    const r = parseRow(row);
-    if (r.kind === "code") return row.split("\n").filter((l) => !isFence(l)).join("\n");
+    const clean = stripBy(row);
+    const r = parseRow(clean);
+    if (r.kind === "code") return clean.split("\n").filter((l) => !isFence(l)).join("\n");
     if (r.kind === "hr") return "";
     const body = stripInline(r.text);
     if (r.kind === "bullet") return r.indent + "• " + body;
@@ -148,8 +177,23 @@ export function toPlain(text) {
 }
 
 const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+const escAttr = (s) => esc(s).replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+// http(s) and mailto: the schemes a note link may hand to the OS. safeHref adds absolute paths for the PDF.
+export function openableUrl(href) {
+  const s = String(href || "");
+  return /^https?:\/\//i.test(s) || /^mailto:/i.test(s) ? s : null;
+}
+// Exported links: only http(s), mailto, and absolute file paths become anchors. date:, herdr:, javascript:,
+// and protocol-relative "//..." stay plain text. A path is rewritten to file:// so the PDF can open it.
+const safeHref = (h) => {
+  const web = openableUrl(h);
+  if (web) return web;
+  const s = String(h || "");
+  if (s.startsWith("/") && !s.startsWith("//")) return "file://" + encodeURI(s);
+  return null;
+};
 function inlineHtml(s) {
-  return parseInline(s).map((r) => r.t === "mark" ? "" : r.t === "link" ? `<a href="${esc(r.href)}">${esc(r.s)}</a>` : r.t === "bold" ? `<b>${esc(r.s)}</b>` : r.t === "italic" ? `<i>${esc(r.s)}</i>`
+  return parseInline(s).map((r) => r.t === "mark" ? "" : r.t === "link" ? (safeHref(r.href) ? `<a href="${escAttr(safeHref(r.href))}">${esc(r.s)}</a>` : esc(r.s)) : r.t === "bold" ? `<b>${esc(r.s)}</b>` : r.t === "italic" ? `<i>${esc(r.s)}</i>`
     : r.t === "code" ? `<code>${esc(r.s)}</code>` : esc(r.s)).join("");
 }
 
@@ -159,7 +203,8 @@ export function toHtml(text, title) {
   let list = null;
   const close = () => { if (list) { out.push(`</${list}>`); list = null; } };
   for (const row of splitRows(text)) {
-    const r = parseRow(row);
+    const clean = stripBy(row);
+    const r = parseRow(clean);
     const want = r.kind === "bullet" || r.kind === "task" ? "ul" : r.kind === "number" ? "ol" : null;
     if (want !== list) { close(); if (want) { out.push(`<${want}>`); list = want; } }
     if (r.kind === "h") out.push(`<h${r.level}>${inlineHtml(r.text)}</h${r.level}>`);
@@ -167,8 +212,8 @@ export function toHtml(text, title) {
     else if (r.kind === "task") out.push(`<li class="task">${r.checked ? "☑" : "☐"} ${inlineHtml(r.text)}</li>`);
     else if (r.kind === "quote") out.push(`<blockquote>${inlineHtml(r.text)}</blockquote>`);
     else if (r.kind === "hr") out.push("<hr>");
-    else if (r.kind === "code") out.push(`<pre>${esc(row.split("\n").filter((l) => !isFence(l)).join("\n"))}</pre>`);
-    else out.push(row.trim() ? `<p>${inlineHtml(r.text)}</p>` : "");
+    else if (r.kind === "code") out.push(`<pre>${esc(clean.split("\n").filter((l) => !isFence(l)).join("\n"))}</pre>`);
+    else out.push(clean.trim() ? `<p>${inlineHtml(r.text)}</p>` : "");
   }
   close();
   return `<!doctype html><meta charset="utf-8"><title>${esc(title)}</title><style>
@@ -197,6 +242,19 @@ export function withIcon(front, icon) {
   const lines = front ? front.replace(/\n$/, "").split("\n").slice(1, -1).filter((l) => !/^icon:/.test(l)) : [];
   if (icon) lines.unshift(`icon: ${icon}`);
   return lines.length ? `---\n${lines.join("\n")}\n---\n` : "";
+}
+
+// Replace the link that starts at `offset` when its href is still `href`. null if that occurrence is gone.
+// Clearing keeps one space at the join ("a [date] b" -> "a b") and leaves other spacing alone.
+export function replaceLinkAt(row, offset, href, replacement) {
+  const span = linkSpans(row).find((s) => s.start === offset);
+  if (!span || span.href !== href) return null;
+  const left = row.slice(0, span.start);
+  const right = row.slice(span.end);
+  if (replacement) return left + replacement + right;
+  const trail = left.match(/ *$/)[0].length;
+  const lead = right.match(/^ */)[0].length;
+  return left.slice(0, left.length - trail) + (trail + lead ? " " : "") + right.slice(lead);
 }
 
 // Where the markdown links sit in a line (JS string offsets = the text box's UTF-16 offsets), for inline badges.

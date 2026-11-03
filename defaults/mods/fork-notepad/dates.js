@@ -102,7 +102,10 @@ function parseDay(s, now) {
   }
   if (s === "next week") return addDays(today, 7);
   if (s === "last week") return addDays(today, -7);
-  if (s === "next month") return new Date(today.getFullYear(), today.getMonth() + 1, today.getDate());
+  if (s === "next month") {   // same day next month, clamped (Jan 31 -> Feb 28/29)
+    const last = new Date(today.getFullYear(), today.getMonth() + 2, 0).getDate();
+    return new Date(today.getFullYear(), today.getMonth() + 1, Math.min(today.getDate(), last));
+  }
   if ((m = /^in\s+(\d+)\s*(day|days|d|week|weeks|w)$/.exec(s))) return addDays(today, +m[1] * (m[2][0] === "w" ? 7 : 1));
   if ((m = /^(\d+)\s*(day|days|d|week|weeks|w)\s+ago$/.exec(s))) return addDays(today, -m[1] * (m[2][0] === "w" ? 7 : 1));
   const mk = (y, mo, d) => {

@@ -18,22 +18,32 @@
       ]
     },
     "menu-browser": {
-      "branch": "ethan/herdr-mods-notepad",
-      "commit": "9bfdce0a9fbb95e66e70f289f1fed51bb9862171",
+      "branch": "ethan/herdr-notepad-virtual",
+      "commit": "6b9163c3bad568356c49640740d54c0c4e174a9e",
       "path": "projects/herdr-mods/clones/mac/menu-browser",
-      "version": "0.1.0"
+      "version": "0.1.0",
+      "pr": "essexlabs/labs#1294"
     },
     "notepad": {
-      "branch": "ethan/herdr-mods-notepad",
-      "commit": "9bfdce0a9fbb95e66e70f289f1fed51bb9862171",
+      "branch": "ethan/herdr-notepad-virtual",
+      "commit": "6b9163c3bad568356c49640740d54c0c4e174a9e",
       "path": "projects/herdr-mods/notepad",
-      "version": "0.1.0"
+      "version": "0.1.0",
+      "pr": "essexlabs/labs#1294"
+    },
+    "notepad-view": {
+      "path": "projects/herdr-mods/notepad-view",
+      "version": "0.1.0",
+      "branch": "ethan/herdr-notepad-virtual",
+      "commit": "6b9163c3bad568356c49640740d54c0c4e174a9e",
+      "pr": "essexlabs/labs#1294"
     },
     "pane-browser": {
-      "branch": "ethan/herdr-mods-notepad",
-      "commit": "9bfdce0a9fbb95e66e70f289f1fed51bb9862171",
+      "branch": "ethan/herdr-notepad-virtual",
+      "commit": "6b9163c3bad568356c49640740d54c0c4e174a9e",
       "path": "projects/herdr-mods/clones/mac/pane-browser",
-      "version": "0.1.0"
+      "version": "0.1.0",
+      "pr": "essexlabs/labs#1294"
     },
     "remote-desktop": {
       "branch": "ethan/herdr-mods-notepad",
@@ -44,10 +54,11 @@
       "why": "duplicates the native browser.remote entry; held until Ethan picks one"
     },
     "split-chooser": {
-      "branch": "ethan/herdr-mods-notepad",
-      "commit": "9bfdce0a9fbb95e66e70f289f1fed51bb9862171",
+      "branch": "ethan/herdr-notepad-virtual",
+      "commit": "6b9163c3bad568356c49640740d54c0c4e174a9e",
       "path": "projects/herdr-mods/split-chooser",
-      "version": "0.1.0"
+      "version": "0.1.0",
+      "pr": "essexlabs/labs#1294"
     }
   }
 }

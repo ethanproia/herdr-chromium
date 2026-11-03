@@ -131,6 +131,30 @@ export function cover(w, h, bw, bh) {
   return { w: sw, h: sh, x: Math.round((bw - sw) / 2) || 0, y: Math.round((bh - sh) / 2) || 0 };
 }
 
+// A failed embed load is remembered only briefly, so the next render after this can try again.
+// A success stays until the cache drops the oldest entry. `now` is milliseconds.
+export const FAIL_TTL = 5000;
+
+export function cacheSet(cache, key, data, now, max = 200) {
+  for (const [k, v] of cache) {
+    if (v && v.ok === false && typeof v.expires === "number" && now >= v.expires) cache.delete(k);
+  }
+  const fail = !data || data.ok === false;
+  cache.set(key, fail ? { ok: false, why: (data && data.why) || "Could not load", expires: now + FAIL_TTL } : data);
+  while (cache.size > max) cache.delete(cache.keys().next().value);
+}
+
+// The stored value, or undefined when there is nothing to reuse (missing, or a failure past its expiry).
+export function cacheGet(cache, key, now) {
+  if (!cache.has(key)) return undefined;
+  const hit = cache.get(key);
+  if (hit && hit.ok === false && typeof hit.expires === "number" && now >= hit.expires) {
+    cache.delete(key);
+    return undefined;
+  }
+  return hit;
+}
+
 // Clamp text to about `lines` lines of `cpl` characters, with an ellipsis.
 export function clampText(s, cpl, lines) {
   const max = Math.max(8, Math.floor(cpl)) * lines;

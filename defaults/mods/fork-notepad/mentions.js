@@ -1,6 +1,7 @@
 // Data side of @ mentions: gathers dates, chats, tabs and files, and opens a clicked link.
 import { agents, terminals, spaces, panes, focused, exec, run, home } from "herdr";
 import { parseHref } from "./mentions-core.js";
+import { openableUrl } from "./rows.js";
 import { dateItems } from "./dates.js";   // Notion's date rows: Today, Now, Tomorrow, Yesterday
 
 export const KIND_ICON = { date: "📅", agent: "💬", tab: "▤", file: "📄" };
@@ -85,7 +86,8 @@ export function openHref(href, _cx) {
       const sp = spaces().find((s) => s.tabs.some((t) => t.id === h.id));
       if (sp) run("space.select", { id: sp.id });
       run("tab.select", { id: h.id });
-    } else if (h.kind === "file") run("pane.split", { direction: "right", mod: "fork-notepad", props: { view: h.path } });
-    else if (h.kind === "url") exec("open", [h.id]).catch(() => {});
+    } else if (h.kind === "file") run("pane.split", { direction: "right", mod: "fork-notepad-view", props: { view: h.path } });
+    // Only web and mail links open (note text can come from agents). Other schemes do nothing.
+    else if (h.kind === "url") { const url = openableUrl(h.id); if (url) exec("open", [url]).catch(() => {}); }
   } catch { /* a stale link does nothing */ }
 }
