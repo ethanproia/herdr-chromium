@@ -975,7 +975,7 @@ mod tests {
         // cmd-t is a Herdr binding: it ran, and the page never saw it.
         assert_eq!(block.read_with(cx, |b, _| b.bound), 1);
         // The page sees the character a shifted key types, with the physical code.
-        let bang = Keystroke { modifiers: Modifiers::shift(), key: "1".into(), key_char: Some("!".into()) };
+        let bang = Keystroke { modifiers: Modifiers::shift(), key: "1".into(), key_char: Some("!".into()), ..Default::default() };
         assert_eq!(dom_key(&bang), ("!".into(), "Digit1".into(), 0x12));
         assert_eq!(edit_command(&Keystroke::parse(if cfg!(target_os = "macos") { "cmd-c" } else { "ctrl-c" }).unwrap()), Some(EditCommand::Copy));
         assert_eq!(edit_command(&Keystroke::parse(if cfg!(target_os = "macos") { "cmd-shift-z" } else { "ctrl-shift-z" }).unwrap()), Some(EditCommand::Redo));
