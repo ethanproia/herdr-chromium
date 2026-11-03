@@ -19,8 +19,9 @@ fn main() {
     let server = fixtures::Server::start();
     if let Some(mut p) = Page::open(Host::Cef, &server.url("scroll.html")) {
         assert_eq!(error(&mut p), None, "a good page has no error");
-        // Port 9 (discard) has no listener on a Mac: refused.
-        p.navigate("http://127.0.0.1:9/").unwrap();
+        // A port just freed has no listener: refused (Chromium blocks low ports like 9 as unsafe, -312).
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        p.navigate(&format!("http://127.0.0.1:{port}/")).unwrap();
         let (_, code) = wait_error(&mut p, "refused");
         assert_eq!(code, -102);
         p.navigate("http://nothing-here.invalid/").unwrap();

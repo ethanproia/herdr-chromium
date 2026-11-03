@@ -2467,7 +2467,7 @@ mod tests {
     use super::*;
     use herdr_browser_protocol::Size;
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn load_error_cards_name_the_kind_and_cap_the_url() {
         assert_eq!(load_error_words("refused", "http://127.0.0.1:3000/x").0, "Nothing is running at 127.0.0.1:3000");
         assert_eq!(load_error_words("refused", "https://a.test/").0, "The site refused to connect");
