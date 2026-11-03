@@ -839,6 +839,23 @@ impl EntityStore {
         }
     }
 
+    // HERDR: a script's key hook on an input or textarea state (only one; a later one replaces it).
+    pub fn set_key_hook(&mut self, handle: EntityHandle, hook: gpui_base::input::KeyHook, cx: &mut App) -> bool {
+        match self.record(handle) {
+            Some(Record::Input { state, .. }) => {
+                let state = state.clone();
+                state.update(cx, |s, cx| s.set_key_hook(Some(hook), cx));
+                true
+            }
+            Some(Record::Textarea { state, .. }) => {
+                let state = state.clone();
+                state.update(cx, |s, cx| s.set_key_hook(Some(hook), cx));
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Subscribes to one slider event for as long as the handle lives.
     ///
     /// Kept apart from [`Self::subscribe_input`] rather than made generic over

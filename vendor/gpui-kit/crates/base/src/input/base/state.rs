@@ -137,6 +137,23 @@ pub enum InputEvent {
     SelectionChange { start: usize, end: usize, reversed: bool, composing: bool },
 }
 
+// HERDR: a script's key hook (see `InputBaseState::set_key_hook`).
+/// A key-down the hook may cancel, with what it needs to decide: the selection (UTF-16) and
+/// whether the caret is on the first or last visual (wrapped) line.
+#[derive(Clone, Debug)]
+pub struct KeyHookEvent {
+    pub keystroke: gpui::Keystroke,
+    /// The key was already down (auto-repeat).
+    pub repeat: bool,
+    pub start: usize,
+    pub end: usize,
+    pub at_first_visual_line: bool,
+    pub at_last_visual_line: bool,
+}
+
+/// Returns true to cancel the key: the input's own action and any key binding do not run.
+pub type KeyHook = Rc<dyn Fn(&KeyHookEvent, &mut Window, &mut App) -> bool>;
+
 pub(super) const CONTEXT: &str = "Input";
 
 pub(crate) fn init(cx: &mut App) {
@@ -469,6 +486,10 @@ pub struct InputBaseState<M: InputModeKind> {
     pub(super) last_selected_range: Option<CursorSelection>,
     // HERDR: the selection last reported as `InputEvent::SelectionChange` (UTF-16, reversed).
     pub(super) last_emitted_selection: Option<(usize, usize, bool)>,
+    // HERDR: the key hook, its keystroke interceptor, and keys down that it has seen.
+    key_hook: Option<KeyHook>,
+    key_interceptor: Option<Subscription>,
+    pub(super) held_keys: Vec<String>,
     pub(super) selecting: bool,
     /// Anchor point of an in-progress columnar (block) selection.
     pub(super) column_select_start: Option<ColumnarPoint>,
@@ -658,6 +679,64 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// backwards (the caret is at `start`).
     pub fn selection_utf16(&self) -> (Range<usize>, bool) {
         (self.range_to_utf16(&self.selected_range()), self.active_selection().reversed)
+    }
+
+    /// Installs (or with None removes) a hook that sees key-downs before key bindings do, while
+    /// this state has focus and no IME composition is open. A hook returning true cancels the key:
+    /// this input's own action does not run, and neither does any window key binding for that key.
+    pub fn set_key_hook(&mut self, hook: Option<KeyHook>, cx: &mut Context<Self>) {
+        self.key_hook = hook;
+        if self.key_hook.is_none() {
+            self.key_interceptor = None;
+            return;
+        }
+        if self.key_interceptor.is_some() {
+            return;
+        }
+        let state = cx.entity().downgrade();
+        self.key_interceptor = Some(cx.intercept_keystrokes(move |ev, window, cx| {
+            let Some(state) = state.upgrade() else { return };
+            let Some((hook, event)) = state.update(cx, |s, _| s.key_hook_event(&ev.keystroke, window)) else { return };
+            if hook(&event, window, cx) {
+                cx.stop_propagation();
+            }
+        }));
+    }
+
+    /// The hook and its event for a key-down, or None when the hook must not see it: not this
+    /// state's focus (the hook is never global), or an IME composition is open.
+    fn key_hook_event(&mut self, keystroke: &gpui::Keystroke, window: &Window) -> Option<(KeyHook, KeyHookEvent)> {
+        let hook = self.key_hook.clone()?;
+        if !self.focus_handle.is_focused(window) || self.is_composing() {
+            return None;
+        }
+        let repeat = self.held_keys.contains(&keystroke.key);
+        if !repeat {
+            self.held_keys.push(keystroke.key.clone());
+        }
+        let (range, _) = self.selection_utf16();
+        let (first, last) = self.caret_visual_line_edges();
+        Some((hook, KeyHookEvent { keystroke: keystroke.clone(), repeat, start: range.start, end: range.end, at_first_visual_line: first, at_last_visual_line: last }))
+    }
+
+    /// Whether the caret is on the first and on the last visual (soft-wrapped) line of the text.
+    /// Before the first paint, logical lines stand in for visual ones.
+    pub fn caret_visual_line_edges(&self) -> (bool, bool) {
+        let cursor = self.cursor();
+        let row = self.text.offset_to_point(cursor).row;
+        let rows = self.text.lines_len().max(1);
+        let (vi, sub, pos) = self.line_and_position_for_offset(cursor);
+        let subs = match (pos, self.last_layout.as_ref()) {
+            (Some(_), Some(layout)) => layout.lines.get(vi).map(|line| {
+                let h = f32::from(line.size(layout.line_height).height) / f32::from(layout.line_height);
+                (h.round() as usize).max(1)
+            }),
+            _ => None,
+        };
+        match subs {
+            Some(subs) => (row == 0 && sub == 0, row + 1 >= rows && sub + 1 >= subs),
+            None => (row == 0, row + 1 >= rows),
+        }
     }
 
     /// Whether an IME composition (marked text) is open.
@@ -926,6 +1005,9 @@ impl<M: InputModeKind> InputBaseState<M> {
             last_bounds: None,
             last_selected_range: None,
             last_emitted_selection: None,
+            key_hook: None,
+            key_interceptor: None,
+            held_keys: Vec::new(),
             column_select_start: None,
             last_cursor: None,
             scroll_handle: ScrollHandle::new(),
@@ -3638,6 +3720,8 @@ impl<M: InputModeKind> InputBaseState<M> {
         }
 
         M::hide_context_menu(self, cx);
+        // HERDR: keys held when focus leaves are released somewhere else.
+        self.held_keys.clear();
         self.undo_manager.break_transaction_coalescing();
 
         // NOTE: Do not cancel select, when blur.
@@ -11093,6 +11177,122 @@ mod tests {
         let two = view.input.read_with(&visual, |s, _| s.selection_bounds()).unwrap();
         assert_eq!(two.size.height, line_height * 2.);
         assert!(two.origin.x <= one.origin.x && two.size.width >= one.size.width, "{two:?} vs {one:?}");
+    }
+    // HERDR: the key hook a script toolbar uses.
+    gpui::actions!(herdr_key_hook_test, [WindowBold]);
+
+    type Seen = Rc<RefCell<Vec<KeyHookEvent>>>;
+
+    /// A focused textarea with a hook that records every event and cancels the keys in `cancel`.
+    fn hooked(cx: &mut TestAppContext, text: &str, cancel: &'static [&'static str]) -> (InputView<TextareaMode>, VisualTestContext, Seen) {
+        let text = text.to_owned();
+        let view = InputView::build_textarea(cx, move |state| state.rows(4).default_value(text));
+        let seen: Seen = Rc::new(RefCell::new(Vec::new()));
+        let sink = seen.clone();
+        let mut visual = VisualTestContext::from_window(view.window_handle.into(), cx);
+        visual.update(|window, cx| {
+            view.input.update(cx, |state, cx| {
+                state.set_key_hook(
+                    Some(Rc::new(move |e: &KeyHookEvent, _: &mut Window, _: &mut App| {
+                        sink.borrow_mut().push(e.clone());
+                        cancel.contains(&e.keystroke.unparse().as_str())
+                    })),
+                    cx,
+                );
+                state.focus(window, cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        (view, visual, seen)
+    }
+
+    #[gpui::test]
+    fn a_key_hook_cancels_enter_and_backspace_or_lets_them_through(cx: &mut TestAppContext) {
+        let (view, mut visual, seen) = hooked(cx, "ab", &["enter", "backspace"]);
+        visual.update(|_, cx| view.input.update(cx, |s, cx| s.set_selected_range(2..2, cx)));
+        visual.simulate_keystrokes("enter backspace");
+        assert_eq!(view.input.read_with(&visual, |s, _| s.value()), "ab", "both cancelled");
+        assert_eq!(seen.borrow().len(), 2);
+        // Not cancelled: the textarea's own handling runs.
+        visual.update(|_, cx| view.input.update(cx, |s, cx| s.set_key_hook(Some(Rc::new(|_: &KeyHookEvent, _: &mut Window, _: &mut App| false)), cx)));
+        visual.simulate_keystrokes("enter");
+        assert_eq!(view.input.read_with(&visual, |s, _| s.value()), "ab\n");
+        visual.simulate_keystrokes("backspace");
+        assert_eq!(view.input.read_with(&visual, |s, _| s.value()), "ab");
+    }
+
+    #[gpui::test]
+    fn the_hook_sees_the_selection_and_the_visual_line_edges(cx: &mut TestAppContext) {
+        let (view, mut visual, seen) = hooked(cx, "one\ntwo", &[]);
+        visual.update(|window, cx| {
+            view.input.update(cx, |s, cx| s.set_selected_range(0..3, cx));
+            window.draw(cx).clear(cx);
+        });
+        visual.simulate_keystrokes("cmd-b");
+        visual.update(|window, cx| {
+            view.input.update(cx, |s, cx| s.set_selected_range(0..0, cx));
+            window.draw(cx).clear(cx);
+        });
+        visual.simulate_keystrokes("up");
+        visual.update(|window, cx| {
+            view.input.update(cx, |s, cx| s.set_selected_range(7..7, cx));
+            window.draw(cx).clear(cx);
+        });
+        visual.simulate_keystrokes("down");
+        let seen = seen.borrow();
+        assert_eq!((seen[0].keystroke.unparse().as_str(), seen[0].start, seen[0].end), ("cmd-b", 0, 3));
+        assert!(seen[1].at_first_visual_line && !seen[1].at_last_visual_line, "{:?}", seen[1]);
+        assert!(!seen[2].at_first_visual_line && seen[2].at_last_visual_line, "{:?}", seen[2]);
+    }
+
+    #[gpui::test]
+    fn the_hook_is_never_global_and_never_sees_composition(cx: &mut TestAppContext) {
+        let (view, mut visual, seen) = hooked(cx, "ab", &["enter"]);
+        // Focus elsewhere in the same window: the hook stays quiet.
+        let other = visual.update(|window, cx| {
+            let other = cx.focus_handle();
+            other.focus(window, cx);
+            other
+        });
+        visual.simulate_keystrokes("enter");
+        assert!(seen.borrow().is_empty(), "not this state's focus");
+        drop(other);
+        // An open IME composition owns the keys.
+        visual.update(|window, cx| {
+            view.input.update(cx, |s, cx| {
+                s.focus(window, cx);
+                s.replace_and_mark_text_in_range(None, "に", None, window, cx);
+            });
+        });
+        visual.simulate_keystrokes("enter");
+        assert!(seen.borrow().is_empty(), "composing");
+    }
+
+    #[gpui::test]
+    fn a_held_key_repeats_until_released(cx: &mut TestAppContext) {
+        let (_view, mut visual, seen) = hooked(cx, "ab", &[]);
+        let left = gpui::Keystroke::parse("left").unwrap();
+        visual.simulate_keystrokes("left left");
+        visual.simulate_event(gpui::KeyUpEvent { keystroke: left });
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        visual.simulate_keystrokes("left");
+        assert_eq!(seen.borrow().iter().map(|e| e.repeat).collect::<Vec<_>>(), [false, true, false]);
+    }
+
+    #[gpui::test]
+    fn cancelling_a_key_also_stops_the_window_binding_for_it(cx: &mut TestAppContext) {
+        let fired = Rc::new(Cell::new(0));
+        let count = fired.clone();
+        cx.update(|cx| {
+            cx.bind_keys([KeyBinding::new("cmd-b", WindowBold, None)]);
+            cx.on_action(move |_: &WindowBold, _| count.set(count.get() + 1));
+        });
+        let (view, mut visual, _seen) = hooked(cx, "ab", &["cmd-b"]);
+        visual.simulate_keystrokes("cmd-b");
+        assert_eq!(fired.get(), 0, "cancelled: Herdr's binding did not run either");
+        visual.update(|_, cx| view.input.update(cx, |s, cx| s.set_key_hook(Some(Rc::new(|_: &KeyHookEvent, _: &mut Window, _: &mut App| false)), cx)));
+        visual.simulate_keystrokes("cmd-b");
+        assert_eq!(fired.get(), 1, "let through: the binding runs");
     }
 }
 
