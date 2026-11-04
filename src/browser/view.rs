@@ -1091,6 +1091,8 @@ impl BrowserView {
                     }
                 }
                 if url != self.state.url {
+                    // HERDR: S13. A new document: the edit and its pending pin go.
+                    self.abandon_text_edit(cx);
                     self.state.url = url.clone();
                     self.block.url = url.clone();
                     self.address_stale = true;
@@ -1116,6 +1118,8 @@ impl BrowserView {
             }
             H::Loading { loading, can_back, can_forward, .. } => {
                 if loading {
+                    // HERDR: S13. A reload makes a new document too.
+                    self.abandon_text_edit(cx);
                     self.load_error = None;
                     self.state.load_error = None;
                 }
@@ -1125,6 +1129,8 @@ impl BrowserView {
             H::Crashed { reason, .. } => {
                 // The host forgets the page; the reload card makes it again.
                 self.crashed = Some(reason);
+                // HERDR: S13.
+                self.abandon_text_edit(cx);
                 self.sized = None;
                 self.frames.clear();
                 self.acked = None;
@@ -1809,9 +1815,8 @@ impl BrowserView {
                             self.click_target(PageAsk::CommentTarget, cx_, cy, cx);
                         } else if self.styles_on_pick {
                             self.click_target(PageAsk::StyleTarget, cx_, cy, cx);
-                            self.input.update(cx, |i, _| {
-                                i.escape();
-                            });
+                            // HERDR: S13. The same double-click window as a plain pick.
+                            self.leave_pick_unless_double_click(cx);
                         } else {
                             // HERDR: S13. Pick ends after the double-click interval, unless a second click edits text.
                             self.leave_pick_unless_double_click(cx);
@@ -1893,7 +1898,7 @@ impl BrowserView {
     fn leave_pick_unless_double_click(&mut self, cx: &mut Context<Self>) {
         let n = self.text_edit.wait_for_second_click();
         cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(Duration::from_millis(super::text_edit::DOUBLE_CLICK_MS)).await;
+            cx.background_executor().timer(Duration::from_millis(super::text_edit::double_click_ms())).await;
             let _ = this.update(cx, |v, cx| {
                 if v.text_edit.wait_ran_out(n) && v.owner(cx) == Owner::Pick {
                     v.input.update(cx, |i, _| {
@@ -1910,12 +1915,31 @@ impl BrowserView {
     /// element under the pointer is asked for (a pick, so the host lets it be edited).
     fn text_edit_at(&mut self, x: f32, y: f32, cx: &mut Context<Self>) {
         self.text_edit.exit_wait = None;
+        // One edit at a time: a double-click mid-edit is ignored rather than orphaning this one.
+        if !self.text_edit.start() {
+            return;
+        }
         if self.owner(cx) == Owner::Comment {
             self.input.update(cx, |i, _| {
                 i.escape();
             });
         }
         self.ask_target(PageAsk::TextEdit, x, y);
+    }
+
+    /// HERDR: S13. The page went away (navigation, reload, crash): the edit ends with it, and any
+    /// answer still in flight finds nothing (its pin would belong to the old document).
+    fn abandon_text_edit(&mut self, cx: &mut Context<Self>) {
+        if self.text_edit.phase == super::text_edit::Phase::Idle && self.text_edit.hint.is_none() {
+            return;
+        }
+        self.text_edit.reset();
+        if self.owner(cx) == Owner::TextEdit {
+            self.input.update(cx, |i, _| {
+                i.escape();
+            });
+        }
+        cx.notify();
     }
 
     /// HERDR: S13. Return saved or Esc (or a lease) cancelled: the host keeps or restores the text.
@@ -1995,6 +2019,9 @@ impl BrowserView {
             // ok false keeps the current pick.
             // HERDR: S13. The double-clicked element: ask the host to make it editable.
             PageAsk::TextEdit => {
+                if target.is_none() {
+                    self.text_edit.nothing_there();
+                }
                 if let Some(t) = target {
                     self.hovered = Some(t.clone());
                     self.text_edit.target = Some(t);

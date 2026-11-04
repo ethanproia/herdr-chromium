@@ -391,6 +391,11 @@ impl BrowserInput {
         }
         self.focused = focused;
         if !focused {
+            // HERDR: S13. Focus leaving the block ends an edit (the text goes back): nothing is
+            // kept that the person didn't confirm with Return.
+            if self.owner() == Owner::TextEdit {
+                self.escape();
+            }
             self.space_held = false;
             self.release_all();
             self.comment.marked = None;
