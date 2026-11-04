@@ -799,6 +799,10 @@ has 120 programs (agents, editors, runtimes, tools, databases, infra);
   `image("mods/<name>/logo.svg")` (full color), `svg("mods/<name>/icon.svg")`
   (tinted with the text color). Saving an asset under `mods/` updates every
   mod showing it, including images that were missing or invalid on first load.
+- Videos follow the same rule: `video("mods/<name>/clip.mp4", {autoplay, loop, muted,
+  controls})` (macOS: .mp4 and .mov). Without `autoplay` it shows its first frame as a still.
+  Unknown options are an error. Give it `.id("clip")` to drive it from code (see `videoPlay` in
+  herdr.d.ts). A file outside `~/.config/herdr-app` is copied in first, as the board does with pictures.
 - The defaults are mods too, read them as examples: `spaces`, `agents`,
   `tabs` (the tab bar), `menu`, `prompt`, `confirm`, `help`, `toast`,
   Terminals' `picker`, `peek`, and `pane` (an
