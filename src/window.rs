@@ -4666,7 +4666,8 @@ impl AppWindow {
                 .px(z(4.0))
                 .cursor_pointer()
                 .text_size(z(12.0))
-                .text_color(c("dim"))
+                // The same grey as the toast's body line (the toast mod's `theme().muted`).
+                .text_color(c("muted"))
                 .child("×")
                 .on_click(cx.listener(move |this, _, w, cx| this.close_overlay(&id, w, cx)));
             let card = div()
