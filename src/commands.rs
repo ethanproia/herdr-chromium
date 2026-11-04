@@ -125,6 +125,7 @@ pub const COMMANDS: &[Command] = &[
     cmd("window.close", &[], "Close the window (on Linux, quits)."),
     cmd("window.minimize", &[], "Minimize the window."),
     cmd("window.maximize", &[], "Maximize the window, or back."),
+    cmd("window.fullscreen", &[], "Enter or leave full screen (macOS: View > Enter Full Screen, ctrl-cmd-f)."),
     cmd("window.native", &[], "macOS: the title bar as the system sees it (see-through, full-size content, title hidden, fullscreen), for checking it."),
 ];
 

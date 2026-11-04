@@ -655,7 +655,7 @@ impl AppWindow {
         w.show_layout_notes(window, cx);
         if let (Some(n), false) = (&name, gone.is_empty()) {
             let note = json!({ "title": format!("{n} needs mods that aren't here"), "body": format!("Showing Herdr instead. Missing: {}. Your {n} layout file is still there.", gone.join(", ")), "level": "info", "timeout": 12000 });
-            w.post_note("app", "herdr", "Herdr", note, window, cx);
+            w.post_note("app", "herdr", crate::brand::NAME, note, window, cx);
         }
 
         w._tasks.push(cx.spawn_in(window, async move |this, cx| {
@@ -1192,12 +1192,12 @@ impl AppWindow {
     fn show_layout_notes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         for clone in mods::take_sync_notes() {
             let n = json!({ "title": format!("Your edits are in {clone}"), "body": "Herdr's own layouts and mods can't be changed: clone one to make it yours.", "level": "info", "timeout": 12000, "keep": false });
-            self.post_note("app", "herdr", "Herdr", n, window, cx);
+            self.post_note("app", "herdr", crate::brand::NAME, n, window, cx);
         }
         // HERDR: keys a mod wanted that the person already uses (src/mod_keys.rs).
         for line in crate::mod_keys::take_notes() {
             let n = json!({ "title": "Mod keys", "body": line, "level": "info", "timeout": 12000 });
-            self.post_note("app", "herdr", "Herdr", n, window, cx);
+            self.post_note("app", "herdr", crate::brand::NAME, n, window, cx);
         }
     }
 
@@ -1984,7 +1984,7 @@ impl AppWindow {
     }
 
     fn layout_notice(&mut self, title: &str, body: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.post_note("machines", "herdr", "Herdr", json!({"title":title,"body":body,"level":"info"}), window, cx);
+        self.post_note("machines", "herdr", crate::brand::NAME, json!({"title":title,"body":body,"level":"info"}), window, cx);
     }
 
     /// Finish the accepted edit and any newer projection before the window goes.
@@ -2465,7 +2465,7 @@ impl AppWindow {
             }).await;
             if let Some(body) = failure {
                 let _ = this.update_in(cx, |this, window, cx| {
-                    this.post_note("app", "herdr", "Herdr", json!({"title":"Terminal failed to start", "body":body, "level":"error"}), window, cx);
+                    this.post_note("app", "herdr", crate::brand::NAME, json!({"title":"Terminal failed to start", "body":body, "level":"error"}), window, cx);
                 });
             }
         }).detach();
@@ -2487,7 +2487,7 @@ impl AppWindow {
             Some(slot) if slot.available => Ok(()),
             Some(slot) => Err(slot.error.clone().unwrap_or_else(|| "This machine's layout is unavailable. Try again when it reconnects.".into())),
             None => Err(match machine {
-                Some(m) => format!("Herdr has no machine called {m}. See hc machine ls; machines added with --temp stay out of Herdr."),
+                Some(m) => format!("{name} has no machine called {m}. See hc machine ls; machines added with --temp stay out of {name}.", name = crate::brand::NAME),
                 None => "This machine's layout is unavailable. Try again when it reconnects.".into(),
             }),
         }
@@ -2922,7 +2922,7 @@ impl AppWindow {
     fn command_error(&mut self, name: &str, error: &str, window: &mut Window, cx: &mut Context<Self>) {
         // HERDR: through the notification store (bell, stacking, one per command), not a bare toast.
         let n = json!({"title":format!("{name} failed"),"body":error,"level":"error","key":format!("cmd:{name}")});
-        self.post_note("app", "herdr", "Herdr", n, window, cx);
+        self.post_note("app", "herdr", crate::brand::NAME, n, window, cx);
     }
 
     /// Runs a command and says what it made or why not. Scripts and agents
@@ -3598,7 +3598,7 @@ impl AppWindow {
                 crate::update::relaunch();
                 cx.quit();
             }
-            "window.close" | "window.minimize" | "window.maximize" => return self.window_command(name, window, cx),
+            "window.close" | "window.minimize" | "window.maximize" | "window.fullscreen" => return self.window_command(name, window, cx),
             "window.native" => return self.answer(Self::window_native(window)),
             // HERDR: test-only (commands::TEST_COMMANDS): unknown unless HERDR_APP_TEST_INPUT=1 at start.
             "mod.click" => {
@@ -3974,6 +3974,8 @@ impl AppWindow {
                 .chain(self.documents.iter().filter_map(|(m, s)| s.error.as_ref().map(|e| format!("layout {}: {e}", if m.is_empty() { "local" } else { m }))))
                 .collect();
             return json!({
+                // HERDR: the fork's version line (brand.json).
+                "app": crate::brand::version_line(),
                 "zoom": round(settings::zoom()),
                 "font_size": round(settings::font_size()),
                 "ui_font_size": round(settings::ui_font_size()),
@@ -5102,8 +5104,8 @@ impl AppWindow {
         let core = crate::update::core();
         let core = core.ready.filter(|_| !core.updating);
         match (crate::update::ready(), core) {
-            (Some(a), Some(c)) => Some(format!("Herdr {a} and herdr-core {c} are ready")),
-            (Some(a), None) => Some(format!("Herdr {a} is ready")),
+            (Some(a), Some(c)) => Some(format!("{} {a} and herdr-core {c} are ready", crate::brand::NAME)),
+            (Some(a), None) => Some(format!("{} {a} is ready", crate::brand::NAME)),
             (None, Some(c)) => Some(format!("herdr-core {c} is ready")),
             (None, None) => None,
         }

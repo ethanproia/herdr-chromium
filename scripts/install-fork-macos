@@ -1,9 +1,11 @@
 #!/bin/bash
-# Installs the fork as "Herdr Labs", beside stock Herdr, which it never touches
-# (docs/fork-install.md). Stock's app, CLI link and home are only read, to copy
-# the home once on first install.
+# Installs the fork under its name (brand.json), beside stock Herdr, which it never
+# touches (docs/fork-install.md). Stock's app, CLI link and home are only read, to copy
+# the home once on first install. An install under an earlier name (brand.json
+# "previous") moves over once: its app and CLI link go to the Trash,
+# its home is copied (the old one stays where it is, as a backup).
 #
-#   scripts/install-fork-macos                install or update Herdr Labs
+#   scripts/install-fork-macos                install or update
 #   scripts/install-fork-macos --remove       quit it and move its app and CLI link to the Trash
 #   scripts/install-fork-macos --remove --purge   also move its home to the Trash
 #
@@ -14,19 +16,24 @@ set -euo pipefail
 
 [[ $(uname -s) == Darwin ]] || { echo 'This installer requires macOS.' >&2; exit 1; }
 here=$(cd "$(dirname "$0")/.." && pwd)
+# The name: brand.json beside this script inside an installed app (for `<cli> uninstall`),
+# else the checkout's; BRAND_FILE picks another (the rename test).
+res=$(cd "$(dirname "$0")" && pwd)
+if [[ -z ${BRAND_FILE:-} && -f $res/brand.json ]]; then BRAND_FILE=$res/brand.json; fi
+if [[ -f $here/scripts/brand.sh ]]; then source "$here/scripts/brand.sh"; else source "$res/brand.sh"; fi
 
-name="Herdr Labs"
-bundle_id=dev.herdr.app.labs
-session=herdr-labs
+name=$BRAND_NAME
+bundle_id=$BRAND_BUNDLE_ID
+session=$BRAND_SESSION
 app="$HOME/Applications/$name.app"
-cli="$HOME/.local/bin/herdr-labs"
-labs_home="$HOME/.config/herdr-labs"
+cli="$HOME/.local/bin/$BRAND_CLI"
+labs_home="$HOME/$BRAND_HOME"
 stock_home="$HOME/.config/herdr-app"
 stock_app="$HOME/Applications/Herdr.app"
 stock_cli="$HOME/.local/bin/herdr-app"
 
 trash() { # move to the user's Trash under a unique name; never delete outright
-  # Unique even within one second (the CLI and the home are both named herdr-labs).
+  # Unique even within one second (the CLI and the home can have the same name).
   local src=$1 dest n=0
   mkdir -p "$HOME/.Trash"
   dest="$HOME/.Trash/$(basename "$1") $(date +%Y%m%d-%H%M%S)"
@@ -42,7 +49,46 @@ remove() {
   [[ -e $app ]] && trash "$app"
   [[ -L $cli || -e $cli ]] && trash "$cli"
   if [[ ${1:-} == --purge && -e $labs_home ]]; then trash "$labs_home"; fi
-  echo "Herdr Labs removed. Stock Herdr was not touched."
+  echo "$name removed. Stock Herdr was not touched."
+}
+
+# An install under an earlier name (brand.json "previous"): its app and CLI link go to the
+# Trash, its home is copied here once (its layouts, the personal labs layout and its .state,
+# settings, keys, notes) and stays where it was as a backup. Its core session: one that
+# still runs terminals is kept (they're the person's; the new name uses it and says so),
+# an empty one is left and the new name's session is used.
+migrate() {
+  [[ -n $BRAND_PREVIOUS ]] || return 0
+  local p_name p_id p_cli p_home p_session
+  while IFS=$'\t' read -r p_name p_id p_cli p_home p_session; do
+    [[ -n $p_name && $p_name != "$name" ]] || continue
+    local p_app="$HOME/Applications/$p_name.app" p_link="$HOME/.local/bin/$p_cli" p_dir="$HOME/$p_home"
+    case "$p_app" in "$stock_app") echo "refusing: $p_app is stock Herdr's" >&2; continue ;; esac
+    case "$p_link" in "$stock_cli") echo "refusing: $p_link is stock Herdr's" >&2; continue ;; esac
+    case "$p_dir" in "$stock_home") echo "refusing: $p_dir is stock Herdr's" >&2; continue ;; esac
+    [[ -e $p_app || -L $p_link || -e $p_link || -d $p_dir ]] || continue
+    echo "moving $p_name to $name"
+    if [[ -x $p_link ]]; then
+      HERDR_APP_HOME=$p_dir HC_SESSION=$p_session HERDR_APP_ID=$p_session "$p_link" do app.quit >/dev/null 2>&1 || true
+    fi
+    [[ -e $p_app ]] && trash "$p_app"
+    [[ -L $p_link || -e $p_link ]] && trash "$p_link"
+    if [[ -d $p_dir && ! -e $labs_home ]]; then
+      mkdir -p "$labs_home"
+      rsync -a --exclude '*.sock' --exclude 'keys.json.bak' "$p_dir/" "$labs_home/"
+      echo "made $labs_home from a copy of $p_dir (the old home stays as a backup)"
+      local live=0
+      if command -v hc >/dev/null 2>&1; then
+        live=$(HC_SESSION=$p_session hc ls --json 2>/dev/null | python3 -c 'import json, sys
+try: print(len(json.load(sys.stdin).get("terminals", [])))
+except Exception: print(0)' 2>/dev/null || echo 0)
+      fi
+      if [[ ${live:-0} -gt 0 ]]; then
+        printf '%s\n' "$p_session" > "$labs_home/.session"
+        echo "kept the core session $p_session: it still runs $live terminal(s), so $name uses it"
+      fi
+    fi
+  done <<< "$BRAND_PREVIOUS"
 }
 
 if [[ ${1:-} == --remove ]]; then
@@ -54,6 +100,10 @@ fi
 for p in "$app" "$cli" "$labs_home"; do
   case $p in "$stock_app"|"$stock_cli"|"$stock_home") echo "refusing: $p is stock Herdr's" >&2; exit 1 ;; esac
 done
+
+migrate
+# A session kept from an earlier name (it had live terminals) stays this install's session.
+if [[ -f $labs_home/.session ]]; then session=$(head -n1 "$labs_home/.session"); fi
 
 bin=${HERDR_APP_BIN:-}
 host=${HERDR_HOST_APP:-}
@@ -76,8 +126,10 @@ cp "$bin" "$new/Contents/MacOS/$name"
 chmod +x "$new/Contents/MacOS/$name"
 cp -R "$host" "$new/Contents/Frameworks/herdr-browser-host.app"
 cp "$here/assets/icons/Herdr.icns" "$new/Contents/Resources/Herdr.icns"
-# A copy of this script, so `herdr-labs uninstall` works after the checkout is gone.
+# A copy of this script and the name, so `<cli> uninstall` works after the checkout is gone.
 cp "$0" "$new/Contents/Resources/install-fork-macos"
+cp "$BRAND_FILE" "$new/Contents/Resources/brand.json"
+cp "$here/scripts/brand.sh" "$new/Contents/Resources/brand.sh"
 host_exe="$app/Contents/Frameworks/herdr-browser-host.app/Contents/MacOS/herdr-browser-host"
 
 cat > "$new/Contents/Info.plist" <<PLIST
@@ -112,7 +164,7 @@ codesign --force --deep --sign - "$new" >/dev/null 2>&1
 if [[ -e $app ]]; then trash "$app"; fi
 mv "$new" "$app"
 
-# The CLI sets the same environment, so `herdr-labs do ...` talks to Herdr Labs, never stock.
+# The CLI sets the same environment, so `<cli> do ...` talks to this install, never stock.
 cat > "$cli.new" <<SH
 #!/bin/sh
 export HERDR_APP_HOME='$labs_home' HC_SESSION='$session' HERDR_APP_ID='$session' HERDR_BROWSER_HOST='$host_exe'
@@ -122,11 +174,12 @@ SH
 chmod +x "$cli.new"
 mv -f "$cli.new" "$cli"
 
-# First install: a copy of stock's home (read only; sockets and layout state left out).
+# First install: a copy of stock's home (read only; sockets, layout state and
+# stock's pending-update marker left out — a fork never applies it).
 if [[ ! -e $labs_home ]]; then
   mkdir -p "$labs_home"
   if [[ -d $stock_home ]]; then
-    rsync -a --exclude '*.sock' --exclude 'layouts/.state' --exclude 'keys.json.bak' "$stock_home/" "$labs_home/"
+    rsync -a --exclude '*.sock' --exclude 'layouts/.state' --exclude 'keys.json.bak' --exclude '.updated' "$stock_home/" "$labs_home/"
   fi
   python3 - "$labs_home/shared.json" <<'PY'
 import json, os, sys
@@ -147,4 +200,5 @@ fi
 if [[ -z ${FORK_INSTALL_NO_REGISTER:-} ]]; then
   /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$app" || true
 fi
-echo "Installed $app (CLI: herdr-labs). Stock Herdr was not touched. Remove with: herdr-labs uninstall"
+version=$("$app/Contents/MacOS/$name" --version 2>/dev/null || true)
+echo "Installed ${version:-$name} at $app (CLI: $BRAND_CLI). Stock Herdr was not touched. Remove with: $BRAND_CLI uninstall"
