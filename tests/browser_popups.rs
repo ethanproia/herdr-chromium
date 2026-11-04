@@ -29,8 +29,20 @@ fn main() {
     assert_eq!(profile, "default", "the popup keeps its opener's profile");
     assert_eq!(url, auth);
     let pop_id = p.cx.update(|cx| p.view.read(cx).popup_ids(cx))[0].clone();
-    assert!(pop_id.starts_with("page-pop"), "{pop_id}");
+    assert!(pop_id.starts_with("page~pop"), "{pop_id}");
     assert_eq!(p.cx.update(|cx| pop.read(cx).state.opener.clone()), Some("page".to_string()));
+
+    // A window shot masks the popup of an opener the person marked sensitive (its pixels never
+    // reach the file, though the popup id itself carries no mark).
+    let cover = [0x20u8, 0x20, 0x20];
+    let card_center = (p.size.0 / 2.0, (p.size.1 - p.page_top()) / 2.0 + 40.0);
+    p.grant(crate::browser::agent::Grant::Sensitive, true);
+    crate::browser::view::SHOT_MASK.store(true, std::sync::atomic::Ordering::SeqCst);
+    let px_ = p.page_pixel(card_center.0, card_center.1);
+    crate::browser::view::SHOT_MASK.store(false, std::sync::atomic::Ordering::SeqCst);
+    p.grant(crate::browser::agent::Grant::Sensitive, false);
+    assert_eq!([px_[0], px_[1], px_[2]], cover, "the sensitive opener's popup is covered in a shot");
+    assert_ne!(&p.page_pixel(card_center.0, card_center.1)[..3], &cover[..], "and shown normally otherwise");
 
     // The bar shows where the popup is NOW: navigate it to another origin.
     let other = format!("http://localhost:{}/form.html", server.port);
@@ -55,7 +67,7 @@ fn main() {
         p.pump();
     };
     inject(&mut p, HostToApp::PopupOpened { opener: "page".into(), id: "page".into(), url: auth.clone(), w: None, h: None });
-    inject(&mut p, HostToApp::PopupOpened { opener: "someone-else".into(), id: "x-pop1".into(), url: auth.clone(), w: None, h: None });
+    inject(&mut p, HostToApp::PopupOpened { opener: "someone-else".into(), id: "x~pop1".into(), url: auth.clone(), w: None, h: None });
     p.run_for(Duration::from_millis(200));
     assert!(popups(&mut p).is_empty(), "neither makes a popup");
     assert!(p.state().url.contains("scroll.html"), "the opener is untouched");

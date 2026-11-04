@@ -32,6 +32,9 @@ fn main() {
         // The stub's PickInfo answers ok:false: no element, so no panel.
         p.run_for(Duration::from_millis(300));
         assert!(panel_status(&mut p).is_none(), "nothing picked, no panel");
+        // HERDR: S13. Pick ends once the double-click window passes (the harness clock is simulated).
+        p.cx.advance_clock(Duration::from_millis(browser::text_edit::double_click_ms() + 50));
+        p.pump();
         assert_eq!(p.cx.update(|cx| v.read(cx).owner(cx)), Owner::Browse);
         println!("styles passed (stub): nothing there opens no panel, pick ends");
     }
@@ -61,7 +64,9 @@ fn main() {
     assert_eq!(style, "color: red", "Revert restores the attribute string-equal");
     let w2 = p.eval("rect('go').w").unwrap().as_f64().unwrap();
     assert!((w2 - w0).abs() < 0.5, "width back: {w0} -> {w2}");
-    // Esc closes the panel.
+    // Esc closes the panel (pick mode has ended by now: the double-click window has passed).
+    p.cx.advance_clock(Duration::from_millis(browser::text_edit::double_click_ms() + 50));
+    p.pump();
     p.key("escape");
     assert!(panel_status(&mut p).is_none(), "Esc closes the panel");
     println!("styles passed (CEF): picked #go, 10 rows, padding 0px -> 16px computed, width {w0} -> {w1} (+32), Revert style attribute \"color: red\", Esc closes");

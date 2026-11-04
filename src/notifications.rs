@@ -24,6 +24,10 @@ pub struct Item {
     pub id: String,
     pub ts: u64,
     pub source: String,
+    /// Who posted it, assigned by the app (a mod's folder, or "herdr"): keys and a mod's own view
+    /// match on this, never on `from`, which is only what the bell shows.
+    #[serde(default)]
+    pub owner: String,
     pub from: String,
     pub title: String,
     #[serde(default)]
@@ -45,6 +49,7 @@ pub struct Item {
 #[derive(Debug, Clone, Default)]
 pub struct Note {
     pub source: String,
+    pub owner: String,
     pub from: String,
     pub title: String,
     pub body: String,
@@ -103,13 +108,47 @@ fn cap(text: &str, n: usize) -> String {
     s
 }
 
-/// A failed download's URL keeps its scheme, host and path, never its query or fragment.
-pub fn strip_query(url_text: &str) -> String {
-    url_text
-        .split_whitespace()
-        .map(|w| if w.contains("://") { w.split(['?', '#']).next().unwrap_or(w) } else { w })
-        .collect::<Vec<_>>()
-        .join(" ")
+/// URLs in a notice body keep their scheme, host and path: user and password, query and
+/// fragment go (any word with `?`, `#` or `@` that looks like a URL or a host/path). Everything else,
+/// spaces included, is left exactly as it was.
+pub fn strip_query(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut word = String::new();
+    let flush = |word: &mut String, out: &mut String| {
+        out.push_str(&clean_url_word(word));
+        word.clear();
+    };
+    for c in text.chars() {
+        if c.is_whitespace() {
+            flush(&mut word, &mut out);
+            out.push(c);
+        } else {
+            word.push(c);
+        }
+    }
+    flush(&mut word, &mut out);
+    out
+}
+
+fn clean_url_word(w: &str) -> String {
+    let (lead, rest) = w.split_at(w.find(|c: char| !matches!(c, '(' | '<' | '"' | '\'')).unwrap_or(w.len()));
+    let (scheme, after) = match rest.find("://") {
+        Some(k) => (&rest[..k + 3], &rest[k + 3..]),
+        None => ("", rest),
+    };
+    // Without a scheme, only something shaped like host.tld/path counts as a URL.
+    let looks_like_url = !scheme.is_empty() || after.split(['/', '?', '#']).next().is_some_and(|h| h.contains('.') && !h.contains('@') && after.contains(['/', '?', '#']));
+    if !looks_like_url {
+        return w.to_owned();
+    }
+    let end = after.find(['?', '#']).unwrap_or(after.len());
+    let (base, tail) = after.split_at(end);
+    // Trailing punctuation after a query (")", ",", ".") stays.
+    let keep_tail: String = tail.chars().rev().take_while(|c| matches!(c, ')' | '>' | '"' | '\'' | ',' | '.' | ';')).collect::<Vec<_>>().into_iter().rev().collect();
+    let host_end = base.find('/').unwrap_or(base.len());
+    let host = &base[..host_end];
+    let host = host.rsplit_once('@').map_or(host, |(_, h)| h);
+    format!("{lead}{scheme}{host}{}{keep_tail}", &base[host_end..])
 }
 
 impl Store {
@@ -117,7 +156,8 @@ impl Store {
     pub fn post(&mut self, note: Note, now_ms: u64) -> String {
         self.dirty = true;
         if let Some(key) = &note.key
-            && let Some(i) = self.items.iter().position(|i| i.key.as_ref() == Some(key))
+            // Only the same poster's own item: a mod can't bump (or hijack) Herdr's or another mod's.
+            && let Some(i) = self.items.iter().position(|i| i.key.as_ref() == Some(key) && i.source == note.source && i.owner == note.owner)
         {
             let mut it = self.items.remove(i);
             it.ts = now_ms;
@@ -139,6 +179,7 @@ impl Store {
             id: id.clone(),
             ts: now_ms,
             source,
+            owner: note.owner,
             from: cap(&note.from, 100),
             title: cap(&note.title, MAX_TITLE),
             body: cap(&note.body, MAX_BODY),
@@ -225,6 +266,21 @@ impl Store {
         n
     }
 
+    /// The saved history arrived after this run already posted some (settings load after the
+    /// window opens): keep both, this run's first, ids renumbered past the saved ones.
+    pub fn merge_loaded(&mut self, saved: Store) {
+        let fresh = std::mem::take(&mut self.items);
+        self.seq = saved.seq;
+        self.items = saved.items;
+        for mut i in fresh.into_iter().rev() {
+            self.seq += 1;
+            i.id = format!("n_{}", self.seq);
+            self.items.insert(0, i);
+        }
+        self.dirty = true;
+        self.trim(crate::model::now_ms());
+    }
+
     pub fn unread(&self, muted: &[String]) -> usize {
         self.items.iter().filter(|i| !i.read && !muted.contains(&i.source)).count()
     }
@@ -249,6 +305,10 @@ impl Store {
                 return Store::default();
             }
         };
+        // Files from before `owner`: a mod's items were its folder's (`from`), the rest Herdr's.
+        for i in store.items.iter_mut().filter(|i| i.owner.is_empty()) {
+            i.owner = if i.source == "mods" { i.from.clone() } else { "herdr".to_owned() };
+        }
         store.seq = store.seq.max(store.items.iter().filter_map(|i| i.id.strip_prefix("n_")?.parse().ok()).max().unwrap_or(0));
         store.mark_stale();
         store.trim(now_ms);
@@ -275,7 +335,7 @@ impl Store {
 
 /// A mod's own items: posted by it (source `mods`, from = its folder). `None`: every item.
 fn owns(owner: Option<&str>, i: &Item) -> bool {
-    owner.is_none_or(|me| i.source == "mods" && i.from == me)
+    owner.is_none_or(|me| i.source == "mods" && i.owner == me)
 }
 
 /// The whole `notifications()` payload, as the window publishes it to mods.
@@ -292,7 +352,7 @@ pub fn view(store: &Store, settings: &crate::settings::NotificationSettings) -> 
 /// their unread count, and no settings.
 pub fn scope(full: &Value, owner: Option<&str>) -> Value {
     let Some(me) = owner else { return full.clone() };
-    let items: Vec<&Value> = full["items"].as_array().into_iter().flatten().filter(|i| i["source"] == "mods" && i["from"] == me).collect();
+    let items: Vec<&Value> = full["items"].as_array().into_iter().flatten().filter(|i| i["source"] == "mods" && i["owner"] == me).collect();
     let unread = items.iter().filter(|i| i["read"] == false).count();
     serde_json::json!({ "unread": unread, "items": items })
 }
@@ -428,8 +488,8 @@ mod tests {
     fn a_mod_without_the_permission_sees_and_changes_only_its_own_items() {
         let mut s = Store::default();
         let agent = s.post(note("agents", "t7 needs you", None), 1);
-        let theirs = s.post(Note { from: "fork-board".into(), ..note("mods", "board", None) }, 2);
-        let mine = s.post(Note { from: "my-mod".into(), ..note("mods", "mine", None) }, 3);
+        let theirs = s.post(Note { from: "fork-board".into(), owner: "fork-board".into(), ..note("mods", "board", None) }, 2);
+        let mine = s.post(Note { from: "my-mod".into(), owner: "my-mod".into(), ..note("mods", "mine", None) }, 3);
         let settings = crate::settings::NotificationSettings { dnd: true, ..Default::default() };
         let v = scope(&view(&s, &settings), Some("my-mod"));
         assert_eq!(v["items"].as_array().unwrap().len(), 1);
@@ -447,6 +507,51 @@ mod tests {
     }
 
     #[test]
+    fn a_key_only_bumps_the_same_posters_item() {
+        let mut s = Store::default();
+        let core = s.post(Note { owner: "herdr".into(), ..note("updates", "herdr-core update failed", Some("updates:core")) }, 1);
+        let fake = s.post(Note { owner: "evil-mod".into(), from: "herdr-core".into(), ..note("mods", "click me", Some("updates:core")) }, 2);
+        assert_ne!(core, fake, "a mod's key can't reach Herdr's item");
+        assert_eq!(s.items.iter().find(|i| i.id == core).unwrap().title, "herdr-core update failed");
+        let other = s.post(Note { owner: "board".into(), ..note("mods", "b", Some("k")) }, 3);
+        let mine = s.post(Note { owner: "notepad".into(), ..note("mods", "n", Some("k")) }, 4);
+        assert_ne!(other, mine, "nor another mod's");
+        assert_eq!(s.post(Note { owner: "notepad".into(), ..note("mods", "n2", Some("k")) }, 5), mine, "its own repeat bumps");
+        // A mod's view and changes follow the owner the app assigned, not the `from` it shows.
+        let v = scope(&view(&s, &Default::default()), Some("evil-mod"));
+        assert_eq!(v["items"].as_array().unwrap().len(), 1);
+        assert_eq!(s.clear_as(&Target::Id(core.clone()), Some("evil-mod")), 0);
+    }
+
+    #[test]
+    fn a_failed_save_stays_dirty_for_the_next_try() {
+        let home = tmp();
+        std::fs::write(home.join("data"), b"a file where the folder should be").unwrap();
+        let mut s = Store::default();
+        s.post(note("app", "keep me", None), 1);
+        assert!(s.save(&home.join("data/notifications/history.json")).is_err());
+        assert!(s.dirty, "kept for the retry");
+        std::fs::remove_file(home.join("data")).unwrap();
+        s.save(&home.join("data/notifications/history.json")).unwrap();
+        assert!(!s.dirty);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn posts_before_the_saved_history_loads_are_kept() {
+        let now = crate::model::now_ms();
+        let mut saved = Store::default();
+        saved.post(note("app", "old", None), now - 2);
+        saved.post(note("app", "older", None), now - 1);
+        let mut s = Store::default();
+        s.post(note("agents", "new", None), now);
+        s.merge_loaded(saved);
+        let ids: Vec<_> = s.items.iter().map(|i| (i.id.as_str(), i.title.as_str())).collect();
+        assert_eq!(ids, [("n_3", "new"), ("n_2", "older"), ("n_1", "old")]);
+        assert!(s.dirty);
+    }
+
+    #[test]
     fn what_is_kept_and_what_is_toast_only() {
         assert!(keeps("error", Some(1000), None, false));
         assert!(!keeps("info", Some(1500), None, false), "a quick confirmation");
@@ -454,5 +559,9 @@ mod tests {
         assert!(!keeps("error", None, Some(false), false) && keeps("info", Some(1000), Some(true), false));
         assert!(!keeps("error", None, Some(true), true), "private is never stored");
         assert_eq!(strip_query("Failed: https://a.test/f.zip?token=SECRET#x (403)"), "Failed: https://a.test/f.zip (403)");
+        assert_eq!(strip_query("from https://user:pw@a.test/f?x=1."), "from https://a.test/f.", "userinfo goes, the full stop stays");
+        assert_eq!(strip_query("cdn.a.test/f.zip?sig=abc failed"), "cdn.a.test/f.zip failed", "no scheme, still a URL");
+        assert_eq!(strip_query("(https://a.test/x#frag)"), "(https://a.test/x)");
+        assert_eq!(strip_query("Saved  to /Users/me/My  File.zip"), "Saved  to /Users/me/My  File.zip", "paths and spacing untouched");
     }
 }

@@ -26,6 +26,11 @@ fn click_in_popup(p: &mut Page, x: f32, y: f32, w: f32, h: f32) {
 fn main() {
     let server = fixtures::Server::start();
     let Some(mut p) = Page::open(Host::Cef, &server.url("oauth-opener.html")) else { return };
+    // 0. An agent's eval clicking Sign in carries Chromium's gesture but not the person's click:
+    //    no popup (the host refuses it; the app may show the blocked chip).
+    p.eval("document.getElementById('signin').click(); 1").unwrap();
+    p.run_for(Duration::from_secs(2));
+    assert!(popups(&mut p).is_empty(), "an agent's eval can't open a popup");
     // 1. Sign in (a real click: a user gesture) opens a 480x560 popup over the opener.
     p.click(120.0, 50.0);
     assert!(p.wait(Duration::from_secs(20), |p| popups(p).len() == 1), "the popup shows: {:?}", p.console());

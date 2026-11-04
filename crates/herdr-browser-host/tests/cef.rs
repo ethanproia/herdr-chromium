@@ -759,6 +759,10 @@ fn text_edit_on_the_persons_pick_commits_or_cancels() {
     assert!(text_edit(&mut h, 21, &four.1, Begin).0);
     h.send(AppToHost::Input { id: "b1".into(), event: InputEvent::Text { text: "gone".into() } });
     assert_eq!(text_edit(&mut h, 22, &four.1, Cancel), (true, "four".into(), "four".into()));
+    // A form field is never edited this way, even when it is the pick.
+    let field = pick(&mut h, 40, 20.0, 105.0);
+    assert!(field.0 && field.2.starts_with("input"), "{field:?}");
+    assert!(!text_edit(&mut h, 41, &field.1, Begin).0, "no form fields");
     // An element with element children is not plain text.
     let card = step(&mut h, 30, &four.1, herdr_browser_protocol::PickStep::Parent);
     assert!(card.0 && card.2 == "div", "{card:?}");

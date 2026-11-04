@@ -194,6 +194,8 @@ struct Open {
     profile: Option<String>,
     size: Dips,
     scale: f32,
+    /// Responsive mode's UA and touch, replayed after a host restart with the page.
+    device: Option<protocol::Device>,
 }
 
 type Subscriber = async_channel::Sender<HostToApp>;
@@ -202,6 +204,9 @@ type Subscriber = async_channel::Sender<HostToApp>;
 struct Shared {
     open: HashMap<BrowserId, Open>,
     subs: HashMap<BrowserId, Subscriber>,
+    /// A popup's events from `PopupOpened` until its view subscribes (the view is made at the
+    /// opener's next draw): an early redirect, its first frames or its close are kept, in order.
+    early: HashMap<BrowserId, Vec<HostToApp>>,
     /// Bumped each time a host connection ends; readers of an older one stay quiet.
     generation: u64,
     /// Hears every host message (the agent commands, part 5).
@@ -245,10 +250,9 @@ impl HostClient {
 
     /// Host events for browser `id` (and the app-wide ones: a crash, an error without an id).
     pub fn subscribe(&self, id: &str) -> async_channel::Receiver<HostToApp> {
-        let (tx, rx) = async_channel::unbounded();
-        self.shared.lock().unwrap().subs.insert(id.to_owned(), tx);
-        rx
+        subscribe_in(&self.shared, id)
     }
+
 
     /// The block is gone: close its page and stop its events.
     pub fn close(&self, id: &str) {
@@ -286,7 +290,7 @@ impl HostLink for HostClient {
             let mut s = self.shared.lock().unwrap();
             match &msg {
                 AppToHost::Create { id, url, size, scale, profile } => {
-                    s.open.insert(id.clone(), Open { url: url.clone(), profile: profile.clone(), size: *size, scale: *scale });
+                    s.open.insert(id.clone(), Open { url: url.clone(), profile: profile.clone(), size: *size, scale: *scale, device: None });
                 }
                 AppToHost::Resize { id, size, scale } => {
                     if let Some(o) = s.open.get_mut(id) {
@@ -300,6 +304,11 @@ impl HostLink for HostClient {
                 }
                 AppToHost::Close { id } => {
                     s.open.remove(id);
+                }
+                AppToHost::SetDevice { id, device } => {
+                    if let Some(o) = s.open.get_mut(id) {
+                        o.device = device.clone();
+                    }
                 }
                 _ => {}
             }
@@ -352,7 +361,10 @@ impl Writer {
                         open.sort_by(|a, b| a.0.cmp(&b.0));
                         self.replayed = open.iter().map(|(id, _)| id.clone()).collect();
                         for (id, o) in open {
-                            self.write(&AppToHost::Create { id, url: o.url, size: o.size, scale: o.scale, profile: o.profile });
+                            self.write(&AppToHost::Create { id: id.clone(), url: o.url, size: o.size, scale: o.scale, profile: o.profile });
+                            if o.device.is_some() {
+                                self.write(&AppToHost::SetDevice { id, device: o.device });
+                            }
                         }
                     }
                     Err(e) => {
@@ -449,6 +461,8 @@ impl Writer {
                 let current = s.generation == c.generation;
                 if current {
                     s.generation += 1;
+                    // A popup the old host announced never comes back.
+                    s.early.clear();
                 }
                 current
             };
@@ -482,6 +496,20 @@ impl Writer {
         self.drop_conn(None);
     }
 }
+
+/// A view's events from now on; a popup's that came before its view are handed over first, in order.
+fn subscribe_in(shared: &Mutex<Shared>, id: &str) -> async_channel::Receiver<HostToApp> {
+    let (tx, rx) = async_channel::unbounded();
+    let mut s = shared.lock().unwrap();
+    for msg in s.early.remove(id).unwrap_or_default() {
+        let _ = tx.try_send(msg);
+    }
+    s.subs.insert(id.to_owned(), tx);
+    rx
+}
+
+/// The most events kept for a popup whose view isn't made yet.
+const EARLY_MAX: usize = 512;
 
 /// Host lines to the views. At the end (the host died) every view hears `Crashed`.
 fn read(stream: UnixStream, shared: Arc<Mutex<Shared>>, generation: u64) {
@@ -519,10 +547,21 @@ fn read(stream: UnixStream, shared: Arc<Mutex<Shared>>, generation: u64) {
         {
             o.url = Some(url.clone());
         }
+        if let HostToApp::PopupOpened { id, .. } = &msg
+            && !s.subs.contains_key(id)
+        {
+            s.early.entry(id.clone()).or_default();
+        }
         match target(&msg) {
             Some(id) => {
                 if let Some(tx) = s.subs.get(id) {
                     let _ = tx.try_send(msg.clone());
+                } else if let Some(q) = s.early.get_mut(id) {
+                    // Bounded: a popup holds at most two frames in flight (the host waits for acks),
+                    // so this only fills if its view is never made.
+                    if q.len() < EARLY_MAX {
+                        q.push(msg.clone());
+                    }
                 }
             }
             None => {
@@ -537,6 +576,7 @@ fn read(stream: UnixStream, shared: Arc<Mutex<Shared>>, generation: u64) {
     let mut s = shared.lock().unwrap();
     if s.generation == generation {
         s.generation += 1;
+        s.early.clear();
         let crash = HostToApp::Crashed { id: None, reason: "the browser host stopped".into() };
         for tx in s.subs.values() {
             let _ = tx.try_send(crash.clone());
@@ -1107,6 +1147,8 @@ impl BrowserView {
                     }
                 }
                 if url != self.state.url {
+                    // HERDR: S13. A new document: the edit and its pending pin go.
+                    self.abandon_text_edit(cx);
                     self.state.url = url.clone();
                     self.block.url = url.clone();
                     self.address_stale = true;
@@ -1132,6 +1174,8 @@ impl BrowserView {
             }
             H::Loading { loading, can_back, can_forward, .. } => {
                 if loading {
+                    // HERDR: S13. A reload makes a new document too.
+                    self.abandon_text_edit(cx);
                     self.load_error = None;
                     self.state.load_error = None;
                 }
@@ -1141,6 +1185,8 @@ impl BrowserView {
             H::Crashed { reason, .. } => {
                 // The host forgets the page; the reload card makes it again.
                 self.crashed = Some(reason);
+                // HERDR: S13.
+                self.abandon_text_edit(cx);
                 self.sized = None;
                 self.frames.clear();
                 self.acked = None;
@@ -1251,7 +1297,7 @@ impl BrowserView {
             }
             // The host minted `id`; only this page's own popups, and never an id already in use.
             H::PopupOpened { opener, id, url, w, h } if opener == self.id => {
-                if self.states.lock().unwrap().contains_key(&id) || self.popups_due.iter().any(|(p, ..)| *p == id) {
+                if !herdr_browser_protocol::is_popup_id(&id) || self.states.lock().unwrap().contains_key(&id) || self.popups_due.iter().any(|(p, ..)| *p == id) {
                     // Never Close it: that id is a live block's.
                     tracing::warn!("browser {}: popup id {id} is already in use; ignored", self.id);
                 } else {
@@ -1320,14 +1366,30 @@ impl BrowserView {
     /// Responsive mode on (a device) or off: the page is resized to the device (or back to the
     /// block) and told the device's UA and touch (or that every override is gone).
     pub fn set_device(&mut self, mode: Option<super::devices::Mode>, cx: &mut Context<Self>) {
+        // Any choice closes the menu, even one that changes nothing.
+        if self.device_menu {
+            self.device_menu = false;
+            cx.notify();
+        }
         if mode == self.device {
             return;
         }
         self.device = mode;
+        // A new viewport: pick, markup, comments and text edit (for the old one) close, wherever
+        // they sit in the stack; an agent's lease stays. They can be opened again on the device.
+        if self.device.is_some() {
+            self.input.update(cx, |i, _| i.close_annotation());
+            self.drain_overlay(cx);
+        }
+        // Either way: picks agents wait on, page answers and the style panel were for the old viewport.
+        if let Some(agent) = &self.agent {
+            agent.lock().unwrap().cancel_picks(&self.id, "the browser switched device mode; pick again");
+        }
+        self.asks.clear();
+        if self.style_panel.is_some() {
+            self.close_style_panel(cx);
+        }
         self.device_menu = false;
-        let off = self.device.is_some();
-        self.input.update(cx, |i, _| i.set_annotate_off(off));
-        self.drain_overlay(cx);
         self.link.send(AppToHost::SetDevice { id: self.id.clone(), device: self.device.as_ref().map(|d| d.device()) });
         if let Some((size, scale)) = self.measured {
             self.laid_out(size, scale);
@@ -1340,12 +1402,24 @@ impl BrowserView {
         self.device.as_ref()
     }
 
+    /// Whether the device menu is open.
+    pub fn device_menu_open(&self) -> bool {
+        self.device_menu
+    }
+
+    /// The 📱 button: opens or closes the device menu.
+    pub fn toggle_device_menu(&mut self, cx: &mut Context<Self>) {
+        self.device_menu = !self.device_menu;
+        cx.notify();
+    }
+
     fn device_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         if !self.device_menu {
             return None;
         }
         let item = |id: &'static str, label: String| div().id(id).px_2().py_1().rounded_sm().cursor_pointer().hover(|s| s.bg(hsla(0., 0., 1., 0.1))).child(label);
-        let mut menu = div().id("device-menu").absolute().top(px(2.)).right(px(8.)).flex().flex_col().p_1().rounded_md().text_xs().bg(rgb(0x1f1f1f)).text_color(rgb(0xf2f2f2));
+        // Occluded: a click on the menu never falls through to the page under it.
+        let mut menu = div().id("device-menu").absolute().top(px(2.)).right(px(8.)).occlude().flex().flex_col().p_1().rounded_md().text_xs().bg(rgb(0x1f1f1f)).text_color(rgb(0xf2f2f2));
         menu = menu.child(item("device-off", "Responsive off".into()).on_click(cx.listener(|v, _, _, cx| v.set_device(None, cx))));
         for (i, p) in super::devices::PRESETS.iter().enumerate() {
             let name = p.name;
@@ -1644,6 +1718,12 @@ impl BrowserView {
     }
 
     /// S29: a grant (or the sensitive mark) as the person set it in the shield; never an agent's.
+    /// Marked sensitive by the person: a popup is as sensitive as its opener.
+    pub fn sensitive(&self) -> bool {
+        let id = self.opener.clone().unwrap_or_else(|| self.id.clone());
+        self.agent.as_ref().is_some_and(|a| a.lock().unwrap().grants.get(&id, Grant::Sensitive))
+    }
+
     pub fn grant(&self, g: Grant) -> bool {
         self.agent.as_ref().is_some_and(|a| a.lock().unwrap().grants.get(&self.id, g))
     }
@@ -1799,9 +1879,8 @@ impl BrowserView {
                             self.click_target(PageAsk::CommentTarget, cx_, cy, cx);
                         } else if self.styles_on_pick {
                             self.click_target(PageAsk::StyleTarget, cx_, cy, cx);
-                            self.input.update(cx, |i, _| {
-                                i.escape();
-                            });
+                            // HERDR: S13. The same double-click window as a plain pick.
+                            self.leave_pick_unless_double_click(cx);
                         } else {
                             // HERDR: S13. Pick ends after the double-click interval, unless a second click edits text.
                             self.leave_pick_unless_double_click(cx);
@@ -1883,7 +1962,7 @@ impl BrowserView {
     fn leave_pick_unless_double_click(&mut self, cx: &mut Context<Self>) {
         let n = self.text_edit.wait_for_second_click();
         cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(Duration::from_millis(super::text_edit::DOUBLE_CLICK_MS)).await;
+            cx.background_executor().timer(Duration::from_millis(super::text_edit::double_click_ms())).await;
             let _ = this.update(cx, |v, cx| {
                 if v.text_edit.wait_ran_out(n) && v.owner(cx) == Owner::Pick {
                     v.input.update(cx, |i, _| {
@@ -1900,12 +1979,31 @@ impl BrowserView {
     /// element under the pointer is asked for (a pick, so the host lets it be edited).
     fn text_edit_at(&mut self, x: f32, y: f32, cx: &mut Context<Self>) {
         self.text_edit.exit_wait = None;
+        // One edit at a time: a double-click mid-edit is ignored rather than orphaning this one.
+        if !self.text_edit.start() {
+            return;
+        }
         if self.owner(cx) == Owner::Comment {
             self.input.update(cx, |i, _| {
                 i.escape();
             });
         }
         self.ask_target(PageAsk::TextEdit, x, y);
+    }
+
+    /// HERDR: S13. The page went away (navigation, reload, crash): the edit ends with it, and any
+    /// answer still in flight finds nothing (its pin would belong to the old document).
+    fn abandon_text_edit(&mut self, cx: &mut Context<Self>) {
+        if self.text_edit.phase == super::text_edit::Phase::Idle && self.text_edit.hint.is_none() {
+            return;
+        }
+        self.text_edit.reset();
+        if self.owner(cx) == Owner::TextEdit {
+            self.input.update(cx, |i, _| {
+                i.escape();
+            });
+        }
+        cx.notify();
     }
 
     /// HERDR: S13. Return saved or Esc (or a lease) cancelled: the host keeps or restores the text.
@@ -1985,6 +2083,9 @@ impl BrowserView {
             // ok false keeps the current pick.
             // HERDR: S13. The double-clicked element: ask the host to make it editable.
             PageAsk::TextEdit => {
+                if target.is_none() {
+                    self.text_edit.nothing_there();
+                }
                 if let Some(t) = target {
                     self.hovered = Some(t.clone());
                     self.text_edit.target = Some(t);
@@ -2241,12 +2342,26 @@ impl BrowserView {
         }));
     }
 
+    /// Responsive mode: how much the page is scaled to fit its block (1 when off).
+    pub fn fit(&self) -> f32 {
+        match (&self.device, self.measured) {
+            // The label and its gap above the frame get their room first.
+            (Some(d), Some((area, _))) => d.fit(area.w, (area.h - DEVICE_LABEL_SPACE).max(1.0)),
+            _ => 1.0,
+        }
+    }
+
+    /// A page-DIP rect where overlays draw it (`geometry::to_drawn` at this block's fit).
+    fn drawn(&self, r: (f32, f32, f32, f32)) -> (f32, f32, f32, f32) {
+        super::geometry::to_drawn(r, self.fit())
+    }
+
     fn annotation_layer(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut out: Vec<AnyElement> = self
             .annotations
             .visible()
             .map(|a| {
-                let (x, y, _, _) = self.pin_rect(a);
+                let (x, y, _, _) = self.drawn(self.pin_rect(a));
                 let n = a.n;
                 div()
                     .id(("pin", n as usize))
@@ -2274,7 +2389,7 @@ impl BrowserView {
             .collect();
         // A9: the open pin's popover beside it.
         if let Some(pin) = self.open_pin.and_then(|n| self.annotations.visible().find(|p| p.n == n).cloned()) {
-            let (x, y, _, _) = self.pin_rect(&pin);
+            let (x, y, _, _) = self.drawn(self.pin_rect(&pin));
             let popover = design_bar::pin_popover(pin.n, &pin.comment, cx, |v, a, _, cx| v.pin_action(a, cx));
             out.push(
                 div()
@@ -2295,6 +2410,8 @@ impl BrowserView {
         if let Some((size, _)) = self.sized {
             let pins: Vec<(u32, (f32, f32, f32, f32))> = self.annotations.visible().map(|a| (a.n, self.pin_rect(a))).collect();
             let o = design_bar::offscreen(&pins, (size.w, size.h));
+            let (_, _, dw, dh) = self.drawn((0.0, 0.0, size.w, size.h));
+            let size = Dips { w: dw, h: dh };
             for (id, text) in design_bar::offscreen_labels(&o) {
                 let m = div().id(id).absolute().px_1().rounded_full().text_xs().bg(rgb(0xff3b30)).text_color(rgb(0xffffff)).child(text);
                 let m = match id {
@@ -2307,12 +2424,14 @@ impl BrowserView {
             }
         }
         if let Some(r) = self.rubber {
+            let (x, y, w, h) = self.drawn((r.x, r.y, r.w, r.h));
+            let r = Rect { x, y, w, h };
             out.push(div().absolute().left(px(r.x)).top(px(r.y)).w(px(r.w)).h(px(r.h)).border_1().border_color(rgb(0x3b82f6)).bg(hsla(0.6, 0.9, 0.6, 0.12)).into_any_element());
         }
         if let Some(t) = &self.comment_target {
             let input = self.input.read(cx);
             let typed = input.comment().text.clone() + input.comment().marked.as_deref().unwrap_or("");
-            let (x, y, _, h) = t.rect;
+            let (x, y, _, h) = self.drawn(t.rect);
             out.push(
                 div()
                     .id("comment-field")
@@ -2650,8 +2769,8 @@ impl BrowserView {
             div()
                 .id("context-menu")
                 .absolute()
-                .left(px(menu.at.0))
-                .top(px(menu.at.1))
+                .left(px(menu.at.0 * self.fit()))
+                .top(px(menu.at.1 * self.fit()))
                 .w(px(MENU_WIDTH))
                 .py(px(4.))
                 .bg(rgb(0xffffff))
@@ -2745,12 +2864,7 @@ impl BrowserView {
             .child(div().flex_1().min_w_0().overflow_hidden().child(Input::new(&self.address)))
             .when(self.state.loading, |d| d.child("loading"))
             // A1: one Design button; the strip under the bar holds every design control.
-            .child(if self.device.is_some() {
-                // Pick and markup overlays assume an unscaled page: off while a device is previewed.
-                button("Design", false).tooltip(|_, cx| cx.new(|_| Hint("Turn off device mode to annotate")).into())
-            } else {
-                button("Design", true).on_click(cx.listener(|v, _, _, cx| v.toggle_mode(Owner::Pick, cx)))
-            })
+            .child(button("Design", true).on_click(cx.listener(|v, _, _, cx| v.toggle_mode(Owner::Pick, cx))))
             // The zoom label shows only off 100 %; a click resets it.
             .when(self.zoom_level.abs() > 1e-6, |d| {
                 d.child(div().id("zoom-label").px_1().rounded_sm().cursor_pointer().bg(hsla(0., 0., 0.5, 0.15)).child(zoom::percent(self.zoom_level)).on_click(cx.listener(|v, _, _, cx| v.set_zoom(0.0, cx))))
@@ -2806,11 +2920,12 @@ impl Render for BrowserView {
         let me = cx.entity().downgrade();
         let (input_el, focus) = (self.input.clone(), self.focus.clone());
         // Responsive mode: the device letterboxed into the page area, drawn at `fit`.
-        let fit = match (&self.device, self.measured) {
-            (Some(d), Some((area, _))) => d.fit(area.w, area.h),
-            _ => 1.0,
-        };
-        self.input.update(cx, |i, _| i.set_fit(fit));
+        let fit = self.fit();
+        let frame = self.device.as_ref().map(|d| (d.w, d.h));
+        self.input.update(cx, |i, _| {
+            i.set_fit(fit);
+            i.set_frame(frame);
+        });
         let boxed = self.device.is_some();
         let (box_input, box_focus) = (self.input.clone(), self.focus.clone());
         let page = div()
@@ -2865,8 +2980,39 @@ impl Render for BrowserView {
             });
         }
         // A window shot covers a page the person marked sensitive (its pixels never reach the file).
-        let masked = SHOT_MASK.load(std::sync::atomic::Ordering::SeqCst) && self.grant(Grant::Sensitive);
+        let masked = SHOT_MASK.load(std::sync::atomic::Ordering::SeqCst) && self.sensitive();
         let frame = if masked { None } else { frame };
+        // Current overlay rects (stale ones are already gone), outlined over the frame.
+        // A3: a stepped pick draws its own box (the pointer's hit test is not it).
+        let stepped = self.hovered.as_ref().filter(|_| self.stepped).map(|t| Rect { x: t.rect.0, y: t.rect.1, w: t.rect.2, h: t.rect.3 });
+        let boxes: Vec<Rect> = match stepped {
+            Some(r) => vec![r],
+            None => self.overlay.shown().to_vec(),
+        };
+        let boxes: Vec<Rect> = boxes.iter().map(|r| { let (x, y, w, h) = self.drawn((r.x, r.y, r.w, r.h)); Rect { x, y, w, h } }).collect();
+        // Every overlay goes in `over`: drawn over the frame, inside the letterboxed box in
+        // responsive mode (positions already through `drawn`).
+        let mut over: Vec<AnyElement> = Vec::new();
+        over.extend(boxes.iter().map(|r| {
+            div().absolute().left(px(r.x)).top(px(r.y)).w(px(r.w)).h(px(r.h)).border_2().border_color(rgb(0x3b82f6)).bg(hsla(0.6, 0.9, 0.6, 0.15)).into_any_element()
+        }));
+        // A2: the label chip on the hover box while picking ("element · W×H" until the label comes).
+        let chip = (self.owner(cx) == Owner::Pick).then(|| boxes.first().copied()).flatten().map(|r| {
+            let label = self.hovered.as_ref().map(|t| t.label.as_str()).unwrap_or("");
+            let (x, y) = design_bar::chip_origin((r.x, r.y, r.w, r.h));
+            div().absolute().left(px(x)).top(px(y)).child(design_bar::chip(design_bar::chip_text(label, r.w, r.h)))
+        });
+        over.extend(chip.map(IntoElement::into_any_element));
+        // S6/S7: pins, the rubber band and the comment field over the frame.
+        over.extend(self.annotation_layer(cx));
+        // Markup above the frame and the highlights, while marking up or when shapes exist.
+        let marking = self.owner(cx) == Owner::Markup || !self.markup.read(cx).shapes().is_empty();
+        if marking {
+            over.push(markup::element(self.markup.clone(), self.fit()).into_any_element());
+        }
+        // The context menu over everything in the page, at the drawn place (it takes the mouse first).
+        over.extend(self.menu_element(cx));
+        let mut over_slot = Some(over);
         let page = match (&self.crashed, frame) {
             _ if masked => page.child(
                 div().absolute().size_full().flex().items_center().justify_center().bg(rgb(0x202020)).text_color(rgb(0x909090)).text_sm().child("Hidden in screenshots: marked sensitive"),
@@ -2886,11 +3032,13 @@ impl Render for BrowserView {
                         .child(
                             div()
                                 .relative()
+                                .flex_none()
                                 .w(px(d.w * fit))
                                 .h(px(d.h * fit))
                                 .bg(rgb(0xffffff))
                                 .child(div().absolute().size_full().child(frame))
-                                .child(canvas(|_, _, _| (), move |bounds, _, window, cx| input::paint(&box_input, &box_focus, bounds, window, cx)).absolute().size_full()),
+                                .child(canvas(|_, _, _| (), move |bounds, _, window, cx| input::paint(&box_input, &box_focus, bounds, window, cx)).absolute().size_full())
+                                .children(over_slot.take().into_iter().flatten()),
                         ),
                 )
                 .children(self.load_error_card(cx))
@@ -2927,32 +3075,8 @@ impl Render for BrowserView {
                     ),
             ),
         };
-        // Current overlay rects (stale ones are already gone), outlined over the frame.
-        // A3: a stepped pick draws its own box (the pointer's hit test is not it).
-        let stepped = self.hovered.as_ref().filter(|_| self.stepped).map(|t| Rect { x: t.rect.0, y: t.rect.1, w: t.rect.2, h: t.rect.3 });
-        let boxes: Vec<Rect> = match stepped {
-            Some(r) => vec![r],
-            None => self.overlay.shown().to_vec(),
-        };
-        let page = page.children(boxes.iter().map(|r| {
-            div().absolute().left(px(r.x)).top(px(r.y)).w(px(r.w)).h(px(r.h)).border_2().border_color(rgb(0x3b82f6)).bg(hsla(0.6, 0.9, 0.6, 0.15))
-        }));
-        // A2: the label chip on the hover box while picking ("element · W×H" until the label comes).
-        let chip = (self.owner(cx) == Owner::Pick).then(|| boxes.first().copied()).flatten().map(|r| {
-            let label = self.hovered.as_ref().map(|t| t.label.as_str()).unwrap_or("");
-            let (x, y) = design_bar::chip_origin((r.x, r.y, r.w, r.h));
-            div().absolute().left(px(x)).top(px(y)).child(design_bar::chip(design_bar::chip_text(label, r.w, r.h)))
-        });
-        let page = page.children(chip);
-        // S6/S7: pins, the rubber band and the comment field over the frame.
-        let layer = self.annotation_layer(cx);
-        let page = page.children(layer);
-        // Markup above the frame and the highlights, while marking up or when shapes exist.
-        let marking = self.owner(cx) == Owner::Markup || !self.markup.read(cx).shapes().is_empty();
-        let page = page.when(marking, |p| p.child(markup::element(self.markup.clone())));
-        // The context menu over everything in the page; it takes the mouse first (occlude).
-        let menu = self.menu_element(cx);
-        let page = page.children(menu);
+        // In responsive mode the device's box took the overlays; otherwise they go over the page.
+        let page = page.children(over_slot.take().into_iter().flatten());
         // A JS dialog and the downloads list sit beside the page element, over it: keys and clicks in
         // them must not bubble into the page's input listeners.
         let page = div()
@@ -3082,7 +3206,7 @@ pub fn device_mode(a: &serde_json::Value) -> Result<Option<super::devices::Mode>
     }
     let num = |k: &str| a.get(k).and_then(serde_json::Value::as_f64).map(|v| v as f32);
     match (num("w"), num("h")) {
-        (Some(w), Some(h)) => Ok(Some(super::devices::Mode::custom(w, h, num("scale")))),
+        (Some(w), Some(h)) => super::devices::Mode::custom(w, h, num("scale")).map(Some),
         _ => Err("browser.device needs name, or w and h, or off: true".into()),
     }
 }
@@ -3102,14 +3226,8 @@ pub fn broker_authorizer(agent: Arc<Mutex<Agent>>, states: Arc<Mutex<HashMap<Bro
     })
 }
 
-/// A small tooltip.
-struct Hint(&'static str);
-
-impl Render for Hint {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div().px_2().py_1().rounded_sm().text_xs().bg(rgb(0x1f1f1f)).text_color(rgb(0xf2f2f2)).child(self.0)
-    }
-}
+/// Room for the device label and its gap above the letterboxed frame (DIPs).
+const DEVICE_LABEL_SPACE: f32 = 24.0;
 
 /// Set while `herdr-app shot` renders the window: blocks marked sensitive draw a cover instead of the page.
 pub static SHOT_MASK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -3381,6 +3499,38 @@ mod tests {
     }
 
     #[::core::prelude::v1::test]
+    fn a_popups_early_events_wait_for_its_view_in_order() {
+        // The host sends open, an early redirect and the popup's close before the opener's next
+        // draw makes the popup's view: the view gets all of them, in order.
+        let shared: Arc<Mutex<Shared>> = Default::default();
+        let opener = subscribe_in(&shared, "a");
+        let (mut host, app) = UnixStream::pair().unwrap();
+        for m in [
+            HostToApp::PopupOpened { opener: "a".into(), id: "a~pop1".into(), url: "http://127.0.0.1:1/auth".into(), w: None, h: None },
+            HostToApp::Url { id: "a~pop1".into(), url: "http://127.0.0.1:2/next".into() },
+            HostToApp::PopupClosed { id: "a~pop1".into() },
+            HostToApp::Title { id: "b~pop9".into(), title: "nobody announced me".into() },
+        ] {
+            writeln!(host, "{}", protocol::encode(&m)).unwrap();
+        }
+        let sh = shared.clone();
+        let reader = std::thread::spawn(move || read(app, sh, 0));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while shared.lock().unwrap().early.get("a~pop1").is_none_or(|q| q.len() < 2) {
+            assert!(Instant::now() < deadline, "the reader kept nothing");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(matches!(opener.try_recv(), Ok(HostToApp::PopupOpened { .. })));
+        let pop = subscribe_in(&shared, "a~pop1");
+        drop(host);
+        reader.join().unwrap();
+        assert!(matches!(pop.try_recv(), Ok(HostToApp::Url { url, .. }) if url.ends_with("/next")), "the early redirect");
+        assert!(matches!(pop.try_recv(), Ok(HostToApp::PopupClosed { .. })), "then its close");
+        assert!(shared.lock().unwrap().early.get("b~pop9").is_none(), "only announced popups are kept");
+    }
+
+    #[::core::prelude::v1::test]
     fn load_error_cards_name_the_kind_and_cap_the_url() {
         assert_eq!(load_error_words("refused", "http://127.0.0.1:3000/x").0, "Nothing is running at 127.0.0.1:3000");
         assert_eq!(load_error_words("refused", "https://a.test/").0, "The site refused to connect");
@@ -3578,6 +3728,10 @@ mod tests {
         recv(&a, |m| matches!(m, HostToApp::Url { url, .. } if url == "https://example.com"));
         let frame = recv(&a, |m| matches!(m, HostToApp::Frame { .. }));
         assert!(matches!(frame, HostToApp::Frame { size: PixelSize { w: 800, h: 600 }, .. }), "{frame:?}");
+        // Responsive mode on: after a restart the new host hears it again with the page.
+        let device = protocol::Device { mobile: true, touch: true, user_agent: Some("UA-phone".into()) };
+        link.send(AppToHost::SetDevice { id: "a".into(), device: Some(device) });
+        recv(&a, |m| matches!(m, HostToApp::Console { message, .. } if message == "device mobile=true touch=true ua=true"));
         // Kill the host: the view hears a crash, the next send starts a new one and makes the page again.
         let pid = String::from_utf8(Command::new("pgrep").args(["-f", &format!("{}", socket_of(&dir).display())]).output().unwrap().stdout).unwrap();
         let pid = pid.lines().next().expect("stub host running").trim().to_owned();
@@ -3585,6 +3739,7 @@ mod tests {
         recv(&a, |m| matches!(m, HostToApp::Crashed { .. }));
         link.send(AppToHost::Reload { id: "a".into(), ignore_cache: false });
         recv(&a, |m| matches!(m, HostToApp::Url { url, .. } if url == "https://example.com"));
+        recv(&a, |m| matches!(m, HostToApp::Console { message, .. } if message == "device mobile=true touch=true ua=true"));
         drop(link);
         std::thread::sleep(Duration::from_millis(700));
         let left = Command::new("pgrep").args(["-f", &format!("{}", socket_of(&dir).display())]).output().unwrap();

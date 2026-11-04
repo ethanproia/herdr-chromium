@@ -41,8 +41,9 @@ impl VideoSpec {
     }
 }
 
-/// Draws a video element: the spec, its element id, the script's `.id()` key, and its style.
-pub type Renderer = fn(&VideoSpec, ElementId, Option<SharedString>, StyleRefinement, &mut Window, &mut App) -> AnyElement;
+/// Draws a video element: the spec, its element id, the script's `.id()` key, the scope (which
+/// script runtime, i.e. which mod copy, drew it: see [`current_scope`]) and its style.
+pub type Renderer = fn(&VideoSpec, ElementId, Option<SharedString>, usize, StyleRefinement, &mut Window, &mut App) -> AnyElement;
 
 static RENDERER: OnceLock<Renderer> = OnceLock::new();
 
@@ -51,9 +52,24 @@ pub fn set_renderer(renderer: Renderer) {
     let _ = RENDERER.set(renderer);
 }
 
-pub(crate) fn render(spec: &VideoSpec, id: ElementId, key: Option<SharedString>, refinement: StyleRefinement, window: &mut Window, cx: &mut App) -> AnyElement {
+/// The scope of a runtime: the same number in its renders and in host calls made by its script.
+pub(crate) fn scope_of(runtime: &std::rc::Rc<crate::ShellRuntime>) -> usize {
+    std::rc::Rc::as_ptr(runtime) as *const () as usize
+}
+
+/// The scope of the script calling a host function now (None outside a script).
+pub fn current_scope() -> Option<usize> {
+    crate::scope::current_runtime().map(|r| scope_of(&r))
+}
+
+/// Redraws the calling script's window (a host call changed what a video shows).
+pub fn invalidate_current() {
+    crate::scope::with_current(|window, _| window.refresh());
+}
+
+pub(crate) fn render(spec: &VideoSpec, id: ElementId, key: Option<SharedString>, scope: usize, refinement: StyleRefinement, window: &mut Window, cx: &mut App) -> AnyElement {
     if let Some(renderer) = RENDERER.get() {
-        return renderer(spec, id, key, refinement, window, cx);
+        return renderer(spec, id, key, scope, refinement, window, cx);
     }
     let mut el = div().id(id);
     el.style().refine(&refinement);

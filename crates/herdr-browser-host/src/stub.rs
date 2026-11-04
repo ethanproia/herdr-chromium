@@ -160,7 +160,7 @@ impl<A: SurfaceAlloc> StubHost<A> {
                     out.push(HostToApp::PopupBlocked { id: id.clone(), url: target });
                 } else if let Some(target) = param("popup") {
                     static POP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                    let pid = format!("{id}-pop{}", POP.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1);
+                    let pid = format!("{id}{}{}", herdr_browser_protocol::POPUP_MARK, POP.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1);
                     let scale = self.browsers.get(&id).map_or(1.0, |b| b.scale);
                     let size = Size { w: 480.0, h: 560.0 };
                     let b = Browser { px: pixels(size, scale), scale, seq: 0, in_flight: None, pending: false, history: vec![target.clone()], pos: 0 };

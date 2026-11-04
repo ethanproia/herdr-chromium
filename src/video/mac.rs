@@ -51,7 +51,12 @@ unsafe extern "C" {
 }
 
 #[link(name = "AVFoundation", kind = "framework")]
-unsafe extern "C" {}
+unsafe extern "C" {
+    static AVURLAssetReferenceRestrictionsKey: Id;
+}
+
+/// `AVAssetReferenceRestrictionForbidAll`: an asset may not follow references to other media.
+const REFERENCE_FORBID_ALL: usize = 0xFFFF;
 #[link(name = "Foundation", kind = "framework")]
 unsafe extern "C" {}
 
@@ -126,7 +131,10 @@ fn asset(path: &std::path::Path) -> Result<Id, String> {
     let p = ns_string(&path.to_string_lossy())?;
     unsafe {
         let url: Id = send!(class(c"NSURL"), c"fileURLWithPath:", p => Id; Id);
-        let asset: Id = send!(class(c"AVURLAsset"), c"URLAssetWithURL:options:", url => Id, std::ptr::null_mut() => Id; Id);
+        // No reference movies: a clip inside the app directory may not pull media from elsewhere.
+        let forbid: Id = send!(class(c"NSNumber"), c"numberWithUnsignedInteger:", REFERENCE_FORBID_ALL => usize; Id);
+        let options: Id = send!(class(c"NSDictionary"), c"dictionaryWithObject:forKey:", forbid => Id, AVURLAssetReferenceRestrictionsKey => Id; Id);
+        let asset: Id = send!(class(c"AVURLAsset"), c"URLAssetWithURL:options:", url => Id, options => Id; Id);
         if asset.is_null() { Err(format!("cannot open {}", path.display())) } else { Ok(asset) }
     }
 }
@@ -142,8 +150,14 @@ fn pixel_attrs() -> Id {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 pub struct AvFoundation;
+
+/// A decoded picture. Stills are decoded on a worker thread and handed to the UI thread whole:
+/// CoreVideo buffers are reference-counted thread-safely and are not touched after the hand-over.
+#[derive(Clone)]
+pub struct Frame(pub CVPixelBuffer);
+unsafe impl Send for Frame {}
 
 /// A live AVPlayer and its frame output (released on drop: that is "releasing the player").
 pub struct Player {
@@ -169,9 +183,9 @@ fn seconds(t: CMTime) -> Option<f64> {
 
 impl Backend for AvFoundation {
     type Player = Player;
-    type Picture = CVPixelBuffer;
+    type Picture = Frame;
 
-    fn still(&self, path: &std::path::Path, at: f64) -> Result<CVPixelBuffer, String> {
+    fn still(&self, path: &std::path::Path, at: f64) -> Result<Frame, String> {
         let asset = asset(path)?;
         unsafe {
             let generator: Id = send!(class(c"AVAssetImageGenerator"), c"assetImageGeneratorWithAsset:", asset => Id; Id);
@@ -203,7 +217,7 @@ impl Backend for AvFoundation {
             CGColorSpaceRelease(space);
             CVPixelBufferUnlockBaseAddress(buf, 0);
             CGImageRelease(image);
-            Ok(CVPixelBuffer::wrap_under_create_rule(buf))
+            Ok(Frame(CVPixelBuffer::wrap_under_create_rule(buf)))
         }
     }
 
@@ -227,7 +241,7 @@ impl Backend for AvFoundation {
         }
     }
 
-    fn frame(&self, p: &mut Player) -> Option<CVPixelBuffer> {
+    fn frame(&self, p: &mut Player) -> Option<Frame> {
         unsafe {
             let t: CMTime = send!(p.output, c"itemTimeForHostTime:", CACurrentMediaTime() => f64; CMTime);
             let fresh: bool = send!(p.output, c"hasNewPixelBufferForItemTime:", t => CMTime; bool);
@@ -235,7 +249,7 @@ impl Backend for AvFoundation {
                 return None;
             }
             let buf: CVPixelBufferRef = send!(p.output, c"copyPixelBufferForItemTime:itemTimeForDisplay:", t => CMTime, std::ptr::null_mut() => *mut CMTime; CVPixelBufferRef);
-            (!buf.is_null()).then(|| CVPixelBuffer::wrap_under_create_rule(buf))
+            (!buf.is_null()).then(|| Frame(CVPixelBuffer::wrap_under_create_rule(buf)))
         }
     }
 
@@ -274,7 +288,8 @@ impl AvFoundation {
 
 /// The BGRA pixel at the middle of a picture (tests read what was decoded).
 #[allow(dead_code)]
-pub fn middle_bgra(buf: &CVPixelBuffer) -> [u8; 4] {
+pub fn middle_bgra(frame: &Frame) -> [u8; 4] {
+    let buf = &frame.0;
     unsafe extern "C" {
         fn CVPixelBufferGetWidth(buf: CVPixelBufferRef) -> usize;
         fn CVPixelBufferGetHeight(buf: CVPixelBufferRef) -> usize;

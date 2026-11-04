@@ -152,6 +152,7 @@ const PICK_DESCRIBE: &str = "const root=el.getRootNode(),esc=s=>CSS.escape(s);\
            t=el.getAttribute('aria-label')||el.getAttribute('alt')||(field?'':[...el.childNodes].filter(c=>c.nodeType===3).map(c=>c.textContent).join(' '))}\
          t=t.replace(/\\s+/g,' ').trim().slice(0,30);\
          const label=tag==='input'&&(el.type||'').toLowerCase()==='password'?'':(t?tag+' '+t:tag);\
+         self.__herdrPicked=el;\
          const r=el.getBoundingClientRect();return{ok:true,selector,label,rect:{x:r.x,y:r.y,w:r.width,h:r.height}}";
 
 /// `PickRelative`: step from the element `from` matches to its parent, first element child, or
@@ -185,36 +186,35 @@ pub fn picked_by_person(id: &str, selector: &str) -> bool {
     LAST_PICK.with_borrow(|m| m.get(id).is_some_and(|s| s == selector))
 }
 
-/// `TextEdit` (S13): an inline edit of the element `selector` matches, in the isolated world.
-/// Begin: only an element whose children are all text nodes; it becomes
+/// `TextEdit` (S13): an inline edit of the node the person's last pick returned (the caller checked
+/// `selector` is that pick's), in the isolated world. Begin: only an element whose children are
+/// all text nodes, never a form field or anything already editable; it becomes
 /// contenteditable="plaintext-only", gets focus, and its text is selected; the original text and
 /// attribute are kept in this world (the page can't see or change them). Commit keeps the text
 /// typed; Cancel puts back the original text exactly. Either way the attribute is restored.
-pub fn text_edit_message(id: &str, req: u64, selector: &str, op: herdr_browser_protocol::TextEditOp) -> Option<Vec<u8>> {
+pub fn text_edit_message(id: &str, req: u64, op: herdr_browser_protocol::TextEditOp) -> Option<Vec<u8>> {
     use herdr_browser_protocol::TextEditOp as T;
-    let sel = serde_json::to_string(selector).expect("encodes");
-    let body = match op {
-        T::Begin => "if(self.__herdrEdit)return{ok:false};            if(![...el.childNodes].every(c=>c.nodeType===3))return{ok:false};            const before=el.textContent,attr=el.getAttribute('contenteditable');            self.__herdrEdit={el,before,attr};el.setAttribute('contenteditable','plaintext-only');el.focus();            const r=document.createRange();r.selectNodeContents(el);const s=getSelection();s.removeAllRanges();s.addRange(r);            return{ok:true,before,after:before}",
-        T::Commit | T::Cancel => {
-            if op == T::Cancel {
-                // Late keys must not land after the text is put back: the same wait as Commit.
-                "const e=self.__herdrEdit;if(!e||e.el!==el)return{ok:false};\
-                 return new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(()=>setTimeout(()=>{\
-                 if(el.textContent!==e.before)el.textContent=e.before;\
-                 if(e.attr===null)el.removeAttribute('contenteditable');else el.setAttribute('contenteditable',e.attr);\
-                 self.__herdrEdit=null;el.blur();r({ok:true,before:e.before,after:el.textContent})},100))))"
-            } else {
-                // Typing reaches the page as input events, this script over DevTools: the two are not ordered, so a
-                // fast Return could read the text before the last keys land (measured: Text then Commit at once lost
-                // it). Wait two frames and a moment for them first.
-                "const e=self.__herdrEdit;if(!e||e.el!==el)return{ok:false};\
-                 return new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(()=>setTimeout(()=>{\
-                 if(e.attr===null)el.removeAttribute('contenteditable');else el.setAttribute('contenteditable',e.attr);\
-                 self.__herdrEdit=null;el.blur();r({ok:true,before:e.before,after:el.textContent})},100))))"
-            }
-        }
+    // Typing reaches the page as input events, these scripts over DevTools: the two are not
+    // ordered, so a fast Return or Esc could act before the last keys land (measured: Text then
+    // Commit at once lost the text). Commit and Cancel wait two frames and a moment first.
+    const SETTLE: &str = "await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(()=>setTimeout(r,100))));";
+    const END: &str = "if(e.attr===null)e.el.removeAttribute('contenteditable');else e.el.setAttribute('contenteditable',e.attr);\
+        self.__herdrEdit=null;e.el.blur();return{ok:true,before:e.before,after:e.el.textContent}";
+    let js = match op {
+        // The element the pick itself returned (this world keeps it; shadow DOM included), not a
+        // re-query that could find another node. Plain text only: no form fields, nothing the page
+        // already made editable.
+        T::Begin => "(()=>{const el=self.__herdrPicked;if(self.__herdrEdit||!el||!el.isConnected)return{ok:false};\
+            if(/^(input|textarea|select|option|button)$/i.test(el.tagName)||el.isContentEditable||el.closest('[contenteditable]'))return{ok:false};\
+            if(![...el.childNodes].every(c=>c.nodeType===3))return{ok:false};\
+            const before=el.textContent,attr=el.getAttribute('contenteditable');\
+            self.__herdrEdit={el,before,attr};el.setAttribute('contenteditable','plaintext-only');el.focus();\
+            const r=document.createRange();r.selectNodeContents(el);const s=getSelection();s.removeAllRanges();s.addRange(r);\
+            return{ok:true,before,after:before}})()"
+            .to_string(),
+        T::Commit => format!("(async()=>{{const e=self.__herdrEdit;if(!e)return{{ok:false}};{SETTLE}{END}}})()"),
+        T::Cancel => format!("(async()=>{{const e=self.__herdrEdit;if(!e)return{{ok:false}};{SETTLE}if(e.el.textContent!==e.before)e.el.textContent=e.before;{END}}})()"),
     };
-    let js = format!("(()=>{{let el=null;try{{el=document.querySelector({sel})}}catch(e){{}}if(!el)return{{ok:false}};{body}}})()");
     evaluate(id, req, Op::TextEdit, &js)
 }
 
@@ -733,7 +733,9 @@ wrap_life_span_handler! {
         fn on_before_popup(&self, _browser: Option<&mut Browser>, _frame: Option<&mut Frame>, _popup_id: ::std::os::raw::c_int, target_url: Option<&CefString>, _target_frame_name: Option<&CefString>, target_disposition: WindowOpenDisposition, user_gesture: ::std::os::raw::c_int, popup_features: Option<&PopupFeatures>, window_info: Option<&mut WindowInfo>, client: Option<&mut Option<Client>>, settings: Option<&mut BrowserSettings>, _extra_info: Option<&mut Option<DictionaryValue>>, _no_javascript_access: Option<&mut ::std::os::raw::c_int>) -> ::std::os::raw::c_int {
             let disposition = disposition_name(&target_disposition);
             if disposition == "new_popup" {
-                if user_gesture == 0 {
+                // Chromium's gesture alone isn't enough: an agent's eval carries one. The person's own
+                // click or key on this page, just now, is.
+                if user_gesture == 0 || !super::person_active(&self.id) {
                     send(HostToApp::PopupBlocked { id: self.id.clone(), url: s(target_url) });
                     return 1;
                 }

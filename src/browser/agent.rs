@@ -298,6 +298,8 @@ impl Agent {
                     self.cdp.hide(id);
                 }
             }
+            // A popup closed: its pending replies, listing and broker target go with it.
+            HostToApp::PopupClosed { id } => self.closed(id),
             HostToApp::CdpTarget { id, target_id } => self.cdp.set_target(id, target_id),
             HostToApp::EvalResult { id, req, ok: true, value } => self.answer(*req, id, Op::Eval, Ok(json!({ "value": value }))),
             HostToApp::EvalResult { id, req, value, .. } => self.answer(*req, id, Op::Eval, Err(value.as_str().map(Into::into).unwrap_or_else(|| value.to_string()))),
@@ -392,6 +394,13 @@ impl Agent {
     }
 
     /// A browser block closed: fail what waits on it and drop it from cdp.json.
+    /// The block's viewport changed (responsive mode): picks waiting on the old page answer now.
+    pub fn cancel_picks(&mut self, id: &BrowserId, why: &str) {
+        for (_, reply) in self.pick_waiters.remove(id).unwrap_or_default() {
+            reply(Err(why.into()));
+        }
+    }
+
     pub fn closed(&mut self, id: &BrowserId) {
         self.fail_all(Some(id), "the browser closed");
         self.cdp.remove(id);
@@ -770,8 +779,8 @@ mod tests {
     impl BrowserRegistry for Reg {
         fn state(&self, id: &BrowserId) -> Option<BrowserState> {
             let profile = if self.person.contains(&id.as_str()) { PERSON_PROFILE } else { AGENT_PROFILE };
-            // "<opener>-pop<n>" is a popup of <opener>.
-            let opener = id.split_once("-pop").map(|(o, _)| o.to_string());
+            // "<opener>~pop<n>" is a popup of <opener>.
+            let opener = id.split_once("~pop").map(|(o, _)| o.to_string());
             self.live.contains(&id.as_str()).then(|| BrowserState { profile: profile.into(), opener, ..Default::default() })
         }
         fn link(&self) -> &dyn HostLink {
@@ -1183,11 +1192,23 @@ mod tests {
     const COMMANDS_COVERED: [&str; 13] = ["device", "navigate", "back", "forward", "reload", "stop", "devtools", "eval", "screenshot", "find", "lock", "close", "pick"];
 
     #[test]
+    fn a_device_switch_answers_waiting_picks() {
+        let (_d, mut a) = agent();
+        let reg = reg();
+        let pane = |_: &str| None;
+        let (got, reply) = catch();
+        let _ = a.run("browser.pick", &json!({ "id": "b1" }), &reg, &Focus { focused: None, block_of_pane: &pane }, reply);
+        assert!(got.lock().unwrap().is_none(), "parked for the person");
+        a.cancel_picks(&"b1".into(), "the browser switched device mode");
+        assert!(got.lock().unwrap().take().unwrap().unwrap_err().contains("device mode"));
+    }
+
+    #[test]
     fn popups_refuse_navigate_and_eval_plainly() {
         let (_d, mut a) = agent();
-        let reg = Reg { live: vec!["b1", "b1-pop1"], person: vec![], link: Link::default() };
+        let reg = Reg { live: vec!["b1", "b1~pop1"], person: vec![], link: Link::default() };
         for name in POPUP_DRIVEN {
-            let r = run(&mut a, &reg, name, json!({ "id": "b1-pop1", "url": "https://x.test", "expr": "1" }));
+            let r = run(&mut a, &reg, name, json!({ "id": "b1~pop1", "url": "https://x.test", "expr": "1" }));
             assert!(r.unwrap().unwrap_err().contains("popups are driven by their page"), "{name}");
         }
         assert!(sent(&reg).is_empty(), "nothing reached the host");
@@ -1203,15 +1224,20 @@ mod tests {
         states.lock().unwrap().insert("theirs".into(), crate::browser::BrowserState { profile: "agent".into(), ..Default::default() });
         a.states = Some(states);
         a.on_host(&HostToApp::Ready { version: herdr_browser_protocol::PROTOCOL_VERSION, cef_version: "t".into(), cdp_port: None, cdp_pipe: true, sandboxed: true });
-        for (opener, id) in [("mine", "mine-pop1"), ("theirs", "theirs-pop1"), ("gone", "gone-pop1")] {
+        for (opener, id) in [("mine", "mine~pop1"), ("theirs", "theirs~pop1"), ("gone", "gone~pop1")] {
             a.on_host(&HostToApp::PopupOpened { opener: opener.into(), id: id.into(), url: "http://127.0.0.1:1/".into(), w: None, h: None });
             a.on_host(&HostToApp::CdpTarget { id: id.into(), target_id: format!("T-{id}") });
         }
         let listed: Value = serde_json::from_str(&std::fs::read_to_string(a.cdp.path()).unwrap()).unwrap();
-        assert!(listed["targets"].get("theirs-pop1").is_some(), "an agent's own popup is listed");
-        assert!(listed["targets"].get("mine-pop1").is_none(), "the person's popup is not");
-        assert!(listed["targets"].get("gone-pop1").is_none(), "nor one whose opener is unknown");
-        assert_eq!(a.cdp.target_of("mine-pop1").as_deref(), Some("T-mine-pop1"), "the broker still knows it (grants decide)");
+        assert!(listed["targets"].get("theirs~pop1").is_some(), "an agent's own popup is listed");
+        assert!(listed["targets"].get("mine~pop1").is_none(), "the person's popup is not");
+        assert!(listed["targets"].get("gone~pop1").is_none(), "nor one whose opener is unknown");
+        assert_eq!(a.cdp.target_of("mine~pop1").as_deref(), Some("T-mine~pop1"), "the broker still knows it (grants decide)");
+        // Closed: its listing and broker target go.
+        a.on_host(&HostToApp::PopupClosed { id: "theirs~pop1".into() });
+        let listed: Value = serde_json::from_str(&std::fs::read_to_string(a.cdp.path()).unwrap()).unwrap();
+        assert!(listed["targets"].get("theirs~pop1").is_none());
+        assert_eq!(a.cdp.target_of("theirs~pop1"), None);
     }
 
     #[test]
