@@ -182,6 +182,14 @@ pub enum OverlayQuery {
     Selection,
 }
 
+/// Popup ids are `<opener>~pop<n>`: the host alone mints them, and layouts can't name a block
+/// with this marker (`is_popup_id`), so a popup never takes a block's id.
+pub const POPUP_MARK: &str = "~pop";
+
+pub fn is_popup_id(id: &str) -> bool {
+    id.contains(POPUP_MARK)
+}
+
 /// What a device mode changes besides size and scale (`AppToHost::SetDevice`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Device {
@@ -432,8 +440,8 @@ mod tests {
         roundtrip_host(HostToApp::Frame { id: "b1".into(), seq: 2, surface: SurfaceRef::MachPort { name: "com.herdr.s".into() }, size: PixelSize { w: 2, h: 2 }, scale: 1.0 });
         roundtrip_host(HostToApp::Loading { id: "b1".into(), loading: true, can_back: false, can_forward: false });
         roundtrip_host(HostToApp::Permission { id: "b1".into(), req: 3, origin: "https://meet.test".into(), kinds: vec!["camera".into(), "microphone".into()] });
-        roundtrip_host(HostToApp::PopupOpened { opener: "b1".into(), id: "b1-pop1".into(), url: "http://127.0.0.1:9/auth".into(), w: Some(480.0), h: None });
-        roundtrip_host(HostToApp::PopupClosed { id: "b1-pop1".into() });
+        roundtrip_host(HostToApp::PopupOpened { opener: "b1".into(), id: "b1~pop1".into(), url: "http://127.0.0.1:9/auth".into(), w: Some(480.0), h: None });
+        roundtrip_host(HostToApp::PopupClosed { id: "b1~pop1".into() });
         roundtrip_host(HostToApp::PopupBlocked { id: "b1".into(), url: "http://127.0.0.1:9/x".into() });
         roundtrip_host(HostToApp::LoadError { id: "b1".into(), url: "http://127.0.0.1:9/".into(), code: -102, kind: "refused".into() });
         roundtrip_host(HostToApp::ImeCaret { id: "b1".into(), x: 1.0, y: 2.0, w: 1.0, h: 16.0 });
