@@ -150,8 +150,14 @@ fn pixel_attrs() -> Id {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 pub struct AvFoundation;
+
+/// A decoded picture. Stills are decoded on a worker thread and handed to the UI thread whole:
+/// CoreVideo buffers are reference-counted thread-safely and are not touched after the hand-over.
+#[derive(Clone)]
+pub struct Frame(pub CVPixelBuffer);
+unsafe impl Send for Frame {}
 
 /// A live AVPlayer and its frame output (released on drop: that is "releasing the player").
 pub struct Player {
@@ -177,9 +183,9 @@ fn seconds(t: CMTime) -> Option<f64> {
 
 impl Backend for AvFoundation {
     type Player = Player;
-    type Picture = CVPixelBuffer;
+    type Picture = Frame;
 
-    fn still(&self, path: &std::path::Path, at: f64) -> Result<CVPixelBuffer, String> {
+    fn still(&self, path: &std::path::Path, at: f64) -> Result<Frame, String> {
         let asset = asset(path)?;
         unsafe {
             let generator: Id = send!(class(c"AVAssetImageGenerator"), c"assetImageGeneratorWithAsset:", asset => Id; Id);
@@ -211,7 +217,7 @@ impl Backend for AvFoundation {
             CGColorSpaceRelease(space);
             CVPixelBufferUnlockBaseAddress(buf, 0);
             CGImageRelease(image);
-            Ok(CVPixelBuffer::wrap_under_create_rule(buf))
+            Ok(Frame(CVPixelBuffer::wrap_under_create_rule(buf)))
         }
     }
 
@@ -235,7 +241,7 @@ impl Backend for AvFoundation {
         }
     }
 
-    fn frame(&self, p: &mut Player) -> Option<CVPixelBuffer> {
+    fn frame(&self, p: &mut Player) -> Option<Frame> {
         unsafe {
             let t: CMTime = send!(p.output, c"itemTimeForHostTime:", CACurrentMediaTime() => f64; CMTime);
             let fresh: bool = send!(p.output, c"hasNewPixelBufferForItemTime:", t => CMTime; bool);
@@ -243,7 +249,7 @@ impl Backend for AvFoundation {
                 return None;
             }
             let buf: CVPixelBufferRef = send!(p.output, c"copyPixelBufferForItemTime:itemTimeForDisplay:", t => CMTime, std::ptr::null_mut() => *mut CMTime; CVPixelBufferRef);
-            (!buf.is_null()).then(|| CVPixelBuffer::wrap_under_create_rule(buf))
+            (!buf.is_null()).then(|| Frame(CVPixelBuffer::wrap_under_create_rule(buf)))
         }
     }
 
@@ -282,7 +288,8 @@ impl AvFoundation {
 
 /// The BGRA pixel at the middle of a picture (tests read what was decoded).
 #[allow(dead_code)]
-pub fn middle_bgra(buf: &CVPixelBuffer) -> [u8; 4] {
+pub fn middle_bgra(frame: &Frame) -> [u8; 4] {
+    let buf = &frame.0;
     unsafe extern "C" {
         fn CVPixelBufferGetWidth(buf: CVPixelBufferRef) -> usize;
         fn CVPixelBufferGetHeight(buf: CVPixelBufferRef) -> usize;
