@@ -103,7 +103,10 @@ try {
   const full = readPng(await cli("screenshot", T, `path=${join(dir, "a3.png")}`));
   check(vw > 0 && full.width === Math.round(vw * dpr) && full.height === Math.round(vh * dpr), `A3 agent screenshot is full resolution (${full.width}x${full.height} for ${vw}x${vh} at ${dpr}x)`);
   if (onApp) {
-    const hostShot = (await appDo("browser.screenshot", { id: T, path: join(dir, "a3-host.png") })).path;
+    // The app writes agent screenshots in its own shots dir: use the path (and size) the reply gives.
+    const hostReply = await appDo("browser.screenshot", { id: T });
+    const hostShot = hostReply.path;
+    check(hostReply.width > 0 && hostReply.height > 0, `A3 herdr-app do browser.screenshot reply gives the size (${hostReply.width}x${hostReply.height})`);
     const h = hostShot ? readPng(hostShot) : { width: 0, height: 0 };
     check(h.width === Math.round(vw * dpr) && h.height === Math.round(vh * dpr), `A3 herdr-app do browser.screenshot is full resolution (${h.width}x${h.height})`);
   }
