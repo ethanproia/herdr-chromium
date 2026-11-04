@@ -1228,7 +1228,7 @@ fn browser_msg(m: AppToHost) {
             let refuse = |id: String| send(HostToApp::TextEditResult { id, req, ok: false, before: String::new(), after: String::new() });
             if !handlers::picked_by_person(&id, selector) {
                 refuse(id);
-            } else if let Some(call) = handlers::text_edit_message(&id, req, selector, op)
+            } else if let Some(call) = handlers::text_edit_message(&id, req, op)
                 && host.send_dev_tools_message(Some(&call)) == 0
             {
                 handlers::eval_unsent(&id);

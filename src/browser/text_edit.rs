@@ -9,12 +9,50 @@ use herdr_browser_protocol::TextEditOp;
 /// What the strip says while editing, or why an edit didn't start.
 pub const HINT_EDITING: &str = "Return to save · Esc to cancel";
 pub const HINT_REFUSED: &str = "Only plain text can be edited here";
-/// How long a plain pick click waits for a second click before pick mode ends (macOS's default
-/// double-click interval is 500 ms; most people are faster).
-pub const DOUBLE_CLICK_MS: u64 = 350;
+/// How long a pick click waits for a second click before pick mode ends: the person's own
+/// double-click speed on macOS (System Settings > Mouse), 500 ms elsewhere or if unset.
+pub fn double_click_ms() -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        use core_foundation::base::TCFType;
+        use core_foundation::number::CFNumber;
+        use core_foundation::string::CFString;
+        unsafe extern "C" {
+            fn CFPreferencesCopyAppValue(key: core_foundation::string::CFStringRef, app: core_foundation::string::CFStringRef) -> core_foundation::base::CFTypeRef;
+            static kCFPreferencesAnyApplication: core_foundation::string::CFStringRef;
+        }
+        let key = CFString::new("com.apple.mouse.doubleClickThreshold");
+        // SAFETY: CoreFoundation's documented C call; the result follows the Copy rule (we own it).
+        let v = unsafe { CFPreferencesCopyAppValue(key.as_concrete_TypeRef(), kCFPreferencesAnyApplication) };
+        if !v.is_null() {
+            let n = unsafe { core_foundation::base::CFType::wrap_under_create_rule(v) };
+            if let Some(secs) = n.downcast::<CFNumber>().and_then(|n| n.to_f64()) {
+                return ((secs * 1000.0) as u64).clamp(150, 5000);
+            }
+        }
+    }
+    500
+}
+
+/// Where an edit is. One at a time: a double-click while not `Idle` is ignored, so nothing can be
+/// orphaned half-way and block the next edit.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub enum Phase {
+    #[default]
+    Idle,
+    /// Asking which element is under the double-click.
+    Picking,
+    /// TextEdit Begin sent.
+    Beginning,
+    /// The element is editable; `Owner::TextEdit` is on top.
+    Editing,
+    /// Commit or Cancel sent.
+    Finishing,
+}
 
 #[derive(Debug, Default)]
 pub struct TextEdit {
+    pub phase: Phase,
     /// The element being edited, from the pick the double-click made.
     pub target: Option<Target>,
     /// The TextEdit request in flight and what it asked.
@@ -55,11 +93,42 @@ impl TextEdit {
         false
     }
 
-    /// Sends `op` for the current target as request `req`; None when there is nothing to edit.
+    /// A double-click: start only from `Idle`.
+    pub fn start(&mut self) -> bool {
+        if self.phase != Phase::Idle {
+            return false;
+        }
+        self.phase = Phase::Picking;
+        self.hint = None;
+        true
+    }
+
+    /// The page navigated, reloaded or crashed: the edit and anything in flight are forgotten,
+    /// so late answers find nothing to act on.
+    pub fn reset(&mut self) {
+        let waits = self.waits;
+        *self = TextEdit { waits, ..TextEdit::default() };
+    }
+
+    /// Sends `op` for the current target as request `req`; None when there is nothing to edit, or
+    /// when `op` doesn't fit the phase (Begin only after Picking, Commit/Cancel only while Editing).
     pub fn ask(&mut self, req: u64, op: TextEditOp) -> Option<String> {
+        let next = match (self.phase, op) {
+            (Phase::Picking, TextEditOp::Begin) => Phase::Beginning,
+            (Phase::Editing, TextEditOp::Commit | TextEditOp::Cancel) => Phase::Finishing,
+            _ => return None,
+        };
         let selector = self.target.as_ref()?.selector.clone();
         self.asked = Some((req, op));
+        self.phase = next;
         Some(selector)
+    }
+
+    /// The pick for the double-click found nothing: back to idle.
+    pub fn nothing_there(&mut self) {
+        if self.phase == Phase::Picking {
+            self.phase = Phase::Idle;
+        }
     }
 
     /// The host's `TextEditResult` for `req`.
@@ -68,15 +137,18 @@ impl TextEdit {
         self.asked = None;
         match (op, ok) {
             (TextEditOp::Begin, true) => {
+                self.phase = Phase::Editing;
                 self.hint = Some(HINT_EDITING);
                 Next::Edit
             }
             (TextEditOp::Begin, false) => {
+                self.phase = Phase::Idle;
                 self.target = None;
                 self.hint = Some(HINT_REFUSED);
                 Next::Refused
             }
             (TextEditOp::Commit, true) if before != after => {
+                self.phase = Phase::Idle;
                 self.hint = None;
                 match self.target.take() {
                     Some(target) => Next::Pin { target, before, after },
@@ -84,6 +156,7 @@ impl TextEdit {
                 }
             }
             _ => {
+                self.phase = Phase::Idle;
                 self.hint = None;
                 self.target = None;
                 Next::Nothing
@@ -103,21 +176,36 @@ mod tests {
     #[test]
     fn begin_then_commit_pins_and_refusals_say_why() {
         let mut e = TextEdit { target: Some(t()), ..TextEdit::default() };
+        assert!(e.ask(1, TextEditOp::Begin).is_none(), "Begin only after a double-click's pick");
+        assert!(e.start() && !e.start(), "one edit at a time");
         assert_eq!(e.ask(1, TextEditOp::Begin).as_deref(), Some("h1"));
+        assert!(e.ask(7, TextEditOp::Commit).is_none(), "no Commit before Begin answers");
         assert_eq!(e.answered(9, true, "a".into(), "a".into()), Next::Nothing, "another request's answer");
         assert_eq!(e.answered(1, true, "Hello".into(), "Hello".into()), Next::Edit);
         assert_eq!(e.hint, Some(HINT_EDITING));
         e.ask(2, TextEditOp::Commit);
         assert_eq!(e.answered(2, true, "Hello".into(), "Hello v2".into()), Next::Pin { target: t(), before: "Hello".into(), after: "Hello v2".into() });
         assert!(e.target.is_none() && e.hint.is_none());
-        let mut e = TextEdit { target: Some(t()), ..TextEdit::default() };
+        let mut e = TextEdit { target: Some(t()), phase: Phase::Picking, ..TextEdit::default() };
         e.ask(3, TextEditOp::Begin);
         assert_eq!(e.answered(3, false, String::new(), String::new()), Next::Refused);
         assert_eq!(e.hint, Some(HINT_REFUSED));
-        let mut e = TextEdit { target: Some(t()), ..TextEdit::default() };
+        let mut e = TextEdit { target: Some(t()), phase: Phase::Editing, ..TextEdit::default() };
         e.ask(4, TextEditOp::Commit);
         assert_eq!(e.answered(4, true, "same".into(), "same".into()), Next::Nothing, "no change, no pin");
         assert!(TextEdit::default().ask(5, TextEditOp::Cancel).is_none());
+    }
+
+    #[test]
+    fn a_navigation_drops_the_edit_and_its_late_answers() {
+        let mut e = TextEdit { target: Some(t()), ..TextEdit::default() };
+        e.start();
+        e.ask(1, TextEditOp::Begin);
+        e.reset();
+        assert_eq!(e.answered(1, true, "a".into(), "a".into()), Next::Nothing, "a stale Begin answer");
+        assert_eq!(e.phase, Phase::Idle);
+        assert!(e.start(), "the next edit can start");
+        assert!((150..=5000).contains(&double_click_ms()));
     }
 
     #[test]
