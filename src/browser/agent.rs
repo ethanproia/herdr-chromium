@@ -394,6 +394,13 @@ impl Agent {
     }
 
     /// A browser block closed: fail what waits on it and drop it from cdp.json.
+    /// The block's viewport changed (responsive mode): picks waiting on the old page answer now.
+    pub fn cancel_picks(&mut self, id: &BrowserId, why: &str) {
+        for (_, reply) in self.pick_waiters.remove(id).unwrap_or_default() {
+            reply(Err(why.into()));
+        }
+    }
+
     pub fn closed(&mut self, id: &BrowserId) {
         self.fail_all(Some(id), "the browser closed");
         self.cdp.remove(id);
@@ -1183,6 +1190,18 @@ mod tests {
 
     /// Every agent `browser.*` command but the window's (new, remote) and the ungated ones (open, annotations).
     const COMMANDS_COVERED: [&str; 13] = ["device", "navigate", "back", "forward", "reload", "stop", "devtools", "eval", "screenshot", "find", "lock", "close", "pick"];
+
+    #[test]
+    fn a_device_switch_answers_waiting_picks() {
+        let (_d, mut a) = agent();
+        let reg = reg();
+        let pane = |_: &str| None;
+        let (got, reply) = catch();
+        let _ = a.run("browser.pick", &json!({ "id": "b1" }), &reg, &Focus { focused: None, block_of_pane: &pane }, reply);
+        assert!(got.lock().unwrap().is_none(), "parked for the person");
+        a.cancel_picks(&"b1".into(), "the browser switched device mode");
+        assert!(got.lock().unwrap().take().unwrap().unwrap_err().contains("device mode"));
+    }
 
     #[test]
     fn popups_refuse_navigate_and_eval_plainly() {

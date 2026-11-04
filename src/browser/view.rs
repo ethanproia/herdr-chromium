@@ -204,6 +204,9 @@ type Subscriber = async_channel::Sender<HostToApp>;
 struct Shared {
     open: HashMap<BrowserId, Open>,
     subs: HashMap<BrowserId, Subscriber>,
+    /// A popup's events from `PopupOpened` until its view subscribes (the view is made at the
+    /// opener's next draw): an early redirect, its first frames or its close are kept, in order.
+    early: HashMap<BrowserId, Vec<HostToApp>>,
     /// Bumped each time a host connection ends; readers of an older one stay quiet.
     generation: u64,
     /// Hears every host message (the agent commands, part 5).
@@ -247,10 +250,9 @@ impl HostClient {
 
     /// Host events for browser `id` (and the app-wide ones: a crash, an error without an id).
     pub fn subscribe(&self, id: &str) -> async_channel::Receiver<HostToApp> {
-        let (tx, rx) = async_channel::unbounded();
-        self.shared.lock().unwrap().subs.insert(id.to_owned(), tx);
-        rx
+        subscribe_in(&self.shared, id)
     }
+
 
     /// The block is gone: close its page and stop its events.
     pub fn close(&self, id: &str) {
@@ -459,6 +461,8 @@ impl Writer {
                 let current = s.generation == c.generation;
                 if current {
                     s.generation += 1;
+                    // A popup the old host announced never comes back.
+                    s.early.clear();
                 }
                 current
             };
@@ -493,6 +497,20 @@ impl Writer {
     }
 }
 
+/// A view's events from now on; a popup's that came before its view are handed over first, in order.
+fn subscribe_in(shared: &Mutex<Shared>, id: &str) -> async_channel::Receiver<HostToApp> {
+    let (tx, rx) = async_channel::unbounded();
+    let mut s = shared.lock().unwrap();
+    for msg in s.early.remove(id).unwrap_or_default() {
+        let _ = tx.try_send(msg);
+    }
+    s.subs.insert(id.to_owned(), tx);
+    rx
+}
+
+/// The most events kept for a popup whose view isn't made yet.
+const EARLY_MAX: usize = 512;
+
 /// Host lines to the views. At the end (the host died) every view hears `Crashed`.
 fn read(stream: UnixStream, shared: Arc<Mutex<Shared>>, generation: u64) {
     for line in BufReader::new(stream).lines() {
@@ -513,10 +531,21 @@ fn read(stream: UnixStream, shared: Arc<Mutex<Shared>>, generation: u64) {
         {
             o.url = Some(url.clone());
         }
+        if let HostToApp::PopupOpened { id, .. } = &msg
+            && !s.subs.contains_key(id)
+        {
+            s.early.entry(id.clone()).or_default();
+        }
         match target(&msg) {
             Some(id) => {
                 if let Some(tx) = s.subs.get(id) {
                     let _ = tx.try_send(msg.clone());
+                } else if let Some(q) = s.early.get_mut(id) {
+                    // Bounded: a popup holds at most two frames in flight (the host waits for acks),
+                    // so this only fills if its view is never made.
+                    if q.len() < EARLY_MAX {
+                        q.push(msg.clone());
+                    }
                 }
             }
             None => {
@@ -531,6 +560,7 @@ fn read(stream: UnixStream, shared: Arc<Mutex<Shared>>, generation: u64) {
     let mut s = shared.lock().unwrap();
     if s.generation == generation {
         s.generation += 1;
+        s.early.clear();
         let crash = HostToApp::Crashed { id: None, reason: "the browser host stopped".into() };
         for tx in s.subs.values() {
             let _ = tx.try_send(crash.clone());
@@ -1324,6 +1354,14 @@ impl BrowserView {
         if self.device.is_some() {
             self.input.update(cx, |i, _| i.close_annotation());
             self.drain_overlay(cx);
+        }
+        // Either way: picks agents wait on, page answers and the style panel were for the old viewport.
+        if let Some(agent) = &self.agent {
+            agent.lock().unwrap().cancel_picks(&self.id, "the browser switched device mode; pick again");
+        }
+        self.asks.clear();
+        if self.style_panel.is_some() {
+            self.close_style_panel(cx);
         }
         self.device_menu = false;
         self.link.send(AppToHost::SetDevice { id: self.id.clone(), device: self.device.as_ref().map(|d| d.device()) });
@@ -2281,7 +2319,8 @@ impl BrowserView {
     /// Responsive mode: how much the page is scaled to fit its block (1 when off).
     pub fn fit(&self) -> f32 {
         match (&self.device, self.measured) {
-            (Some(d), Some((area, _))) => d.fit(area.w, area.h),
+            // The label and its gap above the frame get their room first.
+            (Some(d), Some((area, _))) => d.fit(area.w, (area.h - DEVICE_LABEL_SPACE).max(1.0)),
             _ => 1.0,
         }
     }
@@ -2704,8 +2743,8 @@ impl BrowserView {
             div()
                 .id("context-menu")
                 .absolute()
-                .left(px(menu.at.0))
-                .top(px(menu.at.1))
+                .left(px(menu.at.0 * self.fit()))
+                .top(px(menu.at.1 * self.fit()))
                 .w(px(MENU_WIDTH))
                 .py(px(4.))
                 .bg(rgb(0xffffff))
@@ -2855,11 +2894,12 @@ impl Render for BrowserView {
         let me = cx.entity().downgrade();
         let (input_el, focus) = (self.input.clone(), self.focus.clone());
         // Responsive mode: the device letterboxed into the page area, drawn at `fit`.
-        let fit = match (&self.device, self.measured) {
-            (Some(d), Some((area, _))) => d.fit(area.w, area.h),
-            _ => 1.0,
-        };
-        self.input.update(cx, |i, _| i.set_fit(fit));
+        let fit = self.fit();
+        let frame = self.device.as_ref().map(|d| (d.w, d.h));
+        self.input.update(cx, |i, _| {
+            i.set_fit(fit);
+            i.set_frame(frame);
+        });
         let boxed = self.device.is_some();
         let (box_input, box_focus) = (self.input.clone(), self.focus.clone());
         let page = div()
@@ -2944,6 +2984,8 @@ impl Render for BrowserView {
         if marking {
             over.push(markup::element(self.markup.clone(), self.fit()).into_any_element());
         }
+        // The context menu over everything in the page, at the drawn place (it takes the mouse first).
+        over.extend(self.menu_element(cx));
         let mut over_slot = Some(over);
         let page = match (&self.crashed, frame) {
             _ if masked => page.child(
@@ -2964,6 +3006,7 @@ impl Render for BrowserView {
                         .child(
                             div()
                                 .relative()
+                                .flex_none()
                                 .w(px(d.w * fit))
                                 .h(px(d.h * fit))
                                 .bg(rgb(0xffffff))
@@ -3008,9 +3051,6 @@ impl Render for BrowserView {
         };
         // In responsive mode the device's box took the overlays; otherwise they go over the page.
         let page = page.children(over_slot.take().into_iter().flatten());
-        // The context menu over everything in the page; it takes the mouse first (occlude).
-        let menu = self.menu_element(cx);
-        let page = page.children(menu);
         // A JS dialog and the downloads list sit beside the page element, over it: keys and clicks in
         // them must not bubble into the page's input listeners.
         let page = div()
@@ -3159,6 +3199,9 @@ pub fn broker_authorizer(agent: Arc<Mutex<Agent>>, states: Arc<Mutex<HashMap<Bro
         agent.lock().unwrap().broker_allowed(&grants_of, method, profile.as_deref())
     })
 }
+
+/// Room for the device label and its gap above the letterboxed frame (DIPs).
+const DEVICE_LABEL_SPACE: f32 = 24.0;
 
 /// Set while `herdr-app shot` renders the window: blocks marked sensitive draw a cover instead of the page.
 pub static SHOT_MASK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -3413,6 +3456,38 @@ mod tests {
         assert!(device_mode(&json!({ "w": 500, "userAgent": "evil" })).is_err());
         assert!(device_mode(&json!({ "name": "Nokia" })).is_err());
         assert!(device_mode(&json!({})).is_err());
+    }
+
+    #[::core::prelude::v1::test]
+    fn a_popups_early_events_wait_for_its_view_in_order() {
+        // The host sends open, an early redirect and the popup's close before the opener's next
+        // draw makes the popup's view: the view gets all of them, in order.
+        let shared: Arc<Mutex<Shared>> = Default::default();
+        let opener = subscribe_in(&shared, "a");
+        let (mut host, app) = UnixStream::pair().unwrap();
+        for m in [
+            HostToApp::PopupOpened { opener: "a".into(), id: "a~pop1".into(), url: "http://127.0.0.1:1/auth".into(), w: None, h: None },
+            HostToApp::Url { id: "a~pop1".into(), url: "http://127.0.0.1:2/next".into() },
+            HostToApp::PopupClosed { id: "a~pop1".into() },
+            HostToApp::Title { id: "b~pop9".into(), title: "nobody announced me".into() },
+        ] {
+            writeln!(host, "{}", protocol::encode(&m)).unwrap();
+        }
+        let sh = shared.clone();
+        let reader = std::thread::spawn(move || read(app, sh, 0));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while shared.lock().unwrap().early.get("a~pop1").is_none_or(|q| q.len() < 2) {
+            assert!(Instant::now() < deadline, "the reader kept nothing");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(matches!(opener.try_recv(), Ok(HostToApp::PopupOpened { .. })));
+        let pop = subscribe_in(&shared, "a~pop1");
+        drop(host);
+        reader.join().unwrap();
+        assert!(matches!(pop.try_recv(), Ok(HostToApp::Url { url, .. }) if url.ends_with("/next")), "the early redirect");
+        assert!(matches!(pop.try_recv(), Ok(HostToApp::PopupClosed { .. })), "then its close");
+        assert!(shared.lock().unwrap().early.get("b~pop9").is_none(), "only announced popups are kept");
     }
 
     #[::core::prelude::v1::test]
