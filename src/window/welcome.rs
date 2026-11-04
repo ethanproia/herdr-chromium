@@ -87,7 +87,11 @@ impl AppWindow {
             .flex()
             .flex_col()
             .gap(z(16.0))
-            .w(z(440.0))
+            // Sized to its widest line (the buttons), so the area centres the whole block; the
+            // text stays left-aligned inside it (as Claude and Codex do).
+            .flex_none()
+            .items_start()
+            .max_w(z(560.0))
             .child(div().text_size(z(20.0)).font_weight(FontWeight::SEMIBOLD).text_color(c("foreground")).child("No spaces yet"))
             .child(div().text_size(z(13.0)).text_color(c("dim")).child("A space keeps one project's tabs, terminals and agents together."))
             .when_some(status, |d, s| d.child(div().id("welcome-status").text_size(z(12.0)).text_color(c(if state == Loading::TimedOut { "blocked" } else { "dim" })).child(s)))
