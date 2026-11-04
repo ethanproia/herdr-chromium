@@ -18,6 +18,8 @@ pub mod annotate;
 // HERDR: part 4, design mode chrome (A1, A2, A9).
 pub mod design_bar;
 pub mod dialogs;
+// HERDR: part 4, responsive mode (device sizes).
+pub mod devices;
 // HERDR: part 4, design slice S11.
 pub mod edits;
 pub mod frame;

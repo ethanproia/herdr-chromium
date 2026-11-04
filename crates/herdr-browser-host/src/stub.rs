@@ -210,6 +210,7 @@ impl<A: SurfaceAlloc> StubHost<A> {
             }
             M::Focus { focused, .. } => out.push(echo(&id, format!("focus {focused}"))),
             M::SetVisible { visible, .. } => out.push(echo(&id, format!("visible {visible}"))),
+            M::SetDevice { device, .. } => out.push(echo(&id, format!("device {}", device.map_or("off".to_string(), |d| format!("mobile={} touch={} ua={}", d.mobile, d.touch, d.user_agent.is_some()))))),
             M::Input { event, .. } => out.push(echo(&id, encode(&event))),
             // The stub knows no page: an overlay query answers with no rects, echoing req and epoch.
             M::Overlay { req, epoch, .. } => out.push(HostToApp::OverlayRects { id: id.clone(), req, epoch, rects: vec![], frames: vec![] }),
@@ -274,7 +275,7 @@ fn browser_id(m: &AppToHost) -> &str {
     use AppToHost as M;
     match m {
         M::Create { id, .. } | M::Close { id } | M::Navigate { id, .. } | M::Back { id } | M::Forward { id } | M::Reload { id, .. }
-        | M::Stop { id } | M::Resize { id, .. } | M::Focus { id, .. } | M::SetZoom { id, .. } | M::Overlay { id, .. } | M::PickInfo { id, .. } | M::PickRelative { id, .. } | M::TextEdit { id, .. } | M::Styles { id, .. } | M::SetStyle { id, .. } | M::RevertStyle { id, .. } | M::SetVisible { id, .. } | M::MenuResult { id, .. } | M::Input { id, .. } | M::Edit { id, .. }
+        | M::Stop { id } | M::Resize { id, .. } | M::Focus { id, .. } | M::SetZoom { id, .. } | M::Overlay { id, .. } | M::PickInfo { id, .. } | M::PickRelative { id, .. } | M::TextEdit { id, .. } | M::Styles { id, .. } | M::SetStyle { id, .. } | M::RevertStyle { id, .. } | M::SetVisible { id, .. } | M::SetDevice { id, .. } | M::MenuResult { id, .. } | M::Input { id, .. } | M::Edit { id, .. }
         | M::FrameAck { id, .. } | M::Find { id, .. } | M::StopFind { id, .. } | M::DevTools { id, .. } | M::Eval { id, .. }
         | M::Screenshot { id, .. } | M::FileChooserResult { id, .. } | M::DialogResult { id, .. } | M::PermissionResult { id, .. } => id,
         M::Hello { .. } | M::SetColorScheme { .. } | M::Shutdown => "",

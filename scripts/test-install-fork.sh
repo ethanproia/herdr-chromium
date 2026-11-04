@@ -62,6 +62,13 @@ HOME=$H "$H/.local/bin/herdr-labs" uninstall >"$scratch/remove.log" 2>&1 && ok "
 [[ -d $L ]] && ok "labs home kept without --purge" || bad "labs home removed"
 [[ $(stock_sum) == "$before" ]] && ok "stock untouched after uninstall" || bad "stock changed by uninstall"
 
+# --purge also moves the home to the Trash (the CLI and the home share a name: no collision).
+run >"$scratch/reinstall.log" 2>&1 && ok "reinstall runs" || bad "reinstall: $(tail -3 "$scratch/reinstall.log")"
+HOME=$H "$H/.local/bin/herdr-labs" uninstall --purge >"$scratch/purge.log" 2>&1 && ok "uninstall --purge runs" || bad "purge: $(tail -3 "$scratch/purge.log")"
+[[ ! -e $L && ! -e $app && ! -e $H/.local/bin/herdr-labs ]] && ok "--purge removes the labs home too" || bad "left after --purge: $(ls -d "$L" "$app" "$H/.local/bin/herdr-labs" 2>/dev/null)"
+[[ $(ls "$H/.Trash" | grep -c "^herdr-labs ") -ge 2 ]] && ok "CLI and home both in the Trash" || bad "Trash: $(ls "$H/.Trash")"
+[[ $(stock_sum) == "$before" ]] && ok "stock untouched after --purge" || bad "stock changed by --purge"
+
 # Refuses to write over stock.
 out=$(HOME=$H HERDR_APP_BIN=$HERDR_APP_BIN HERDR_HOST_APP=$host FORK_INSTALL_NO_REGISTER=1 bash -c 'sed "s|^cli=.*|cli=\"\$HOME/.local/bin/herdr-app\"|" scripts/install-fork-macos > "'"$scratch"'/evil" && bash "'"$scratch"'/evil"' 2>&1)
 [[ $out == *"refusing"* ]] && ok "refuses to write over stock's CLI" || bad "no refusal: $out"

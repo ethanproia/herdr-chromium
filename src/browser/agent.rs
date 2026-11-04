@@ -113,6 +113,14 @@ impl Agent {
         reg.state(&id).map(|_| id.clone()).ok_or_else(|| format!("no browser {id:?}"))
     }
 
+    /// The block a command targets, once the person's grants allow it (for commands the view
+    /// carries out itself, such as `browser.device`).
+    pub fn check(&self, name: &str, a: &Value, reg: &dyn BrowserRegistry, focus: &Focus) -> Result<BrowserId, String> {
+        let id = Self::target(a, reg, focus)?;
+        self.allowed(name, a, &id, reg)?;
+        Ok(id)
+    }
+
     pub fn run(&mut self, name: &str, a: &Value, reg: &dyn BrowserRegistry, focus: &Focus, reply: Reply) -> Step {
         if name == "browser.open" {
             // Canonical first, then authorized: " default " and "" both name the person's profile.
@@ -1135,6 +1143,7 @@ mod tests {
             ("browser.eval", json!({ "expr": "1" }), true),
             ("browser.screenshot", json!({}), true),
             ("browser.find", json!({ "text": "a" }), true),
+            ("browser.device", json!({ "name": "iPhone 15" }), true),
             ("browser.lock", json!({}), true),
             ("browser.close", json!({}), true),
             ("browser.pick", json!({ "x": 1, "y": 1 }), true),
@@ -1171,7 +1180,7 @@ mod tests {
     }
 
     /// Every agent `browser.*` command but the window's (new, remote) and the ungated ones (open, annotations).
-    const COMMANDS_COVERED: [&str; 12] = ["navigate", "back", "forward", "reload", "stop", "devtools", "eval", "screenshot", "find", "lock", "close", "pick"];
+    const COMMANDS_COVERED: [&str; 13] = ["device", "navigate", "back", "forward", "reload", "stop", "devtools", "eval", "screenshot", "find", "lock", "close", "pick"];
 
     #[test]
     fn popups_refuse_navigate_and_eval_plainly() {
