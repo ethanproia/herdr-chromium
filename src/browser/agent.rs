@@ -210,7 +210,10 @@ impl Agent {
                 let path = path.to_string_lossy().into_owned();
                 let req = self.park(&id, Op::Screenshot, Box::new({
                     let path = path.clone();
-                    move |r: Result<Value, String>| reply(r.map(|_| json!({ "path": path })))
+                    move |r: Result<Value, String>| reply(r.map(|_| match png_size(Path::new(&path)) {
+                        Some((width, height)) => json!({ "path": path, "width": width, "height": height }),
+                        None => json!({ "path": path }),
+                    }))
                 }));
                 link.send(AppToHost::Screenshot { id, req, path });
             }
@@ -627,6 +630,15 @@ pub fn canonical_profile(name: &str) -> String {
         "" => PERSON_PROFILE.to_string(),
         n => n.to_string(),
     }
+}
+
+/// A PNG's pixel size, from its header (IHDR): what a screenshot reply reports as written.
+fn png_size(path: &Path) -> Option<(u32, u32)> {
+    use std::io::Read;
+    let mut head = [0u8; 24];
+    std::fs::File::open(path).ok()?.read_exact(&mut head).ok()?;
+    (head.starts_with(b"\x89PNG\r\n\x1a\n") && &head[12..16] == b"IHDR")
+        .then(|| (u32::from_be_bytes(head[16..20].try_into().unwrap()), u32::from_be_bytes(head[20..24].try_into().unwrap())))
 }
 
 /// Where an agent's screenshot goes: an app-made name in `shots`, or the caller's plain file name there
@@ -1216,6 +1228,22 @@ mod tests {
         assert!(sent(&reg).is_empty(), "nothing reaches the host");
         a.grants.set(&"b1".into(), Grant::Capture, true);
         assert!(!matches!(run(&mut a, &reg, "browser.pick", json!({ "x": 5, "y": 5 })), Some(Err(_))), "with Capture it goes ahead");
+    }
+
+    // HERDR: the screenshot reply's size comes from the written PNG's header.
+    #[test]
+    fn png_size_reads_the_header() {
+        let (d, _a) = agent();
+        std::fs::create_dir_all(d.path()).unwrap();
+        let p = d.path().join("a.png");
+        let mut head = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        head.extend(2400u32.to_be_bytes());
+        head.extend(1600u32.to_be_bytes());
+        std::fs::write(&p, &head).unwrap();
+        assert_eq!(png_size(&p), Some((2400, 1600)));
+        std::fs::write(&p, b"not a png at all, just text").unwrap();
+        assert_eq!(png_size(&p), None);
+        assert_eq!(png_size(&d.path().join("missing.png")), None);
     }
 
     // HERDR: agent screenshots only go to new files in the app's shots dir.
