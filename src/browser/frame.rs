@@ -101,6 +101,9 @@ impl FrameView {
         #[cfg(target_os = "macos")]
         {
             let frame = self.frame.as_ref()?;
+            if self.drawn != Some(frame.seq) {
+                super::trace::line("drawn", format_args!("seq={}", frame.seq));
+            }
             self.drawn = Some(frame.seq);
             if self.stretching() {
                 // HERDR: held during a resize: drawn at its own size from the top left (clipped),
@@ -138,6 +141,7 @@ impl FrameView {
         if let (Some(stats), Some(f)) = (&mut self.stats, self.frame.as_ref().filter(|f| f.seq == seq)) {
             stats.painted(seq, f.arrived);
         }
+        super::trace::line("presented", format_args!("seq={seq}"));
         self.presented = Some(seq);
     }
 
@@ -178,6 +182,7 @@ impl FrameSink for FrameView {
         if self.frame.as_ref().is_some_and(|f| f.seq >= seq) {
             return Ok(());
         }
+        super::trace::line("arrive", format_args!("seq={seq}"));
         // HERDR: resizing. A frame painted for an older size would show the page laid out for a
         // width it no longer has (the jump): keep the last accepted frame until one at the size
         // asked for arrives, or HOLD_MAX passes. The skipped frame is still acked.

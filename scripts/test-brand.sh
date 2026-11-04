@@ -27,6 +27,10 @@ rm -rf "$t"
 lit=$(git grep -n -I -F "\"$BRAND_NAME\"" -- 'src/*.rs' 'src/**/*.rs' | grep -v '^src/brand.rs' || true)
 [[ -z $lit ]] && ok "no literal \"$BRAND_NAME\" in src (it comes from brand.rs)" || bad "literal brand name in src: $lit"
 
+# Menu titles and items say the brand, never a literal "Herdr".
+menus=$(git grep -n -I -E '(Menu::new|MenuItem::(action|submenu|os_action))\(\s*"[^"]*Herdr' -- 'src/*.rs' 'src/**/*.rs' || true)
+[[ -z $menus ]] && ok "menus name the brand, not Herdr" || bad "a menu says Herdr:"$'\n'"$menus"
+
 # The install guide names the current brand (it is written out there; a rename updates it).
 grep -q -F "$BRAND_NAME" docs/fork-install.md && ok "docs/fork-install.md names $BRAND_NAME" || bad "docs/fork-install.md doesn't name $BRAND_NAME"
 

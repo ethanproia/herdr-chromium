@@ -19,10 +19,6 @@ export function hc(args: string[]): Promise<ExecResult>;
 export function home(): string;
 /** The app's folder (`~/.config/herdr-app`, or `$HERDR_APP_HOME`): settings.json, keys.json, layouts/. */
 export function appHome(): string;
-/** Fork builds only (feature-detect: `typeof appInfo === "function"`): the build's name and
- *  version, the stock Herdr version it is based on, its commit, the line the app shows
- *  ("Trestle 0.2.0 (Herdr 0.1.13, 4101803)"), and each bundled mod's pinned commit. */
-export function appInfo(): { name: string; version: string; base: string; sha: string; line: string; mods: { name: string; commit: string }[] };
 
 /** Reads UTF-8 text (up to 16 MiB), or null if absent. Runs off the UI thread.
  *  `on`: from that machine (a space's `machine`). */

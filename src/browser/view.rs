@@ -1183,11 +1183,13 @@ impl BrowserView {
                 if let Err(e) = result {
                     tracing::warn!("browser {}: frame {seq}: {e:#}", self.id);
                     // Unpaintable: ack anyway, or the host waits on it forever.
+                    super::trace::line("acked", format_args!("seq={seq}"));
                     self.link.send(AppToHost::FrameAck { id: self.id.clone(), seq });
                 } else if crate::control::headless() && self.acked != Some(seq) {
                     // A headless window never draws, so nothing would ack: take each frame as
                     // shown, or the host stops after one and screenshots stay stale.
                     self.acked = Some(seq);
+                    super::trace::line("acked", format_args!("seq={seq}"));
                     self.link.send(AppToHost::FrameAck { id: self.id.clone(), seq });
                 }
             }
@@ -1658,6 +1660,7 @@ impl BrowserView {
     fn send_ack(&mut self) {
         if let Some(seq) = self.frames.ack().filter(|s| Some(*s) != self.acked) {
             self.acked = Some(seq);
+            super::trace::line("acked", format_args!("seq={seq}"));
             self.link.send(AppToHost::FrameAck { id: self.id.clone(), seq });
             if let Some(p) = &self.probe {
                 p(&FrameEvent::Acked { seq });
