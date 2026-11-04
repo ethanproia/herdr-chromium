@@ -307,8 +307,8 @@ fn agent(program: std::path::PathBuf, args: Vec<String>, url: &str, real: bool) 
         }
     };
     let id = serde_json::json!({ "id": "web" });
-    let shot = dir.join("page.png");
-    let shot_r = run(&mut cx, "browser.screenshot", serde_json::json!({ "id": "web", "path": shot }));
+    // Agent screenshots go to the app's shots dir (a caller can't name a path elsewhere): read the path the reply gives.
+    let shot_r = run(&mut cx, "browser.screenshot", serde_json::json!({ "id": "web" }));
     if real {
         // Type through the page's input (a click to focus the textarea, then text as the
         // platform's text input delivers it) and read it back from the page.
@@ -334,7 +334,9 @@ fn agent(program: std::path::PathBuf, args: Vec<String>, url: &str, real: bool) 
         };
         assert_eq!(value["value"], "typed in herdr", "the page's textarea got the typed text: {value}");
         let shot_r = shot_r.unwrap();
+        let shot = std::path::PathBuf::from(shot_r["path"].as_str().expect("the reply names the written file"));
         let png = std::fs::read(&shot).expect("the screenshot was written");
+        assert!(shot_r["width"].as_u64().is_some_and(|w| w > 0) && shot_r["height"].as_u64().is_some_and(|h| h > 0), "the reply gives the PNG's size: {shot_r}");
         assert!(png.starts_with(b"\x89PNG"), "a PNG at {}", shot.display());
         // A link to a new window: the host asks, the block tells its window (which splits).
         let js = "let a=document.createElement('a');a.href='data:text/html,popup';a.target='_blank';document.body.append(a);a.click();true";

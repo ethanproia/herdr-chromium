@@ -197,17 +197,67 @@ export function isSafeFetchUrl(url) {
 
 // curl flags for every embed fetch: web protocols only, and curl never follows a redirect itself (no -L);
 // fetchHops follows them so each hop passes isSafeFetchUrl.
-export const CURL_SAFE = ["--proto", "=http,https", "--max-redirs", "0"];
+// Also: no URL globbing ([a-z] / {a,b} in a note's link), and no proxy from the environment. Callers put "-q" (skip
+// ~/.curlrc) as curl's very first argument; curl ignores it anywhere else.
+export const CURL_SAFE = ["--proto", "=http,https", "--max-redirs", "0", "--globoff", "--noproxy", "*"];
 export const MAX_HOPS = 3;
 
-// Fetch `url`, following at most MAX_HOPS redirects, each checked before it is fetched. `once(url)` runs one
-// curl and resolves to { redirect, result } (redirect = curl's %{redirect_url}, "" when there is none).
-// Resolves to { url, result } for the final page, or null when a hop is refused or there are too many.
-export async function fetchHops(url, once, maxHops = MAX_HOPS) {
+// Cap curl's body at the first argument's byte count and exit with curl's status.
+// head closes the pipe once it has that many bytes, so a chunked response with no
+// Content-Length is not stored in full (--max-filesize only applies when the length
+// is declared). curl's status is saved aside: the pipeline's own status would be
+// head's 0, and a connect failure would never try the next address.
+// The pipeline is in the background. A shell defers INT and TERM until a foreground
+// pipeline finishes, so a killed fetch would wait out curl's -m and could leave curl
+// running. wait is interrupted at once; the trap kills curl and head, and EXIT removes
+// the status files.
+export const CURL_BODY_SCRIPT = `n=$1; shift
+rcf=$(mktemp "\${TMPDIR:-/tmp}/notepad-rc.XXXXXX") || exit 1
+pf=$(mktemp "\${TMPDIR:-/tmp}/notepad-rc.XXXXXX") || { rm -f -- "$rcf"; exit 1; }
+hpid=
+trap 'rm -f -- "$rcf" "$pf"' EXIT
+trap 'c=$(cat "$pf" 2>/dev/null || true); [ -n "$c" ] && kill "$c" 2>/dev/null; [ -n "$hpid" ] && kill "$hpid" 2>/dev/null; wait; exit 130' INT
+trap 'c=$(cat "$pf" 2>/dev/null || true); [ -n "$c" ] && kill "$c" 2>/dev/null; [ -n "$hpid" ] && kill "$hpid" 2>/dev/null; wait; exit 143' TERM
+{
+  curl "$@" &
+  echo $! > "$pf"
+  wait $!
+  echo $? > "$rcf"
+} | head -c "$n" &
+hpid=$!
+wait
+rc=$(cat "$rcf" 2>/dev/null || true)
+case "$rc" in
+  ''|*[!0-9]*) exit 1 ;;
+esac
+exit "$rc"
+`;
+
+// curl's CURLE_COULDNT_CONNECT. A later address of the same name is tried only for this status.
+export const CURL_COULDNT_CONNECT = 7;
+// Lookup returned nothing (no dig, split DNS, empty answer). Not the same as a private address.
+export const RESOLVE_ERROR = "could not resolve host";
+
+// Fetch `url`, following at most MAX_HOPS redirects, each checked before it is fetched. `once(url, extra)` runs
+// one curl and resolves to { redirect, result } (redirect = curl's %{redirect_url}, "" when there is none).
+// Resolves to { url, result } for the final page, { error: RESOLVE_ERROR } when the name has no addresses,
+// or null when a hop is refused or there are too many.
+// `pin(url)` returns pinArgs: null to refuse, { error: RESOLVE_ERROR } when lookup found nothing, [] when no
+// pin is needed, or a list of curl arg lists (one checked address each). A connect failure tries the next list.
+export async function fetchHops(url, once, maxHops = MAX_HOPS, pin = null) {
   let cur = url;
   for (let hop = 0; hop <= maxHops; hop++) {
     if (!isSafeFetchUrl(cur)) return null;
-    const r = await once(cur);
+    const extra = pin ? await pin(cur) : [];
+    if (extra && extra.error === RESOLVE_ERROR) return { error: RESOLVE_ERROR };
+    if (!extra) return null;
+    const attempts = extra.length === 0 ? [[]] : (Array.isArray(extra[0]) ? extra : [extra]);
+    let r;
+    for (let i = 0; i < attempts.length; i++) {
+      r = await once(cur, attempts[i]);
+      if (Number(r?.result?.code) === CURL_COULDNT_CONNECT && i + 1 < attempts.length) continue;
+      break;
+    }
     const next = String(r?.redirect ?? "").trim();
     if (!next) return { url: cur, result: r?.result };
     let abs;
@@ -215,4 +265,45 @@ export async function fetchHops(url, once, maxHops = MAX_HOPS) {
     cur = abs;
   }
   return null;
+}
+
+// Why a fetch result must not be parsed. Null means the page is usable (including a curl that connected
+// and failed; that is not a refused address and not a lookup failure).
+export function loadFailure(got) {
+  if (got && got.error === RESOLVE_ERROR) return RESOLVE_ERROR;
+  if (!got || got.error) return "not a public web address";
+  return null;
+}
+
+// A public name can resolve to this machine or the local network. Check every address the name resolves to
+// (`lookup(host)` -> list of IPs) and pin curl with --resolve, so curl never resolves the name again.
+// Any private address refuses the fetch (null). No address is RESOLVE_ERROR, not a refusal.
+// Each returned list pins one checked address; fetchHops tries the next only after a connect failure.
+export async function pinArgs(url, lookup) {
+  let u;
+  try { u = new URL(String(url)); } catch { return null; }
+  const host = u.hostname.replace(/^\[|\]$/g, "");
+  if (/^[\d.]+$/.test(host) || host.includes(":")) return [];   // a literal address: isSafeFetchUrl already checked it
+  let ips;
+  try { ips = await lookup(host); } catch { return { error: RESOLVE_ERROR }; }
+  ips = (ips || []).map((x) => String(x).trim()).filter(Boolean);
+  if (!ips.length) return { error: RESOLVE_ERROR };
+  const lit = (ip) => (ip.includes(":") ? `[${ip}]` : ip);
+  if (!ips.every((ip) => isSafeFetchUrl(`http://${lit(ip)}/`))) return null;
+  const seen = new Set();
+  ips = ips.filter((ip) => (seen.has(ip) ? false : seen.add(ip)));
+  const port = u.port || (u.protocol === "https:" ? "443" : "80");
+  return ips.map((ip) => ["--resolve", `${host}:${port}:${lit(ip)}`]);
+}
+
+// dig treats a bare name starting with "-" or "+" as an option (`-f` reads a batch file).
+// The name is the argument of `-q`, so it is only the query.
+export function digArgs(host, type) {
+  return ["+short", "+time=2", "+tries=1", "-q", String(host), type];
+}
+
+// The addresses in `dig +short` output (CNAME lines end with "." and are skipped).
+export function ipsFromDig(out) {
+  return String(out || "").split("\n").map((l) => l.trim())
+    .filter((l) => /^\d+\.\d+\.\d+\.\d+$/.test(l) || (/^[0-9a-f:]+$/i.test(l) && l.includes(":")));
 }

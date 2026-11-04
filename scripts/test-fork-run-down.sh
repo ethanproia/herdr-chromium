@@ -32,5 +32,25 @@ sleep 3
 [[ -z $(apps) ]] && ok "no herdr-app left on the home" || bad "apps left: $(apps | tr '\n' ' ')"
 [[ -z $(cores) ]] && ok "no herdr-core left for the session" || bad "cores left: $(cores | tr '\n' ' ')"
 
+# Renamed binaries: an app not called herdr-app and a core copy called hc (as a release copy or a scratch
+# core is) are found by what they hold open, not by name.
+n2=frr$$
+home2=$HOME/.herdr-fork-home/$n2/home
+bins=$(mktemp -d "${TMPDIR:-/tmp}/frd-bins.XXXXXX")
+cp "$HERDR_APP_BIN" "$bins/renamed-app"
+core_src=$(command -v herdr-core || command -v hc)
+cp "$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$core_src")" "$bins/hc"
+mkdir -p "$home2"
+printf '{ "core": "%s" }\n' "$bins/hc" > "$home2/settings.json"
+HERDR_APP_BIN=$bins/renamed-app scripts/fork-run.sh $n2 up >/dev/null || bad "renamed up"
+HERDR_APP_BIN=$bins/renamed-app scripts/fork-run.sh $n2 do space.new >/dev/null
+sleep 2
+any() { ps -E -ax -o pid=,command= | grep -F -e "$bins/" -e "herdr-fork-$n2" | grep -v grep | awk '{print $1}'; }
+[[ -n $(any) ]] && ok "a renamed app and core run" || bad "renamed binaries did not start"
+HERDR_APP_BIN=$bins/renamed-app scripts/fork-run.sh $n2 down >/dev/null
+sleep 3
+[[ -z $(any) ]] && ok "down leaves nothing of a renamed app or core" || bad "left: $(any | tr '\n' ' ')"
+find "$bins" -delete
+
 echo "failures: $fails"
 exit $((fails > 0))

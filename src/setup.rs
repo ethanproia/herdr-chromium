@@ -48,7 +48,7 @@ pub struct Setup {
 pub fn open(need: Need, requests: async_channel::Receiver<Request>, cx: &mut App) {
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, size(px(620.0), px(460.0)), cx))),
-        titlebar: Some(TitlebarOptions { title: Some("Herdr".into()), ..Default::default() }),
+        titlebar: Some(TitlebarOptions { title: Some(crate::brand::NAME.into()), ..Default::default() }),
         app_id: Some("herdr-app".into()),
         ..Default::default()
     };
@@ -136,17 +136,17 @@ impl Setup {
     fn words(&self) -> (String, String, String) {
         match &self.need {
             Need::Install => (
-                "Herdr needs herdr-core".into(),
+                format!("{} needs herdr-core", crate::brand::NAME),
                 "herdr-core runs your terminals and agents, and keeps them alive when this window closes. Herdr couldn't find it on this computer.".into(),
                 format!("Install it for me puts it in {CORE_PLACE} (with hc), like its own installer: {CORE_INSTALL}"),
             ),
             Need::Fix(Mismatch::TooOld { have, need }) => (
-                "Herdr needs a newer herdr-core".into(),
+                format!("{} needs a newer herdr-core", crate::brand::NAME),
                 format!("Yours is {have}; this Herdr needs {need} or newer. Updating keeps your terminals running."),
                 "Or update it yourself: hc update".into(),
             ),
             Need::Fix(Mismatch::Missing(methods)) => (
-                "Herdr needs a newer herdr-core".into(),
+                format!("{} needs a newer herdr-core", crate::brand::NAME),
                 format!("Your herdr-core can't do everything this Herdr needs ({}). Updating keeps your terminals running.", methods.join(", ")),
                 "Or update it yourself: hc update".into(),
             ),

@@ -2,9 +2,10 @@
 // the safe copy runner, how a tool opens, and the host side of the registry.
 import { div, svg } from "gpui-kit";
 import { h_flex } from "gpui-base";
-import { exec, appHome, readTextFile, settings, notify, run, watchFolder, shared, setShared, openOverlay } from "herdr";
+import { exec, hc, appHome, readTextFile, settings, notify, run, watchFolder, shared, setShared, openOverlay, writeTextFile } from "herdr";
+import * as herdr from "herdr";
 import { SELF, icon } from "./self.js";
-import { keysym, COPY_TEXT, COPY_FILE_STRIPPED, watchMembership, registryWatchRelevant, headerActionPlan, registryNotice, runRegistryWatch, registryWatchFailure } from "./pure.js";
+import { keysym, COPY_TEXT, COPY_FILE_STRIPPED, watchMembership, registryWatchRelevant, headerActionPlan, registryNotice, runRegistryWatch, registryWatchFailure, runCopyPlan } from "./pure.js";
 import { resolveOpen, createRegistry, readRegistryCache, toolsFromCache, publishRegistryChanges, REGISTRY_CACHE_KEY } from "./registry.js";
 
 export { keysym, registryNotice, icon };
@@ -39,11 +40,18 @@ export const toolIcon = (tool, size = 15) => (tool.icon ? svg(tool.icon).size(si
 // ---- copy: the clipboard only changes when the producer succeeded --------------------------------------------------
 export const tmpDir = () => `${appHome()}/data/${SELF}/tmp`;
 
-// Runs [script, arg] (from pure.js) and resolves true only on success; says so on failure.
+// Runs a copy plan (from pure.js) and resolves true only on success; says so on failure.
+// A terminal plan reads through hc(); file and text plans stay shell scripts.
 export function runCopy(script, arg) {
-  return exec("sh", ["-c", script, "sh", arg, tmpDir()]).then((r) => {
-    if (r.code !== 0) notify({ title: "Couldn't copy", body: (r.stderr || "").trim().slice(0, 200), level: "error", timeout: 3000 });
-    return r.code === 0;
+  return Promise.resolve(runCopyPlan(script, arg, {
+    hc,
+    exec,
+    writeTextFile,
+    tmpDir,
+    stamp: () => `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+  })).then((r) => {
+    if (!r || r.code !== 0) notify({ title: "Couldn't copy", body: (r?.stderr || "").trim().slice(0, 200), level: "error", timeout: 3000 });
+    return !!r && r.code === 0;
   }).catch((e) => {
     notify({ title: "Couldn't copy", body: String(e?.message ?? e).slice(0, 200), level: "error", timeout: 3000 });
     return false;
@@ -51,7 +59,7 @@ export function runCopy(script, arg) {
 }
 
 export function copyText(text, doneTitle = "Link copied") {
-  runCopy(COPY_TEXT, text).then((ok) => { if (ok) notify({ title: doneTitle, body: text, timeout: 2000 }); });
+  return runCopy(COPY_TEXT, text).then((ok) => { if (ok) notify({ title: doneTitle, body: text, timeout: 2000 }); return ok; });
 }
 
 // The Notepad saves 400 ms after typing. A note copy asks that mod to write first (the same handshake
@@ -66,8 +74,10 @@ export function flushNoteCopy(mod, cx) {
       const a = shared("notepad.flushAck");
       if (a && a.req === req) {
         await cx.sleep(150);
+        // A newer request may have replaced the answer by now; only an answer to this request counts.
         const z = shared("notepad.flushAck");
-        return z && z.ok ? null : ((z && z.error) || "The note could not be saved");
+        const ack = z && z.req === req ? z : a;
+        return ack.ok ? null : (ack.error || "The note could not be saved");
       }
       await cx.sleep(100);
     }
@@ -141,6 +151,19 @@ export const registryIO = {
     return r.stdout.split("\n").filter(Boolean);
   },
   read: (file) => readTextFile(file),
+  // Command names, feature-detected. Stock Herdr may not export `commands`; a named import of a missing
+  // export fails this module, so it is read off the namespace (same as notes.js). Null means the list is
+  // unknown: not a function, a throw, or a null, empty, or non-array answer. The registry then keeps
+  // command-backed tools. A real list hides only the commands it does not contain.
+  commands() {
+    if (typeof herdr.commands !== "function") return null;
+    try {
+      const list = herdr.commands();
+      if (!Array.isArray(list)) return null;
+      const names = list.map((c) => (typeof c === "string" ? c : c?.name)).filter((n) => typeof n === "string");
+      return names.length ? names : null;   // an unrecognised shape is "unknown", so command tools stay visible
+    } catch { return null; }
+  },
   disabled() { const d = settings()?.mods_disabled; return Array.isArray(d) ? d.filter((x) => typeof x === "string") : []; },
 };
 

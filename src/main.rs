@@ -2,6 +2,8 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod bench;
+// HERDR: the fork's user-facing name (brand.json).
+mod brand;
 mod browser;
 mod commands;
 mod control;
@@ -106,7 +108,8 @@ fn main() {
         None => {}
         Some("-h" | "--help" | "help") => return print!("{HELP}"),
         Some("--skill") => return print!("{}", include_str!("SKILL.md")),
-        Some("-V" | "--version" | "version") => return println!("herdr-app {}", env!("CARGO_PKG_VERSION")),
+        // HERDR: the fork's version line (brand.json); the updater reads it too (update::version_of).
+        Some("-V" | "--version" | "version") => return println!("{}", brand::version_line()),
         Some(other) => {
             eprint!("herdr-app: unknown argument {other:?}\n\n{HELP}");
             std::process::exit(2);
@@ -248,7 +251,7 @@ pub fn open_main(core: std::sync::Arc<hc::Core>, requests: async_channel::Receiv
                 // macOS: always see-through, so a layout can draw its own title bar
                 // live; the app drags the window (window/titlebar.rs).
                 titlebar: Some(TitlebarOptions {
-                    title: Some("Herdr".into()),
+                    title: Some(brand::NAME.into()),
                     // Windows: hidden for good (it can't change live); the app draws it.
                     appears_transparent: cfg!(any(target_os = "macos", windows)),
                     traffic_light_position: cfg!(target_os = "macos").then(|| point(px(12.0), px(7.0))),
