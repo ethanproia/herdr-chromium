@@ -2,7 +2,7 @@
 //! plays. The host (herdr-app) installs the renderer that plays it; without one the element is an
 //! empty box styled like any other, so a script still lays out and tests run headless.
 
-use gpui::{AnyElement, App, ElementId, InteractiveElement, IntoElement, SharedString, StyleRefinement, Styled, Window, div};
+use gpui::{AnyElement, App, ElementId, InteractiveElement, IntoElement, Refineable as _, SharedString, StyleRefinement, Styled, Window, div};
 use std::sync::OnceLock;
 
 /// What a script asked for. The path follows `image`'s rule (inside the application directory);
