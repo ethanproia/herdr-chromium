@@ -76,13 +76,42 @@ case $cmd in
     echo "fork window pid $(cat "$root/pid"), log $root/app.log"
     ;;
   down)
-    if [[ -f $root/pid ]]; then
-      pid=$(cat "$root/pid")
-      # Only our own process: its command line is this build.
-      if ps -p "$pid" -o command= 2>/dev/null | grep -qF "$bin"; then kill "$pid"; fi
-      rm -f "$root/pid"
-    fi
-    hc server stop >/dev/null 2>&1 || true
+    # Every herdr-app on this home, not only the one in the pid file: a second `up`
+    # overwrites the file, and a stranded app keeps its core alive.
+    pids=$(ps -E -ax -o pid=,command= | awk -v want="HERDR_APP_HOME=$home" '
+      { app = 0; mine = 0
+        for (i = 2; i <= NF; i++) {
+          if (i == 2 && $i ~ /\/herdr-app$/) app = 1
+          if ($i == want) mine = 1
+        }
+        if (app && mine) print $1 }')
+    for pid in $pids; do kill "$pid" 2>/dev/null || true; done
+    # Wait for the apps to exit (up to 20 s). `|| true`: under set -e a failed kill -0 here
+    # used to end the script before the cleanup below ran.
+    for _ in $(seq 200); do
+      left=$(for pid in $pids; do kill -0 "$pid" 2>/dev/null && echo "$pid"; done || true)
+      [[ -z $left ]] && break
+      sleep 0.1
+    done
+    rm -f "$root/pid"
+    # This home's core and its terminal holders, without hc (an hc call starts a core when none
+    # runs). Holders outlive their core by design, and a quitting app parks its terminals just
+    # after it exits, which starts a core: end whatever has files open in this home's private
+    # state dir until it has been quiet for 3 s (at most 20 s), then remove that state.
+    mine() { lsof -c herdr-cor -Fpn 2>/dev/null | awk -v s="/herdr-core/$HC_SESSION/" '/^p/ { p = substr($0, 2) } /^n/ && index($0, s) { print p }' | sort -u; }
+    quiet=0
+    for _ in $(seq 20); do
+      left=$(mine)
+      if [[ -z $left ]]; then
+        quiet=$((quiet + 1))
+        [[ $quiet -ge 3 ]] && break
+      else
+        quiet=0
+        kill $left 2>/dev/null || true
+      fi
+      sleep 1
+    done
+    case $XDG_STATE_HOME in /tmp/hf-*) rm -rf "${XDG_STATE_HOME:?}/herdr-core/${HC_SESSION:?}" ;; esac
     echo "fork $name stopped"
     ;;
   hc) shift; exec hc "$@" ;;

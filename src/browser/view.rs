@@ -622,6 +622,17 @@ pub struct BrowserView {
     pub state: BrowserState,
     /// The host or the page died; the block shows a reload card until clicked.
     crashed: Option<String>,
+    /// Real popups this page opened (window.open), shown as cards over it; and ones the host
+    /// announced that the next render makes (a view needs the window): (id, url, w, h).
+    popups: Vec<(Entity<BrowserView>, (f32, f32))>,
+    popups_due: Vec<(BrowserId, String, f32, f32)>,
+    /// A popup the page asked for without a click (refused): its url, for "Open as tab".
+    blocked_popup: Option<String>,
+    /// This view is a popup: its opener, and whether it closed (window.close or the host).
+    opener: Option<BrowserId>,
+    popup_closed: bool,
+    /// Made by the host already (a popup): the first layout resizes it instead of creating it.
+    adopted: bool,
     /// Site permission requests waiting on the person, oldest first (req, origin, kinds); the bar
     /// shows the first. The host denies any left after 60 s, on close and when the page changes.
     prompts: std::collections::VecDeque<(u64, String, Vec<String>)>,
@@ -890,6 +901,12 @@ impl BrowserView {
             link,
             state,
             crashed: None,
+            popups: Vec::new(),
+            popups_due: Vec::new(),
+            blocked_popup: None,
+            opener: None,
+            popup_closed: false,
+            adopted: false,
             prompts: Default::default(),
             prompt_remember: false,
             load_error: None,
@@ -1191,6 +1208,17 @@ impl BrowserView {
                 })
                 .detach();
             }
+            // The host minted `id`; only this page's own popups, and never an id already in use.
+            H::PopupOpened { opener, id, url, w, h } if opener == self.id => {
+                if self.states.lock().unwrap().contains_key(&id) || self.popups_due.iter().any(|(p, ..)| *p == id) {
+                    // Never Close it: that id is a live block's.
+                    tracing::warn!("browser {}: popup id {id} is already in use; ignored", self.id);
+                } else {
+                    self.popups_due.push((id, url, w.unwrap_or(500.0), h.unwrap_or(600.0)));
+                }
+            }
+            H::PopupBlocked { url, .. } => self.blocked_popup = Some(url),
+            H::PopupClosed { .. } if self.opener.is_some() => self.popup_closed = true,
             H::Error { message, .. } => tracing::warn!("browser {}: {message}", self.id),
             _ => return,
         }
@@ -1204,6 +1232,9 @@ impl BrowserView {
             return;
         }
         match self.sized {
+            None if self.adopted => {
+                self.link.send(AppToHost::Resize { id: self.id.clone(), size, scale });
+            }
             None => {
                 // A launch url (with a one-time token) is used once and never kept.
                 let url = self.block.launch_url.take().or_else(|| Some(self.block.url.clone())).filter(|u| !u.is_empty());
@@ -1240,6 +1271,127 @@ impl BrowserView {
     pub fn set_prompt_remember(&mut self, on: bool, cx: &mut Context<Self>) {
         self.prompt_remember = on && self.block.profile == super::agent::PERSON_PROFILE;
         cx.notify();
+    }
+
+    /// Makes the popups the host announced (needs the window) and drops closed ones.
+    fn sync_popups(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.popups.retain(|(p, _)| !p.read(cx).popup_closed);
+        for (id, url, w, h) in std::mem::take(&mut self.popups_due) {
+            // Same profile as its opener (CEF made it in the opener's context).
+            let block = BrowserBlock { url: url.clone(), profile: self.block.profile.clone(), ..Default::default() };
+            let (link, states, opener) = (self.link.clone(), self.states.clone(), self.id.clone());
+            let agent = self.agent.clone();
+            let popup = cx.new(|cx| {
+                let mut v = BrowserView::new(&id, block, link, states, window, cx);
+                v.opener = Some(opener.clone());
+                v.adopted = true;
+                v.state.url = url;
+                v.state.opener = Some(opener);
+                v.agent = agent;
+                v.states.lock().unwrap().insert(id.clone(), v.state.clone());
+                v
+            });
+            cx.observe(&popup, |_, _, cx| cx.notify()).detach();
+            let f = popup.read(cx).focus.clone();
+            window.focus(&f, cx);
+            self.popups.push((popup, (w, h)));
+        }
+    }
+
+    /// The ids of this page's open popups.
+    pub fn popup_ids(&self, cx: &App) -> Vec<BrowserId> {
+        self.popups.iter().map(|(p, _)| p.read(cx).id.clone()).collect()
+    }
+
+    /// This page's open popup views.
+    pub fn popup_views(&self) -> Vec<Entity<BrowserView>> {
+        self.popups.iter().map(|(p, _)| p.clone()).collect()
+    }
+
+    /// The url of a popup the page asked for without a click (refused), while its chip shows.
+    pub fn blocked_popup(&self) -> Option<&str> {
+        self.blocked_popup.as_deref()
+    }
+
+    /// The page size the host was last told (None: not laid out yet).
+    pub fn page_size(&self) -> Option<Dips> {
+        self.sized.map(|(s, _)| s)
+    }
+
+    /// This view's opener when it is a popup.
+    pub fn opener(&self) -> Option<&str> {
+        self.opener.as_deref()
+    }
+
+    /// A popup's own bar: where it is NOW (its current top-level origin, never the url it opened
+    /// with: the anti-phishing line) and a close button.
+    fn popup_bar(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id("popup-bar")
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap_2()
+            .h(px(28.))
+            .px_2()
+            .text_xs()
+            .bg(rgb(0x2b2b2b))
+            .text_color(rgb(0xf0f0f0))
+            .child(div().flex_1().overflow_hidden().whitespace_nowrap().child(popup_origin(&self.state.url)))
+            .child(div().id("popup-close").px_1().cursor_pointer().child("×").on_click(cx.listener(|v, _, _, cx| {
+                v.link.send(AppToHost::Close { id: v.id.clone() });
+                v.popup_closed = true;
+                cx.notify();
+            })))
+            .into_any_element()
+    }
+
+    /// The opener's cards for its popups, centred over the page, and the blocked-popup chip.
+    fn popup_layer(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let mut out: Vec<AnyElement> = self
+            .popups
+            .iter()
+            .map(|(p, (w, h))| {
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(hsla(0., 0., 0., 0.25))
+                    .child(div().w(px(*w)).h(px(*h + 28.)).max_w_full().max_h_full().rounded_md().overflow_hidden().border_1().border_color(rgb(0x555555)).child(p.clone()))
+                    .into_any_element()
+            })
+            .collect();
+        if let Some(url) = self.blocked_popup.clone() {
+            out.push(
+                div()
+                    .id("popup-blocked")
+                    .absolute()
+                    .top(px(6.))
+                    .right(px(8.))
+                    .flex()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .text_xs()
+                    .bg(rgb(0x2b2b2b))
+                    .text_color(rgb(0xf0f0f0))
+                    .child("Pop-up blocked")
+                    .child(div().id("popup-open").cursor_pointer().underline().child("Open as tab").on_click(cx.listener(move |v, _, _, cx| {
+                        v.blocked_popup = None;
+                        cx.emit(BrowserEvent::NewWindow(url.clone()));
+                        cx.notify();
+                    })))
+                    .child(div().id("popup-dismiss").cursor_pointer().child("×").on_click(cx.listener(|v, _, _, cx| {
+                        v.blocked_popup = None;
+                        cx.notify();
+                    })))
+                    .into_any_element(),
+            );
+        }
+        out
     }
 
     /// The person answers the first waiting permission request (agents have no way to).
@@ -2452,6 +2604,7 @@ impl Drop for BrowserView {
 
 impl Render for BrowserView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_popups(window, cx);
         if self.address_stale && !self.address.read(cx).focus_handle(cx).is_focused(window) {
             self.address_stale = false;
             let url = self.state.url.clone();
@@ -2658,10 +2811,10 @@ impl Render for BrowserView {
                     a.select_all(window, cx);
                 });
             }))
-            .child(self.chrome(cx))
-            .children(self.find_bar(cx))
-            .children(strip)
+            .relative()
+            .map(|d| if self.opener.is_some() { d.child(self.popup_bar(cx)) } else { d.child(self.chrome(cx)).children(self.find_bar(cx)).children(strip) })
             .child(page)
+            .children(self.popup_layer(cx))
     }
 }
 
@@ -2695,8 +2848,14 @@ fn bind_keys(cx: &mut App) {
 /// and event, so a revoked grant or a closed block takes effect at once.
 pub fn broker_authorizer(agent: Arc<Mutex<Agent>>, states: Arc<Mutex<HashMap<BrowserId, BrowserState>>>) -> super::broker::Authorize {
     Arc::new(move |block: &str, method: &str| {
-        let profile = states.lock().unwrap().get(block).map(|s| s.profile.clone());
-        agent.lock().unwrap().broker_allowed(&block.to_string(), method, profile.as_deref())
+        // A popup answers to its opener's grants and profile.
+        let (grants_of, profile) = {
+            let st = states.lock().unwrap();
+            let owner = st.get(block).and_then(|s| s.opener.clone()).unwrap_or_else(|| block.to_string());
+            let profile = st.get(&owner).filter(|_| st.contains_key(block)).map(|s| s.profile.clone());
+            (owner, profile)
+        };
+        agent.lock().unwrap().broker_allowed(&grants_of, method, profile.as_deref())
     })
 }
 
@@ -2736,6 +2895,7 @@ impl Browsers {
         if self.link.is_none() {
             let link = HostClient::new(HostConfig::from_env());
             let agent = Arc::new(Mutex::new(Agent::new(link.config().dir.clone())));
+            agent.lock().unwrap().states = Some(self.states.clone());
             let a = agent.clone();
             link.set_tap(Arc::new(move |msg| a.lock().unwrap().on_host(msg)));
             // HERDR: part 5. CDP on the app's pipe: agents reach it only through the broker (agent.sock + token).
@@ -2754,9 +2914,11 @@ impl Browsers {
     /// For tests: browsers over a given link (its agent is made here too).
     pub fn with_link(link: Arc<HostClient>) -> Self {
         let agent = Arc::new(Mutex::new(Agent::new(link.config().dir.clone())));
+        let states: Arc<Mutex<HashMap<BrowserId, BrowserState>>> = Default::default();
+        agent.lock().unwrap().states = Some(states.clone());
         let a = agent.clone();
         link.set_tap(Arc::new(move |msg| a.lock().unwrap().on_host(msg)));
-        Self { link: Some(link), agent: Some(agent), ..Default::default() }
+        Self { link: Some(link), agent: Some(agent), states, ..Default::default() }
     }
 
     /// `herdr-app do browser.<name>`: answered through `reply` (now, or when the host answers).
@@ -2888,6 +3050,21 @@ pub fn load_error_words(kind: &str, url: &str) -> (String, String) {
 /// The S27 inbox under the browser dir.
 fn send_to_root(dir: &Path) -> PathBuf {
     super::inbox::root(dir)
+}
+
+/// A popup's bar text: its scheme and host only (plain, capped), from the url it shows now.
+pub fn popup_origin(url: &str) -> String {
+    let clean: String = url.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+    let origin = match clean.split_once("://") {
+        Some((scheme, rest)) => {
+            let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+            // Userinfo is not where the page is: `https://google.com@evil.test` shows evil.test.
+            let host = host.rsplit_once('@').map_or(host, |(_, h)| h);
+            format!("{scheme}://{host}")
+        }
+        None => clean,
+    };
+    capped(&origin, 80)
 }
 
 /// At most `n` characters, with an ellipsis when cut.

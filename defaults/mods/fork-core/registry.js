@@ -260,7 +260,7 @@ export const FALLBACKS = {
     open: { mod: "." }, places: ["tab", "split", "pane", "side"],
     header: [
       { id: "md", icon: "md.svg", label: "Markdown", action: { toggleShared: "notepad.md" } },
-      { id: "export", icon: "export.svg", label: "Export…", action: { openPopup: { props: { export: true }, width: 220, height: 176 } } },
+      { id: "export", icon: "export.svg", label: "Export…", action: { openPopup: { props: { export: true }, width: 220, height: 180 } } },
     ],
     copy: { copyFile: { dirShared: "notepad.dir", file: "notepad.md", stripFrontmatter: true } },
   },

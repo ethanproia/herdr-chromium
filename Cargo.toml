@@ -58,6 +58,11 @@ path = "tests/titlebar_fullscreen.rs"
 harness = false
 
 [[test]]
+name = "video_play"
+path = "tests/video_play.rs"
+harness = false
+
+[[test]]
 name = "browser_shot"
 path = "tests/browser_shot.rs"
 harness = false
@@ -75,6 +80,16 @@ harness = false
 [[test]]
 name = "browser_shot_mask"
 path = "tests/browser_shot_mask.rs"
+harness = false
+
+[[test]]
+name = "browser_popups_cef"
+path = "tests/browser_popups_cef.rs"
+harness = false
+
+[[test]]
+name = "browser_popups"
+path = "tests/browser_popups.rs"
 harness = false
 
 [[test]]

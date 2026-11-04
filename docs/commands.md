@@ -552,7 +552,7 @@ An agent takes a browser (on, default true): the person's input there is refused
 
 ## `browser.new`
 
-Open the person's browser (the + menu, cmd-shift-b, the pane menu; agents use browser.open). Their own cookies and logins (profile "default"), keys as in any app. A new tab (place "tab", default) or "right"/"down" of pane (else the focused pane).
+Open a browser. From the + menu, cmd-shift-b or the pane menu it is the person's own (profile "default", their logins); through `herdr-app do` it is an agent-profile browser (never their logins). A new tab (place "tab", default) or "right"/"down" of pane (else the focused pane).
 
 | Argument | Required |
 |---|---|
@@ -608,6 +608,24 @@ Draft feedback for the person to review and send (from: person or agent).
 ## `app.palette`
 
 Toggle the command palette: every command by name, with its key; calling again closes it.
+
+No arguments.
+
+## `notifications.read_all`
+
+Mark every notification in the bell read.
+
+No arguments.
+
+## `notifications.clear_all`
+
+Delete every notification in the bell's history.
+
+No arguments.
+
+## `notifications.toggle_dnd`
+
+Turn Do Not Disturb on or off: no toasts or sounds; the bell still counts.
 
 No arguments.
 
