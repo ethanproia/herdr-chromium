@@ -45,6 +45,8 @@ fn main() {
     p.double_click(x, y);
     assert!(p.wait(Duration::from_secs(10), |p| owner(p) == Owner::TextEdit));
     p.text("gone");
+    // The edit really changed the page before Esc (so the restore below proves something).
+    assert!(p.wait(Duration::from_secs(5), |p| text(p, "p") != before), "typing changed the page first");
     p.key("escape");
     assert!(p.wait(Duration::from_secs(10), |p| text(p, "p") == before), "restored exactly");
     assert_eq!(owner(&mut p), Owner::Pick, "one Esc ends the edit, not design mode");

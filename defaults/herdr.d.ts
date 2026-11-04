@@ -20,11 +20,11 @@ export function home(): string;
 /** The app's folder (`~/.config/herdr-app`, or `$HERDR_APP_HOME`): settings.json, keys.json, layouts/. */
 export function appHome(): string;
 
-/** Reads UTF-8 text (up to 1 MiB), or null if absent. Runs off the UI thread.
+/** Reads UTF-8 text (up to 16 MiB), or null if absent. Runs off the UI thread.
  *  `on`: from that machine (a space's `machine`). */
 export function readTextFile(path: string, options?: { on?: string | null }): Promise<string | null>;
 /** Writes UTF-8 text only if it still matches expected (null creates a new file).
- * Rejects on a stale snapshot; existing files are replaced atomically. */
+ * Rejects on a stale snapshot; existing files are replaced atomically. Up to 16 MiB. */
 export function writeTextFile(path: string, text: string, expected: string | null): Promise<null>;
 
 /** The agents people can start from a menu (entries with `run` in programs.json), most picked

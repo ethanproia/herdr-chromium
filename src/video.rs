@@ -56,6 +56,24 @@ struct Clip<P, Pic> {
     ready_sent: bool,
     /// This clip's events; dropping the clip closes them (waiting readers get an error).
     events: (async_channel::Sender<Value>, async_channel::Receiver<Value>),
+    /// A still decode is running for this clip (at most one at a time).
+    still_running: bool,
+    /// The newest still asked for while one ran: only it is decoded next (scrubbing coalesces).
+    still_wanted: Option<f64>,
+}
+
+/// A still to decode off the UI thread (`Clips::complete` takes the answer back).
+pub struct StillRequest {
+    pub id: String,
+    pub path: std::path::PathBuf,
+    pub at: f64,
+}
+
+/// A decoded still (or why not) for `Clips::complete`.
+pub struct StillDone<Pic> {
+    pub id: String,
+    pub at: f64,
+    pub result: Result<Pic, String>,
 }
 
 /// All clips of this process, on GPUI's main thread.
@@ -63,6 +81,8 @@ pub struct Clips<B: Backend> {
     backend: B,
     root: std::path::PathBuf,
     clips: HashMap<String, Clip<B::Player, B::Picture>>,
+    /// Starts a still decode elsewhere (the app: a worker thread; tests: a list they answer).
+    stills: Box<dyn Fn(StillRequest)>,
 }
 
 /// The map key of clip `id` drawn by the mod copy `scope`.
@@ -71,8 +91,8 @@ pub fn key(scope: usize, id: &str) -> String {
 }
 
 impl<B: Backend> Clips<B> {
-    pub fn new(backend: B, root: std::path::PathBuf) -> Self {
-        Self { backend, root, clips: HashMap::new() }
+    pub fn new(backend: B, root: std::path::PathBuf, stills: Box<dyn Fn(StillRequest)>) -> Self {
+        Self { backend, root, clips: HashMap::new(), stills }
     }
 
     fn emit(&mut self, id: &str, kind: &str, error: Option<&str>) {
@@ -105,9 +125,9 @@ impl<B: Backend> Clips<B> {
         if fresh {
             // Dropping the old clip closes its events and releases its player.
             self.clips.remove(id);
-            let still = self.path(spec).and_then(|p| self.backend.still(&p, 0.0));
-            self.clips.insert(id.to_owned(), Clip::new(name, spec.clone(), still.as_ref().ok().cloned(), now));
-            if let Err(e) = still {
+            self.clips.insert(id.to_owned(), Clip::new(name, spec.clone(), None, now));
+            // The first frame decodes off the UI thread; the element shows it when it lands.
+            if let Err(e) = self.ask_still(id, 0.0) {
                 self.emit(id, "error", Some(&e));
                 return None;
             }
@@ -129,6 +149,12 @@ impl<B: Backend> Clips<B> {
             clip.autoplayed = true;
             let _ = self.play(id, now);
         }
+    }
+
+    /// The picture clip `id` shows now (tests read what reached the screen).
+    #[cfg(test)]
+    pub fn picture(&self, id: &str) -> Option<B::Picture> {
+        self.clips.get(id).and_then(|c| c.still.clone())
     }
 
     /// Playing, position and length of clip `id` (the controls bar shows these).
@@ -181,21 +207,48 @@ impl<B: Backend> Clips<B> {
     }
 
     pub fn seek(&mut self, id: &str, to: f64) -> Result<(), String> {
-        let to = to.max(0.0);
-        let path = { let clip = self.clips.get(id).ok_or_else(|| format!("no video {:?} on screen", id.split_once('/').map_or(id, |(_, n)| n)))?; self.path(&clip.spec)? };
-        let clip = self.clips.get_mut(id).expect("checked above");
-        let to = clip.duration.map_or(to, |d| to.min(d));
+        if !to.is_finite() {
+            return Err(format!("seek to {to}: not a time in seconds"));
+        }
+        let clip = self.clips.get_mut(id).ok_or_else(|| format!("no video {:?} on screen", id.split_once('/').map_or(id, |(_, n)| n)))?;
+        let to = clip.duration.map_or(to.max(0.0), |d| to.clamp(0.0, d));
         clip.time = to;
         match clip.player.as_mut() {
             Some(p) => self.backend.seek(p, to),
-            // Paused: the still shows the new position.
-            None => {
-                if let Ok(s) = self.backend.still(&path, to) {
-                    clip.still = Some(s);
-                }
-            }
+            // Paused: the still shows the new position once it is decoded.
+            None => self.ask_still(id, to)?,
         }
         Ok(())
+    }
+
+    /// Asks for the still at `at`. While one decodes, only the newest ask waits (a scrub sends many).
+    fn ask_still(&mut self, id: &str, at: f64) -> Result<(), String> {
+        let path = self.path(&self.clips.get(id).ok_or("no such video")?.spec)?;
+        let clip = self.clips.get_mut(id).expect("checked above");
+        if clip.still_running {
+            clip.still_wanted = Some(at);
+            return Ok(());
+        }
+        clip.still_running = true;
+        (self.stills)(StillRequest { id: id.to_owned(), path, at });
+        Ok(())
+    }
+
+    /// A still decode finished. Only the newest ask is shown: an older answer starts the newest
+    /// instead. A failure is reported as an `error` event and the old picture stays.
+    pub fn complete(&mut self, done: StillDone<B::Picture>) {
+        let Some(clip) = self.clips.get_mut(&done.id) else { return };
+        clip.still_running = false;
+        if let Some(next) = clip.still_wanted.take() {
+            let _ = self.ask_still(&done.id, next);
+            return;
+        }
+        match done.result {
+            // A clip that started playing meanwhile keeps its live frames.
+            Ok(p) if clip.player.is_none() => clip.still = Some(p),
+            Ok(_) => {}
+            Err(e) => self.emit(&done.id, "error", Some(&format!("no picture at {:.2} s: {e}", done.at))),
+        }
     }
 
     /// Pulls a playing clip's frame and reports time, ready, end (or loops) and errors.
@@ -258,6 +311,10 @@ impl<B: Backend> Clips<B> {
         for id in offscreen {
             self.pause(&id);
         }
+        // A scrub whose clip went (its track with it) has nobody left to end it.
+        if SCRUB.with_borrow(|s| s.as_ref().is_some_and(|id| !self.clips.contains_key(id))) {
+            end_scrub();
+        }
     }
 
     #[cfg(test)]
@@ -284,6 +341,8 @@ impl<P, Pic> Clip<P, Pic> {
             last_time_event: None,
             ready_sent: false,
             events: async_channel::bounded(EVENTS_KEPT),
+            still_running: false,
+            still_wanted: None,
         }
     }
 }
@@ -295,6 +354,10 @@ impl<P, Pic> Clip<P, Pic> {
 pub trait Host: Backend + Sized + 'static {
     fn with<R>(f: impl FnOnce(&mut Clips<Self>) -> R) -> R;
     fn show(picture: Self::Picture) -> AnyElement;
+    /// Decoded stills coming back from the worker (None: the host answers them itself, as tests do).
+    fn finished_stills() -> Option<async_channel::Receiver<StillDone<Self::Picture>>> {
+        None
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -305,15 +368,44 @@ type Native = Unsupported;
 thread_local! {
     static CLIPS: RefCell<Option<Clips<Native>>> = const { RefCell::new(None) };
     static SWEEPING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FINISHED: RefCell<Option<async_channel::Receiver<StillDone<<Native as Backend>::Picture>>>> = const { RefCell::new(None) };
+}
+
+/// Stills waiting for the worker; each clip has at most one queued, so this bounds clips, not scrubs.
+const STILLS_QUEUED: usize = 256;
+
+/// One thread decodes every still, in order, so 50 new clips never block a frame or each other's
+/// players; the answers go back to the UI thread through `finished`.
+fn still_worker(backend: Native) -> Box<dyn Fn(StillRequest)> {
+    let (ask, asks) = std::sync::mpsc::sync_channel::<StillRequest>(STILLS_QUEUED);
+    let (done, finished) = async_channel::unbounded();
+    FINISHED.with_borrow_mut(|f| *f = Some(finished));
+    let _ = std::thread::Builder::new().name("herdr-video-stills".into()).spawn(move || {
+        for r in asks {
+            let result = backend.still(&r.path, r.at);
+            if done.send_blocking(StillDone { id: r.id, at: r.at, result }).is_err() {
+                break;
+            }
+        }
+    });
+    Box::new(move |r| {
+        if let Err(std::sync::mpsc::TrySendError::Full(r) | std::sync::mpsc::TrySendError::Disconnected(r)) = ask.try_send(r) {
+            tracing::warn!("video still for {} dropped: the worker is busy or gone", r.id);
+        }
+    })
 }
 
 impl Host for Native {
     fn with<R>(f: impl FnOnce(&mut Clips<Self>) -> R) -> R {
-        CLIPS.with_borrow_mut(|c| f(c.get_or_insert_with(|| Clips::new(Native::default(), crate::mods::app_dir()))))
+        CLIPS.with_borrow_mut(|c| f(c.get_or_insert_with(|| Clips::new(Native::default(), crate::mods::app_dir(), still_worker(Native::default())))))
+    }
+    fn finished_stills() -> Option<async_channel::Receiver<StillDone<Self::Picture>>> {
+        Self::with(|_| ());
+        FINISHED.with_borrow(|f| f.clone())
     }
     #[cfg(target_os = "macos")]
     fn show(picture: Self::Picture) -> AnyElement {
-        gpui::surface(picture).absolute().size_full().object_fit(ObjectFit::Contain).into_any_element()
+        gpui::surface(picture.0).absolute().size_full().object_fit(ObjectFit::Contain).into_any_element()
     }
     #[cfg(not(target_os = "macos"))]
     fn show(_: ()) -> AnyElement {
@@ -337,6 +429,18 @@ fn render<H: Host>(spec: &VideoSpec, element: ElementId, key: Option<SharedStrin
             cx.update(|_| H::with(|c| c.sweep(Instant::now())));
         })
         .detach();
+        if let Some(finished) = H::finished_stills() {
+            // A decoded still is shown on the next draw: windows redraw when one lands.
+            cx.spawn(async move |cx| {
+                while let Ok(done) = finished.recv().await {
+                    cx.update(|cx| {
+                        H::with(|c| c.complete(done));
+                        cx.refresh_windows();
+                    });
+                }
+            })
+            .detach();
+        }
     }
     let picture = H::with(|c| c.rendered(&id, &name, spec, Instant::now()));
     if H::with(|c| c.status(&id).is_some_and(|(playing, _, _)| playing)) {
@@ -427,14 +531,18 @@ fn controls<H: Host>(id: &str) -> AnyElement {
                         move |bounds, _, _| track_probe.set(bounds),
                         // While this clip is being scrubbed, the whole window's moves and the release
                         // are the bar's: caught in the capture phase, so the mod under it never sees them.
+                        // Installed on every paint (not only once a scrub started), so a press and
+                        // release with no frame between them are caught too; each checks at dispatch.
                         move |_, _, window, _| {
-                            if !scrubbing(&scrub_id) {
-                                return;
-                            }
                             let (id, seek, track) = (scrub_id.clone(), seek_drag.clone(), track_drag.clone());
                             window.on_mouse_event(move |e: &gpui::MouseMoveEvent, phase, window, cx| {
                                 if phase == gpui::DispatchPhase::Capture && scrubbing(&id) {
                                     cx.stop_propagation();
+                                    if e.pressed_button != Some(MouseButton::Left) {
+                                        // The release went elsewhere (outside the window): the scrub is over.
+                                        end_scrub();
+                                        return;
+                                    }
                                     seek(&id, e.position.x, track.get());
                                     window.refresh();
                                 }
@@ -533,7 +641,7 @@ pub fn functions(module: gpui_shell::HostModule) -> gpui_shell::HostModule {
 
 /// Off macOS nothing plays yet: every clip reports an error.
 #[cfg(not(target_os = "macos"))]
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 pub struct Unsupported;
 
 #[cfg(not(target_os = "macos"))]

@@ -145,8 +145,9 @@ pub struct BrowserInput {
     origin: Point<Pixels>,
     /// Responsive mode: the page is drawn at this fraction of its size (pointer positions are divided by it).
     fit: f32,
-    /// Responsive mode is on: pick, markup and comments stay off (their overlays assume an unscaled page).
-    annotate_off: bool,
+    /// Responsive mode: the device's size in page DIPs; presses and wheels outside it (the gutters
+    /// around the letterboxed frame) never reach the page.
+    frame: Option<(f32, f32)>,
     focused: bool,
     caps_lock: bool,
     /// Keys sent down and not yet up, by DOM code, so blur can release them.
@@ -168,7 +169,7 @@ pub struct BrowserInput {
 
 impl BrowserInput {
     pub fn new(id: BrowserId, link: Arc<dyn HostLink>) -> Self {
-        Self { id, link, raw_chords: false, origin: Point::default(), fit: 1.0, annotate_off: false, focused: false, caps_lock: false, held_keys: Vec::new(), held_buttons: Vec::new(), last_pos: (0.0, 0.0), marked: None, caret: None, owners: vec![Owner::Browse], lease: None, space_held: false, comment: CommentField::default(), overlay: Vec::new() }
+        Self { id, link, raw_chords: false, origin: Point::default(), fit: 1.0, frame: None, focused: false, caps_lock: false, held_keys: Vec::new(), held_buttons: Vec::new(), last_pos: (0.0, 0.0), marked: None, caret: None, owners: vec![Owner::Browse], lease: None, space_held: false, comment: CommentField::default(), overlay: Vec::new() }
     }
 
     /// HERDR: raw chords for this block (a remote-desktop page): Cmd+A/Z go to the page as keys.
@@ -184,18 +185,19 @@ impl BrowserInput {
         (f32::from(p.x - self.origin.x) / self.fit, f32::from(p.y - self.origin.y) / self.fit)
     }
 
-    /// Responsive mode on or off: on closes pick, markup and comments and keeps them closed.
-    pub fn set_annotate_off(&mut self, off: bool) {
-        self.annotate_off = off;
-        if off {
-            // The whole stack, not just its top: under an agent's lease a pick can sit below.
-            self.close_annotation();
-        }
-    }
-
     /// Responsive mode: the page is drawn scaled by `fit` (1 when off).
     pub fn set_fit(&mut self, fit: f32) {
         self.fit = if fit > 0.0 { fit } else { 1.0 };
+    }
+
+    /// Responsive mode: the device's page size (None: off, the whole block is the page).
+    pub fn set_frame(&mut self, frame: Option<(f32, f32)>) {
+        self.frame = frame;
+    }
+
+    /// A position in the gutter beside the letterboxed frame (page DIPs).
+    fn in_gutter(&self, x: f32, y: f32) -> bool {
+        self.frame.is_some_and(|(w, h)| x < 0.0 || y < 0.0 || x > w || y > h)
     }
 
     fn mods(&self, m: &gpui::Modifiers) -> protocol::Modifiers {
@@ -209,7 +211,8 @@ impl BrowserInput {
 
     /// The page caret from `ImeCaret`, in window coordinates: where the candidate window goes.
     pub fn caret(&self) -> Option<Bounds<Pixels>> {
-        self.caret.map(|c| Bounds::new(self.origin + c.origin, c.size))
+        // The caret is in page DIPs: drawn at `fit` from the frame's origin.
+        self.caret.map(|c| Bounds::new(self.origin + point(c.origin.x * self.fit, c.origin.y * self.fit), gpui::size(c.size.width * self.fit, c.size.height * self.fit)))
     }
 
     pub fn owner(&self) -> Owner {
@@ -243,9 +246,6 @@ impl BrowserInput {
     /// Opens a mode on top of the current one. Allowed: Browse -> Pick or Markup; Pick or
     /// Markup -> Comment; Pick <-> Markup. Refused while an agent holds the lease.
     pub fn enter(&mut self, owner: Owner) -> bool {
-        if self.annotate_off && owner != Owner::Browse && owner != Owner::Agent {
-            return false;
-        }
         let from = self.owner();
         let ok = match (from, owner) {
             (Owner::Agent, _) => {
@@ -405,6 +405,11 @@ impl BrowserInput {
         }
         self.focused = focused;
         if !focused {
+            // HERDR: S13. Focus leaving the block ends an edit (the text goes back): nothing is
+            // kept that the person didn't confirm with Return.
+            if self.owner() == Owner::TextEdit {
+                self.escape();
+            }
             self.space_held = false;
             self.release_all();
             self.comment.marked = None;
@@ -442,6 +447,9 @@ impl BrowserInput {
             });
             return;
         }
+        if self.in_gutter(x, y) {
+            return;
+        }
         if ev.click_count == 2 && ev.button == MouseButton::Left && matches!(self.owner(), Owner::Pick | Owner::Comment) && !self.space_held {
             self.overlay.push(OverlayEvent::DoubleClick { x, y });
             return;
@@ -476,6 +484,10 @@ impl BrowserInput {
     pub fn mouse_move(&mut self, ev: &MouseMoveEvent) {
         let (x, y) = self.local(ev.position);
         self.last_pos = (x, y);
+        // In the gutter with nothing held, the page has no pointer to move.
+        if self.in_gutter(x, y) && self.held_buttons.is_empty() {
+            return;
+        }
         if !self.pointer(MouseKind::Move, x, y, ev.modifiers.shift) {
             return;
         }
@@ -498,7 +510,7 @@ impl BrowserInput {
             ScrollDelta::Pixels(p) => (f32::from(p.x), f32::from(p.y), true),
             ScrollDelta::Lines(p) => (p.x, p.y, false),
         };
-        if dx == 0.0 && dy == 0.0 {
+        if (dx == 0.0 && dy == 0.0) || self.in_gutter(x, y) {
             return;
         }
         // The wheel scrolls the page while picking too; markup draws on a still picture.
@@ -1126,23 +1138,37 @@ mod tests {
     }
 
     #[test]
-    fn device_mode_keeps_annotation_modes_off() {
-        let mut i = BrowserInput::new("b1".into(), Arc::new(Recording::default()));
-        assert!(i.enter(Owner::Pick));
-        i.set_annotate_off(true);
-        assert_eq!(i.owner(), Owner::Browse, "turning a device on closes pick");
-        assert!(!i.enter(Owner::Pick) && !i.enter(Owner::Markup) && !i.toggle(Owner::Pick));
-        assert_eq!(i.owner(), Owner::Browse);
-        i.set_annotate_off(false);
-        assert!(i.enter(Owner::Markup), "off again: annotating works");
+    fn gutter_presses_and_wheels_never_reach_the_page_but_a_release_does() {
+        use gpui::{Modifiers, MouseButton as B, MouseDownEvent, MouseUpEvent, ScrollDelta, ScrollWheelEvent, TouchPhase, point, px};
+        let rec = Arc::new(Recording::default());
+        let mut i = BrowserInput::new("b1".into(), rec.clone());
+        i.set_fit(0.5);
+        i.set_frame(Some((390.0, 844.0)));
+        let down = |x: f32, y: f32| MouseDownEvent { button: B::Left, position: point(px(x), px(y)), modifiers: Modifiers::default(), click_count: 1, first_mouse: false };
+        let up = |x: f32, y: f32| MouseUpEvent { button: B::Left, position: point(px(x), px(y)), modifiers: Modifiers::default(), click_count: 1 };
+        let mice = |r: &Recording| r.0.lock().unwrap().iter().filter(|m| matches!(m, AppToHost::Input { event: InputEvent::Mouse { kind: MouseKind::Down | MouseKind::Up, .. }, .. })).count();
+        // Window x 300 at fit 0.5 is page x 600: beside a 390-wide frame.
+        i.mouse_down(&down(300.0, 100.0));
+        i.scroll(&ScrollWheelEvent { position: point(px(300.0), px(100.0)), delta: ScrollDelta::Pixels(point(px(0.), px(40.))), modifiers: Modifiers::default(), touch_phase: TouchPhase::Moved });
+        assert_eq!(mice(&rec), 0, "no press from the gutter");
+        assert!(!rec.0.lock().unwrap().iter().any(|m| matches!(m, AppToHost::Input { event: InputEvent::Wheel { .. }, .. })), "no wheel from the gutter");
+        // A press on the frame, released in the gutter: the page gets both (no stuck button).
+        i.mouse_down(&down(100.0, 100.0));
+        i.mouse_up(&up(300.0, 100.0));
+        assert_eq!(mice(&rec), 2);
+    }
+
+    #[test]
+    fn turning_a_device_on_closes_annotation_across_the_stack() {
         // Under an agent's lease: the pick below it is stripped, the lease stays on top.
         let mut j = BrowserInput::new("b1".into(), Arc::new(Recording::default()));
         assert!(j.enter(Owner::Pick));
         j.grant_lease("agent-7");
-        j.set_annotate_off(true);
+        j.close_annotation();
         assert_eq!(j.owner(), Owner::Agent);
         j.end_lease();
         assert_eq!(j.owner(), Owner::Browse, "no pick left under the lease");
+        assert!(j.enter(Owner::Markup), "and annotating still works in device mode");
     }
 
     #[test]

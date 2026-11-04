@@ -746,7 +746,10 @@ fn shipped_layouts_and_keys() {
         references(&serde_json::from_str::<Value>(&text).unwrap(), &mods);
         layouts.insert(path.file_stem().unwrap().to_str().unwrap().to_owned());
     }
-    assert_eq!(layouts, crate::window::shipped_layouts().into_iter().map(str::to_owned).collect());
+    // HERDR: defaults/layouts also holds labs, the fork's bundled seed for a personal (not shipped) layout.
+    let mut want: std::collections::BTreeSet<String> = crate::window::shipped_layouts().into_iter().map(str::to_owned).collect();
+    want.insert("labs".into());
+    assert_eq!(layouts.into_iter().collect::<std::collections::BTreeSet<_>>(), want);
     // HERDR: the bundled notepad's own command (defaults/keys.macos.json).
     let mod_commands = ["ribbon.next", "fork-notepad.select-all"];
     for text in [

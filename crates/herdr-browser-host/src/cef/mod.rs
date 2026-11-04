@@ -119,6 +119,51 @@ pub(crate) fn on_closed(id: &str) {
     if was_popup {
         send(HostToApp::PopupClosed { id: id.to_string() });
     }
+    // A popup that closed itself takes its own popups with it.
+    close_descendants(id);
+}
+
+/// Every popup below `root` (its popups, theirs, ...), nearest first.
+fn descendants(popups: &HashMap<String, String>, root: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut frontier = vec![root.to_string()];
+    while let Some(o) = frontier.pop() {
+        let mut kids: Vec<String> = popups.iter().filter(|(_, opener)| **opener == o).map(|(p, _)| p.clone()).collect();
+        kids.sort();
+        for k in kids {
+            if !out.contains(&k) {
+                frontier.push(k.clone());
+                out.push(k);
+            }
+        }
+    }
+    out
+}
+
+/// The one teardown for a browser's popups, whatever closed it (the app, the page, a failed
+/// create): each descendant is forgotten first (a late `on_created` then finds no entry and
+/// closes it), its prompts and choosers are answered, the app hears `PopupClosed`, and an
+/// attached one is closed.
+fn close_descendants(root: &str) {
+    let gone: Vec<(String, Option<Browser>)> = with_host(|h| {
+        descendants(&h.popups, root)
+            .into_iter()
+            .map(|p| {
+                h.popups.remove(&p);
+                let b = h.browsers.remove(&p).and_then(|e| e.browser);
+                (p, b)
+            })
+            .collect()
+    })
+    .unwrap_or_default();
+    for (p, b) in gone {
+        deny_permissions(Some(&p), false);
+        cancel_choosers(&p);
+        send(HostToApp::PopupClosed { id: p });
+        if let Some(host) = b.as_ref().and_then(|b| b.host()) {
+            host.close_browser(1);
+        }
+    }
 }
 
 pub(crate) struct Host {
@@ -1001,17 +1046,8 @@ fn handle(m: AppToHost) {
             }
         }
         M::Close { id } => {
-            // An opener takes its popups with it.
-            let popups: Vec<Browser> = with_host(|h| {
-                let ids: Vec<String> = h.popups.iter().filter(|(_, o)| **o == id).map(|(p, _)| p.clone()).collect();
-                ids.iter().filter_map(|p| h.browsers.get(p).and_then(|e| e.browser.clone())).collect()
-            })
-            .unwrap_or_default();
-            for b in popups {
-                if let Some(host) = b.host() {
-                    host.close_browser(1);
-                }
-            }
+            // An opener takes all its popups (and theirs) with it, attached or still being made.
+            close_descendants(&id);
             deny_permissions(Some(&id), false);
             cancel_choosers(&id);
             let Some(entry) = with_host(|h| h.browsers.remove(&id)).flatten() else { return unknown(&id) };
@@ -1252,7 +1288,7 @@ fn browser_msg(m: AppToHost) {
             let refuse = |id: String| send(HostToApp::TextEditResult { id, req, ok: false, before: String::new(), after: String::new() });
             if !handlers::picked_by_person(&id, selector) {
                 refuse(id);
-            } else if let Some(call) = handlers::text_edit_message(&id, req, selector, op)
+            } else if let Some(call) = handlers::text_edit_message(&id, req, op)
                 && host.send_dev_tools_message(Some(&call)) == 0
             {
                 handlers::eval_unsent(&id);
@@ -1460,6 +1496,20 @@ mod chooser_tests {
         assert_eq!(take_owned(&mut m, 8, "b1"), None);
         assert_eq!(take_owned(&mut m, 7, "b1"), Some("cb"));
         assert_eq!(take_owned(&mut m, 7, "b1"), None, "answered once");
+    }
+
+    #[test]
+    fn teardown_reaches_every_descendant_once() {
+        let mut m: HashMap<String, String> = HashMap::new();
+        m.insert("a~pop1".into(), "a".into());
+        m.insert("a~pop2".into(), "a".into());
+        m.insert("a~pop1~pop3".into(), "a~pop1".into());
+        m.insert("b~pop4".into(), "b".into());
+        let mut d = descendants(&m, "a");
+        d.sort();
+        assert_eq!(d, vec!["a~pop1", "a~pop1~pop3", "a~pop2"], "children and grandchildren, not another opener's");
+        assert_eq!(descendants(&m, "a~pop1"), vec!["a~pop1~pop3"]);
+        assert!(descendants(&m, "b~pop4").is_empty());
     }
 
     #[test]

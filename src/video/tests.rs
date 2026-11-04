@@ -13,7 +13,7 @@ struct Log {
 }
 
 #[derive(Clone, Default)]
-struct Fake(Rc<RefCell<Log>>);
+struct Fake(Rc<RefCell<Log>>, Rc<RefCell<Vec<StillRequest>>>);
 
 struct FakePlayer {
     log: Rc<RefCell<Log>>,
@@ -32,6 +32,9 @@ impl Backend for Fake {
     type Picture = String;
     fn still(&self, path: &std::path::Path, at: f64) -> Result<String, String> {
         self.0.borrow_mut().stills += 1;
+        if at == 7.0 {
+            return Err("cannot decode".into());
+        }
         Ok(format!("{}@{at}", path.file_name().unwrap().to_string_lossy()))
     }
     fn play(&self, _: &std::path::Path, at: f64, _: bool) -> Result<FakePlayer, String> {
@@ -69,21 +72,39 @@ fn setup() -> (tempfile_dir::Dir, Fake, Clips<Fake>) {
         std::fs::write(dir.0.join(format!("c{n}.mp4")), b"x").unwrap();
     }
     let fake = Fake::default();
-    let clips = Clips::new(fake.clone(), dir.0.clone());
+    let queue = fake.1.clone();
+    let clips = Clips::new(fake.clone(), dir.0.clone(), Box::new(move |r| queue.borrow_mut().push(r)));
     (dir, fake, clips)
+}
+
+/// The still worker, played by the test: decodes everything asked so far.
+fn decode(c: &mut Clips<Fake>, fake: &Fake) {
+    loop {
+        let asked: Vec<StillRequest> = std::mem::take(&mut *fake.1.borrow_mut());
+        if asked.is_empty() {
+            return;
+        }
+        for r in asked {
+            let result = fake.still(&r.path, r.at);
+            c.complete(StillDone { id: r.id, at: r.at, result });
+        }
+    }
 }
 
 fn spec(n: usize) -> VideoSpec {
     VideoSpec { path: format!("c{n}.mp4"), ..VideoSpec::default() }
 }
 
-/// Renders clip `id` (named the same) and, when `on_screen`, has layout see it.
+/// Renders clip `id` (named the same), lets the still worker finish, and, when `on_screen`, has
+/// layout see it. Returns what the clip shows.
 fn frame(c: &mut Clips<Fake>, id: &str, spec: &VideoSpec, on_screen: bool, now: Instant) -> Option<String> {
-    let p = c.rendered(id, id, spec, now);
+    c.rendered(id, id, spec, now);
+    let fake = Fake(c.backend.0.clone(), c.backend.1.clone());
+    decode(c, &fake);
     if on_screen {
         c.seen(id, now);
     }
-    p
+    c.picture(id)
 }
 
 fn drain(c: &mut Clips<Fake>, id: &str) -> Vec<String> {
@@ -341,6 +362,110 @@ fn a_playing_clip_draws_and_ends_with_no_input(cx: &mut gpui::TestAppContext) {
     assert_eq!(fake.0.borrow().released, 1, "the ended clip released its player");
     FAKE.with_borrow_mut(|c| *c = None);
     drop(d);
+}
+
+/// P1-5: the first still decodes off the UI thread; the render does not wait for it.
+#[test]
+fn a_new_clip_renders_before_its_still_is_decoded() {
+    let (_d, fake, mut c) = setup();
+    assert_eq!(c.rendered("v", "v", &spec(0), Instant::now()), None, "nothing decoded on the UI thread");
+    assert_eq!(fake.0.borrow().stills, 0);
+    assert_eq!(fake.1.borrow().len(), 1, "one still asked of the worker");
+    decode(&mut c, &fake);
+    assert_eq!(c.picture("v"), Some("c0.mp4@0".into()));
+}
+
+/// P1-5: a paused scrub sends many seeks; one decode runs at a time and only the newest follows.
+#[test]
+fn scrubbing_a_paused_clip_decodes_only_the_newest_position() {
+    let (_d, fake, mut c) = setup();
+    let now = Instant::now();
+    frame(&mut c, "v", &spec(0), true, now);
+    let before = fake.0.borrow().stills;
+    for t in [1.0, 2.0, 3.0, 4.0, 5.0] {
+        c.seek("v", t).unwrap();
+    }
+    assert_eq!(fake.1.borrow().len(), 1, "one decode running, the rest wait as one");
+    decode(&mut c, &fake);
+    assert_eq!(fake.0.borrow().stills - before, 2, "the first and the newest, not all five");
+    assert_eq!(c.picture("v"), Some("c0.mp4@5".into()), "the newest position is what shows");
+}
+
+/// P1-5: a still that cannot be decoded is reported, the old picture stays, and a seek must be a time.
+#[test]
+fn a_failed_still_is_reported_and_seeks_must_be_times() {
+    let (_d, _fake, mut c) = setup();
+    let now = Instant::now();
+    frame(&mut c, "v", &spec(0), true, now);
+    drain(&mut c, "v");
+    c.seek("v", 7.0).unwrap();
+    frame(&mut c, "v", &spec(0), true, now);
+    let rx = c.events_of("v").unwrap();
+    let e = rx.try_recv().unwrap();
+    assert_eq!(e["type"], "error");
+    assert!(e["error"].as_str().unwrap().contains("cannot decode"), "{e}");
+    assert_eq!(c.picture("v"), Some("c0.mp4@0".into()), "the last good picture stays");
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert!(c.seek("v", bad).is_err(), "{bad}");
+    }
+}
+
+/// P1-4: a press and release on the track with no frame drawn between them never reaches the mod
+/// under the clip, and the scrub ends.
+#[gpui::test]
+fn a_quick_scrub_keeps_its_release_from_the_mod(cx: &mut gpui::TestAppContext) {
+    use gpui::{Modifiers, MouseButton, point, px};
+    struct View(Rc<std::cell::Cell<usize>>);
+    impl gpui::Render for View {
+        fn render(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+            let ups = self.0.clone();
+            // The clip's own box, as a script's .w(400).h(200) would give it.
+            let mut sized = div().w(px(400.0)).h(px(200.0));
+            let style = sized.style().clone();
+            let clip = render::<Fake>(&VideoSpec { controls: true, ..spec(0) }, ElementId::Name("clip".into()), Some("clip".into()), 1, style, window, cx);
+            div().size_full().on_mouse_up(MouseButton::Left, move |_, _, _| ups.set(ups.get() + 1)).child(clip)
+        }
+    }
+    let (d, fake, clips) = setup();
+    FAKE.with_borrow_mut(|c| *c = Some(clips));
+    let ups = Rc::new(std::cell::Cell::new(0));
+    let (_view, cx) = cx.add_window_view({
+        let ups = ups.clone();
+        move |_, _| View(ups)
+    });
+    let draw = |cx: &mut gpui::VisualTestContext| cx.update(|window, cx| window.draw(cx).clear(cx));
+    draw(cx);
+    Fake::with(|c| decode(c, &fake));
+    draw(cx);
+    // The track: the bar's middle, 14 px above the clip's bottom.
+    let at = point(px(150.0), px(186.0));
+    // Straight to the window, with no chance to draw between the press and the release.
+    let press = gpui::PlatformInput::MouseDown(gpui::MouseDownEvent { button: MouseButton::Left, position: at, modifiers: Modifiers::none(), click_count: 1, first_mouse: false });
+    let release = gpui::PlatformInput::MouseUp(gpui::MouseUpEvent { button: MouseButton::Left, position: at, modifiers: Modifiers::none(), click_count: 1 });
+    // One update: a context update draws a dirty window when it returns, so both events go in one.
+    let started = cx.update(|window, cx| {
+        window.dispatch_event(press, cx);
+        let started = scrubbing(&key(1, "clip"));
+        window.dispatch_event(release, cx);
+        started
+    });
+    assert!(started, "the press started a scrub");
+    assert_eq!(ups.get(), 0, "the release stayed with the bar");
+    assert!(!scrubbing(&key(1, "clip")), "and ended the scrub");
+    end_scrub();
+    FAKE.with_borrow_mut(|c| *c = None);
+    drop(d);
+}
+
+/// P1-4: a scrub whose clip is gone (its track with it) is cleared.
+#[test]
+fn a_scrub_ends_with_its_clip() {
+    let (_d, _fake, mut c) = setup();
+    let t0 = Instant::now();
+    frame(&mut c, "v", &spec(0), true, t0);
+    start_scrub("v");
+    c.sweep(t0 + GONE_IDLE);
+    assert!(!scrubbing("v"));
 }
 
 /// A throwaway directory, removed on drop.
