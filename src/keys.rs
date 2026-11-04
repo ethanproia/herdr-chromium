@@ -46,6 +46,8 @@ const SHIPPED_MACOS_KEYS: &[&str] = &[
     include_str!("keys/shipped/v0.1.5-keys.macos.json"),
     // HERDR: the fork's own last default (0.1.12 base), so untouched Labs keys get 0.1.13's cmd-f.
     include_str!("keys/shipped/fork-labs-0.1.12-keys.macos.json"),
+    // HERDR: 0.1.13's fork default, so untouched keys get ctrl-cmd-f (full screen).
+    include_str!("keys/shipped/fork-labs-0.1.13-keys.macos.json"),
 ];
 
 #[derive(serde::Deserialize)]
@@ -339,7 +341,7 @@ mod tests {
         let keys = super::parse(include_str!("../defaults/keys.macos.json")).unwrap();
         let cmd_f: Vec<_> = keys
             .iter()
-            .filter(|b| b.keystrokes().len() == 1 && b.keystrokes()[0].inner().key == "f" && b.keystrokes()[0].inner().modifiers.platform && !b.keystrokes()[0].inner().modifiers.shift)
+            .filter(|b| b.keystrokes().len() == 1 && b.keystrokes()[0].inner().key == "f" && b.keystrokes()[0].inner().modifiers.platform && !b.keystrokes()[0].inner().modifiers.shift && !b.keystrokes()[0].inner().modifiers.control)
             .collect();
         assert_eq!(cmd_f.len(), 1, "one cmd-f binding");
         let when = cmd_f[0].predicate().expect("a context");
@@ -347,6 +349,19 @@ mod tests {
         assert!(when.eval(&ctx(&["Herdr", "Terminal"])), "a focused terminal searches");
         assert!(!when.eval(&ctx(&["Herdr", "Browser"])), "a focused browser keeps cmd-f");
         assert!(!when.eval(&ctx(&["Herdr", "Mod mod = fork-board"])), "a mod keeps it too");
+    }
+
+    // HERDR: ctrl-cmd-f is the standard macOS full-screen key; it must not shadow (or be shadowed
+    // by) 0.1.13's cmd-f search.
+    #[test]
+    fn ctrl_cmd_f_is_full_screen_and_cmd_f_still_searches() {
+        let keys: serde_json::Value = serde_json::from_str(include_str!("../defaults/keys.macos.json")).unwrap();
+        assert_eq!(keys["global"]["ctrl-cmd-f"], "window.fullscreen");
+        let all: Vec<(String, String)> = keys.as_object().unwrap().values().filter_map(|c| c.as_object()).flat_map(|c| c.iter().map(|(k, v)| (k.clone(), v.to_string()))).collect();
+        assert_eq!(all.iter().filter(|(k, _)| k == "ctrl-cmd-f").count(), 1, "bound once, in no other context");
+        assert!(all.iter().any(|(k, v)| k == "cmd-f" && v.contains("search")), "cmd-f still searches");
+        assert!(super::parse(include_str!("../defaults/keys.macos.json")).is_ok());
+        assert!(crate::commands::find("window.fullscreen").is_some());
     }
 
     #[test]
