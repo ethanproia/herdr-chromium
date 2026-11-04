@@ -168,7 +168,7 @@ pub fn client(args: &[String]) -> i32 {
         Err(_) if args.first().is_some_and(|v| v == "feedback") => {
             let body = crate::feedback::draft(&args[1], "", 0, "agent", "other");
             println!("{}", serde_json::to_string_pretty(&body).unwrap_or_default());
-            eprintln!("Herdr must be open to review and send this feedback. Nothing was sent; core version and layout will reflect the open window.");
+            eprintln!("{} must be open to review and send this feedback. Nothing was sent; core version and layout will reflect the open window.", crate::brand::NAME);
             return 1;
         }
         Err(e) => return fail(&format!("no Herdr window at {}: {e}", socket().display())),

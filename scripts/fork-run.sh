@@ -79,13 +79,10 @@ case $cmd in
   down)
     # Every herdr-app on this home, not only the one in the pid file: a second `up`
     # overwrites the file, and a stranded app keeps its core alive.
-    pids=$(ps -E -ax -o pid=,command= | awk -v want="HERDR_APP_HOME=$home" '
-      { app = 0; mine = 0
-        for (i = 2; i <= NF; i++) {
-          if (i == 2 && $i ~ /\/herdr-app$/) app = 1
-          if ($i == want) mine = 1
-        }
-        if (app && mine) print $1 }')
+    # Found by what they hold open, never by binary name (a release copy or a renamed build counts too):
+    # an app holds this home's socket; cores and holders hold files in its private state dir.
+    holding() { lsof -Fpn 2>/dev/null | awk -v s="$1" '/^p/ { p = substr($0, 2) } /^n/ && index($0, s) { print p }' | sort -u; }
+    pids=$(holding "$home/herdr-app.sock")
     for pid in $pids; do kill "$pid" 2>/dev/null || true; done
     # Wait for the apps to exit (up to 20 s). `|| true`: under set -e a failed kill -0 here
     # used to end the script before the cleanup below ran.
@@ -99,7 +96,7 @@ case $cmd in
     # runs). Holders outlive their core by design, and a quitting app parks its terminals just
     # after it exits, which starts a core: end whatever has files open in this home's private
     # state dir until it has been quiet for 3 s (at most 20 s), then remove that state.
-    mine() { lsof -c herdr-cor -Fpn 2>/dev/null | awk -v s="/herdr-core/$HC_SESSION/" '/^p/ { p = substr($0, 2) } /^n/ && index($0, s) { print p }' | sort -u; }
+    mine() { holding "/herdr-core/$HC_SESSION/"; }
     quiet=0
     for _ in $(seq 20); do
       left=$(mine)

@@ -147,6 +147,51 @@ export function mergeAppend(loaded, text, disk) {
   return text + add;
 }
 
+// Where the editing caret goes after an append replaces the row list.
+// Rows before the suffix keep their index. The empty row after a final newline is the
+// caret: appended lines land before it, so that caret follows the new trailing empty row.
+// -1 unbinds. The row under the caret changed (the suffix continued it, a fence swallowed
+// it, or that empty row was filled), and the next keystroke would write the text box
+// back over the append. Index 0 is the title's own text box, so an empty title is unbound
+// instead of moved onto the body box.
+export function activeAfterAppend(prev, next, active) {
+  if (active < 0 || active >= prev.length) return -1;
+  if (prev[prev.length - 1] === "" && active === prev.length - 1) {
+    if (active > 0 && next.length > 1 && next[next.length - 1] === "") return next.length - 1;
+    return -1;
+  }
+  if (active >= next.length || next[active] !== prev[active]) return -1;
+  return active;
+}
+
+// First read of the note. A file that exists but cannot be read must not open as an empty note:
+// a later save would replace it. A missing file opens empty. A string, including "", was read.
+export function loadAction(text, exists) {
+  if (typeof text === "string") return "open";
+  return exists ? "unread" : "open";
+}
+
+// A later folder watch. An open note is refreshed in place (a failed re-read must not clear it).
+// With no note yet: a string opens, a missing file opens empty, and a file that still cannot be read waits.
+export function watchLoad(hasNote, text, exists) {
+  if (hasNote) return "refresh";
+  return loadAction(text, exists) === "unread" ? "hold" : "open";
+}
+
+// Whether a draft file should be offered. `noteText` undefined: the note is not loaded, so the
+// draft must be kept and shown, not deleted because it could not be compared.
+export function draftOffer(draft, noteText) {
+  if (draft === null || draft === undefined) return "none";
+  if (noteText === undefined) return "offer";
+  return draft === noteText ? "clear" : "offer";
+}
+
+// Restore while the note is still unreadable defers. Discard always drops the draft.
+export function restoreChoice(keep, hasNote) {
+  if (!keep) return "discard";
+  return hasNote ? "restore" : "defer";
+}
+
 // What Restore should do with a draft. `base` is the text the draft was edited from
 // (null: the file did not exist; undefined: a draft with no recorded base).
 // "save" writes the draft. "merge" keeps an append that landed on that base. "conflict" does not overwrite.

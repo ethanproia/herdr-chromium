@@ -10,6 +10,7 @@ import { fadeLabel, over } from "../scroll.js";
 import { icon, openInTab, openRegistry } from "../look.js";
 import { inboxSnapshot } from "../notes.js";
 import { badgeState, inboxHeight, INBOX_W, BELL_MENU_H } from "../inbox-pure.js";
+import { tabbarMenuHeight, tabBarPins } from "../pure.js";
 
 const SIDE = (id) => `panels.side.${id}`;
 
@@ -44,8 +45,6 @@ export default class Tabs {
     if (tool) return openInTab(tool, space);
     run("tab.new", { name: "Browser", space, mod: "browser", props: { id: `b${Date.now().toString(36)}` } });
   }
-
-  enabledPanels() { return [...(shared("workspace.panels") ?? ["files", "changes"])]; }
 
   // Switching space shows that space's choice (closed if it never had one); opening or closing the panel records it.
   syncPanel() {
@@ -128,19 +127,22 @@ export default class Tabs {
     const panel = find(layout(), "panel"), body = find(layout(), "panel-body");
     // Top right: only the tools the person pinned, as compact icon buttons (Chrome's pinned tabs). Files and Changes
     // are not always-on: they live in the + menu's Tools and open in the side panel (Ethan, 18:20 via orchestrator).
-    const pins = (() => { const p = shared("panels.pins"); return Array.isArray(p) ? p : []; })();
-    const panelButton = (id) => {
-      const tool = this.reg.tools.find((x) => x.id === id);
+    const pins = tabBarPins((() => { const p = shared("panels.pins"); return Array.isArray(p) ? p : []; })(), this.reg.tools);
+    const panelButton = (pin) => {
+      const { id } = pin;
       const on = panel && !panel.hidden && body?.active === id;
+      const mark = pin.icon
+        ? svg(pin.icon).size(14)
+        : div().size(14).flex_none().text_size(12).child(pin.letter);
       return div().id(`panel-${id}`).size(26).flex_none().flex().items_center().justify_center().rounded(6)
         .bg(on ? t.selected : t.chrome).text_color(on ? t.foreground : t.muted)
-        .hover((s) => s.bg(t.hover)).on_mouse_down("left", stop).tooltip(tool?.name ?? id)
+        .hover((s) => s.bg(t.hover)).on_mouse_down("left", stop).tooltip(pin.name)
         .on_mouse_down("right", (_e, cx) => { cx.stop_propagation(); openOverlay({ mod: SELF, kind: "popup", width: 260, height: 8 + 3 * 32 + 9, props: { role: "menu", tab: "side", target: { tool: id } } }); })
         .on_click(() => {
           if (on) run("layout.hide", { id: "panel" });
           else if (!(body?.children ?? []).some((c) => c.id === id)) openInSide(id, "pinned");
           else { run("layout.select", { stack: "panel-body", child: id }); run("layout.show", { id: "panel" }); }
-        }).child(tool?.icon ? svg(tool.icon).size(14) : div().size(14));
+        }).child(mark);
     };
     // The notification bell, before the pinned tools: a dot while anything is unread (the blocked colour when an
     // error is waiting), bell-off under Do Not Disturb. Stock Herdr has no notification API: no bell at all.
@@ -162,12 +164,16 @@ export default class Tabs {
       .on_mouse_up("left", () => { this.pressed = null; })
       .on_scroll_wheel((e) => { if (Math.abs(e.delta.y) >= 1) run(e.delta.y > 0 ? "tab.prev" : "tab.next"); })
       // Right-click on the empty part of the bar: new tab, tools, pinned panels, rename space (shared menu rows).
-      .on_mouse_down("right", () => openOverlay({ mod: SELF, kind: "popup", width: 260, height: 520, props: { role: "menu", tab: "tabbar", target: { space: space?.id } } }))
+      .on_mouse_down("right", () => {
+        const reg = shared("core.registry");
+        const tools = Array.isArray(reg?.tools) ? reg.tools : [];
+        openOverlay({ mod: SELF, kind: "popup", width: 260, height: tabbarMenuHeight(tools, space?.id), props: { role: "menu", tab: "tabbar", target: { space: space?.id } } });
+      })
       // + sits right after the last tab, as in Chrome, Figma and Paper (it scrolls with the tabs).
       .child(h_flex().id("tab-scroll").flex_1().min_w(0).h_full().items_center().gap(3).overflow_x_scrollbar().children(shown.map(item))
         .child(button("tab-new", "+", () => openOverlay({ mod: SELF, kind: "popup", width: 260, height: 575, props: { role: "plus" } }))))
       .when(badge.show, (el) => el.child(bell()))
-      .children(pins.map((id) => panelButton(id)))
+      .children(pins.map((pin) => panelButton(pin)))
       .when(window()?.buttons, (el) => el.child(button("minimize", "−", () => run("window.minimize")))
         .child(button("maximize", "□", () => run("window.maximize")))
         .child(button("close-window", svg(icon("close")).size(13), () => run("window.close"))));

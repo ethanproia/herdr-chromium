@@ -6,13 +6,15 @@ import { v_flex } from "gpui-base";
 import { run, props, closeOverlay, openOverlay, theme, keys, terminals, spaces, panes, agents, exec, shared, setShared } from "herdr";
 import { SELF } from "../self.js";
 import { icon, menuRow, keysym, copyText, groupLabel, openInTab } from "../look.js";
-import { menuHeight } from "../pure.js";
+import { menuHeight, tabbarMenuItems, breaksBefore, MENU_GROUP_LABEL_H } from "../pure.js";
 import { sectionLocked } from "../sections-pure.js";
-import { escapeLabel, tabLeaf } from "../labels.js";
+import { tabLeaf } from "../labels.js";
+import { encodeLink } from "../encode-link.js";
+import { runOverlayItem } from "../overlay-action.js";
 import { sideMenuItems, runSideAction } from "./side-strip.js";
 import { sections, toggleFromClick, toggleSidebar, isCollapsed } from "./sections.js";
-import { inboxSnapshot } from "../notes.js";
-import { bellMenuItems } from "../inbox-pure.js";
+import { inboxSnapshot, markRead, clearNotifications, setDnd } from "../notes.js";
+import { bellMenuItems, bellMenuPlan } from "../inbox-pure.js";
 
 // Where a space is now: its first terminal's live folder, else where it was made.
 function place(s) {
@@ -57,16 +59,9 @@ function items(p, git) {
     }
     case "tabbar": {
       // Right-click on the tab bar's empty space: a new tab, the + menu's tools, the side-panel tools as pin checks
-      // (pinned ones show at the top right), and renaming the space.
+      // (pinned ones show at the top right), and renaming the space. The tab strip sizes its popup from this list.
       const reg = shared("core.registry"), tools = Array.isArray(reg?.tools) ? reg.tools : [];
-      const tabTools = tools.filter((x) => (x.places ?? []).includes("tab") && x.id !== "terminal");
-      const sideTools = tools.filter((x) => (x.places ?? []).includes("side"));
-      return [
-        ["New Tab", "tab.new", { space: tg.space }],
-        ...tabTools.map((x) => [x.name, "tool.open", { id: x.id, icon: x.icon }]),
-        ...sideTools.map((x) => [x.name, "panel.pin", { tool: x.id, icon: x.icon }]),
-        ["Rename Space…", "space.rename", { id: tg.space }],
-      ];
+      return tabbarMenuItems(tools, tg.space);
     }
     case "tab":
       return [
@@ -157,7 +152,7 @@ function toggleSwitch(t, on, locked) {
 const SPACE_COLORS = { ansi6: ["Teal", "#22a99a"], ansi3: ["Orange", "#e3814f"], ansi4: ["Blue", "#5b8def"], ansi5: ["Violet", "#8b7cf6"], ansi2: ["Green", "#3fae6a"], ansi1: ["Pink", "#d9649a"] };
 
 // The height of a groupLabel (6 top + 12 text + 6 bottom, as the + menu counts it).
-export const LABEL_H = 30;
+export const LABEL_H = MENU_GROUP_LABEL_H;
 
 function menuIcon(command, args) {
   if (command === "pane.split") return icon(args?.direction === "down" ? "split-down" : "split-right");
@@ -195,21 +190,19 @@ function menuIcon(command, args) {
 function copyLink({ pane, terminal }) {
   const p = panes().find((x) => x.pane === pane);
   const term = terminal && terminals().find((x) => x.address === terminal);
-  const label = escapeLabel(term?.name || p?.title || terminal || pane || "panel");
-  copyText(terminal ? `[${label}](herdr:agent/${terminal})` : `[${label}](herdr:pane/${pane})`);
+  const label = term?.name || p?.title || terminal || pane || "panel";
+  return copyText(encodeLink({ text: label, href: terminal ? `herdr:agent/${terminal}` : `herdr:pane/${pane}` }));
 }
 
 // A tab's link, as Notepad tab mentions: "[Space › Tab](herdr:tab/<tab id>)".
 function copyTabLink({ id, space }) {
   const sp = spaces().find((s) => s.id === space) ?? spaces().find((s) => (s.tabs ?? []).some((t) => t.id === id));
-  const label = escapeLabel(`${sp?.name ?? "Space"} › ${tabLeaf(sp?.tabs, id)}`);
-  copyText(`[${label}](herdr:tab/${id})`);
+  return copyText(encodeLink({ text: `${sp?.name ?? "Space"} › ${tabLeaf(sp?.tabs, id)}`, href: `herdr:tab/${id}` }));
 }
 
 // A space's link: "[name](herdr:space/<space id>)".
 function copySpaceLink({ id }) {
-  const label = (spaces().find((s) => s.id === id)?.name ?? "Space").replace(/[\\\]]/g, "\\$&");
-  copyText(`[${label}](herdr:space/${id})`);
+  return copyText(encodeLink({ text: spaces().find((s) => s.id === id)?.name ?? "Space", href: `herdr:space/${id}` }));
 }
 
 // The key bound to a command, for the hint on the right.
@@ -220,10 +213,8 @@ function shortcut(name, args) {
   return k ? keysym(Array.isArray(k.keys) ? k.keys[0] : k.keys) : "";
 }
 
-// A hairline sits before some items, which groups them.
 // A side-panel tool is pinned when it's in shared panels.pins (pinned tools show at the top right of the tab bar).
 const pinned = (id) => { const p = shared("panels.pins"); return Array.isArray(p) && p.includes(id); };
-const breaksBefore = (list, i) => i > 0 && ((list[i][1] === "sidebar.toggle" && list[i - 1][1] === "sidebar.collapse") || (list[i][1] === "tool.open" && list[i - 1][1] !== "tool.open") || (list[i][1] === "panel.pin" && list[i - 1][1] !== "panel.pin") || (list[i][1] === "space.rename" && list[i - 1][1] === "panel.pin") || list[i][1] === "machine.add" || list[i][1].endsWith(".close") || list[i][1] === "app.help" || list[i][1] === "terminal.right_click" || list[i][1] === "copy-link" || (list[i][1] === "space.move" && list[i - 1][1] !== "space.move") || list[i][1] === "tab.rename" || (list[i][1] === "app.theme" && list[i - 1][1] !== "app.theme") || list[i][1] === "notifications.clear_all");
 
 export default class Menu {
   init(_props, cx) {
@@ -248,9 +239,29 @@ export default class Menu {
     if (it[1] === "sidebar.toggle") { toggleFromClick(it[2].key); return cx?.notify?.(); }
     if (it[1] === "sidebar.collapse") { closeOverlay(props()?.overlay); return toggleSidebar(); }
     if (it[1] === "machine.add") { closeOverlay(props()?.overlay); return run("mod.open", { name: "machine-add" }); }
-    if (it[1] === "notifications.toggle_dnd") { run(it[1], it[2]); return cx?.notify?.(); }   // a check flips in place
+    // The bell rows are not host commands. Same three calls as the inbox header (markRead / setDnd /
+    // clearNotifications). Do Not Disturb stays open so its check can flip; the other two close.
+    const bell = bellMenuPlan(it[1], inboxSnapshot());
+    if (bell) {
+      if (!bell.stay) closeOverlay(props()?.overlay);
+      if (bell.fn === "markRead") markRead(bell.arg);
+      else if (bell.fn === "clearNotifications") clearNotifications(bell.arg);
+      else if (bell.fn === "setDnd") setDnd(bell.arg);
+      if (bell.stay) cx?.notify?.();
+      return;
+    }
     if (it[1] === "panel.pin") { runSideAction(pinned(it[2].tool) ? "side.unpin" : "side.pin", { tool: it[2].tool }); return cx?.notify?.(); }   // a check flips in place
     if (it[1] === "tool.open") { closeOverlay(props()?.overlay); const tool = (shared("core.registry")?.tools ?? []).find((x) => x.id === it[2].id); return tool && openInTab(tool, spaces().find((x) => x.active)?.id); }
+    // Copy starts pbcopy before this popup closes (a closed popup can drop the pending copy and its
+    // notification); the popup closes when the copy settles, or after 10 s. Same helper as the Notepad.
+    if (it[1] === "copy-link" || it[1] === "copy-tab-link" || it[1] === "copy-space-link") {
+      const work = it[1] === "copy-link" ? () => copyLink(it[2]) : it[1] === "copy-tab-link" ? () => copyTabLink(it[2]) : () => copySpaceLink(it[2]);
+      const overlay = props()?.overlay;
+      // The 10 s cap sleeps after this click returns, so it uses an AsyncContext from cx.spawn.
+      if (cx?.spawn) cx.spawn(async (cx) => { await runOverlayItem(work, () => closeOverlay(overlay), true, undefined, (ms) => cx.sleep(ms))?.catch?.(() => {}); });
+      else runOverlayItem(work, () => closeOverlay(overlay), true)?.catch?.(() => {});
+      return;
+    }
     closeOverlay(props()?.overlay);
     if (it[1] === "machine.fold") { const cur = shared("machines.folded") ?? []; return setShared("machines.folded", cur.includes(it[2].key) ? cur.filter((k) => k !== it[2].key) : [...cur, it[2].key]); }
     if (it[1] === "space.color") return setShared("space.colors", { ...(shared("space.colors") ?? {}), [it[2].id]: it[2].color });
@@ -261,13 +272,10 @@ export default class Menu {
       if (!a || a.status === "working" || a.status === "blocked") return;
       return openOverlay({ mod: "confirm", kind: "dialog", width: 380, height: 170, props: { title: "Close agent?", detail: `${a.space_name ? `${a.space_name} · ` : ""}${a.program?.name ?? it[2].terminal} will end.`, command: { name: "terminal.kill", args: { terminal: it[2].terminal } } } });
     }
-    if (it[1] === "copy-space-link") return copySpaceLink(it[2]);
     if (it[1] === "worktree") openOverlay({ mod: "worktree", kind: "dialog", ...(it[2].action === "open" ? { width: 560, height: 480 } : { width: 440, height: 260 }), props: it[2] });
     // Splits open their new pane as the New panel.
     else if (it[1] === "pane.split") run("pane.split", { ...it[2], mod: SELF, props: { role: "new-panel", direction: it[2].direction } });
     else if (it[1].startsWith("side.")) runSideAction(it[1], it[2]);
-    else if (it[1] === "copy-link") copyLink(it[2]);
-    else if (it[1] === "copy-tab-link") copyTabLink(it[2]);
     else run(it[1], it[2]);
   }
 
