@@ -891,7 +891,7 @@ fn read_remote(machine: &str, path: &str) -> Result<Option<String>, String> {
         return Ok(None);
     }
     if out.len() as u64 > crate::mod_files::LIMIT {
-        return Err("Text file exceeds 1 MiB".into());
+        return Err(format!("Text file exceeds {} MiB", crate::mod_files::LIMIT >> 20));
     }
     Ok(Some(String::from_utf8_lossy(&out).into_owned()))
 }
