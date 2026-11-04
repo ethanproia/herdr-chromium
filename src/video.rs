@@ -121,6 +121,11 @@ impl<B: Backend> Clips<B> {
         clip.still.clone()
     }
 
+    /// Playing, position and length of clip `id` (the controls bar shows these).
+    pub fn status(&self, id: &str) -> Option<(bool, f64, Option<f64>)> {
+        self.clips.get(id).map(|c| (c.player.is_some(), c.time, c.duration))
+    }
+
     /// Whether any clip is playing (the window keeps drawing frames while one is).
     pub fn any_playing(&self) -> bool {
         self.clips.values().any(|c| c.player.is_some())
@@ -131,7 +136,9 @@ impl<B: Backend> Clips<B> {
         if clip.player.is_some() {
             return Ok(());
         }
-        let (spec, at) = (clip.spec.clone(), clip.time);
+        // Played again after the end: from the start.
+        let at = if clip.duration.is_some_and(|d| clip.time >= d - 0.05) { 0.0 } else { clip.time };
+        let spec = clip.spec.clone();
         let path = self.path(&spec)?;
         // The cap: the clip playing longest makes room.
         while self.clips.values().filter(|c| c.player.is_some()).count() >= MAX_PLAYING {
@@ -301,6 +308,9 @@ fn render(spec: &VideoSpec, element: ElementId, key: Option<SharedString>, refin
     }
     #[cfg(not(target_os = "macos"))]
     let _ = (picture, ObjectFit::Contain);
+    if spec.controls {
+        el = el.child(controls(&id));
+    }
     let probe_id = id.clone();
     el.child(
         canvas(
@@ -321,6 +331,91 @@ fn render(spec: &VideoSpec, element: ElementId, key: Option<SharedString>, refin
         .size_full(),
     )
     .into_any_element()
+}
+
+/// `controls: true`: a bar along the bottom with play/pause, a scrub track (click or drag to seek)
+/// and the time. It drives the clip the way `videoPlay` / `videoPause` / `videoSeek` do.
+fn controls(id: &str) -> AnyElement {
+    use gpui::{MouseButton, Pixels, hsla, px, relative};
+    let Some((playing, time, duration)) = with_clips(|c| c.status(id)) else { return div().into_any_element() };
+    let track = std::rc::Rc::new(std::cell::Cell::new(gpui::Bounds::<Pixels>::default()));
+    let (toggle, down, drag) = (id.to_owned(), id.to_owned(), id.to_owned());
+    let seek_at = move |id: &str, x: Pixels, bounds: gpui::Bounds<Pixels>| {
+        if let Some(d) = duration {
+            let _ = with_clips(|c| c.seek(id, fraction_at(f32::from(x), f32::from(bounds.origin.x), f32::from(bounds.size.width)) * d));
+        }
+    };
+    let (track_down, track_drag, track_probe) = (track.clone(), track.clone(), track);
+    let white = hsla(0.0, 0.0, 1.0, 1.0);
+    div()
+        .absolute()
+        .left_0()
+        .right_0()
+        .bottom_0()
+        .h(px(28.0))
+        .px(px(8.0))
+        .gap(px(8.0))
+        .flex()
+        .items_center()
+        .bg(hsla(0.0, 0.0, 0.0, 0.55))
+        .text_color(white)
+        .text_xs()
+        .child(
+            div()
+                .id(SharedString::from(format!("{id}-video-play")))
+                .w(px(16.0))
+                .cursor_pointer()
+                .child(if playing { "❚❚" } else { "▶" })
+                .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                    cx.stop_propagation();
+                    with_clips(|c| if playing { c.pause(&toggle) } else { let _ = c.play(&toggle, Instant::now()); });
+                    window.refresh();
+                }),
+        )
+        .child(
+            div()
+                .id(SharedString::from(format!("{id}-video-track")))
+                .flex_1()
+                .h(px(12.0))
+                .flex()
+                .items_center()
+                .cursor_pointer()
+                .child(
+                    div().w_full().h(px(4.0)).rounded(px(2.0)).bg(hsla(0.0, 0.0, 1.0, 0.3)).relative().child(
+                        div().absolute().left_0().top_0().bottom_0().rounded(px(2.0)).bg(white).w(relative(duration.map_or(0.0, |d| fraction(time, d)))),
+                    ),
+                )
+                .child(canvas(move |bounds, _, _| track_probe.set(bounds), |_, _, _, _| {}).absolute().size_full())
+                .on_mouse_down(MouseButton::Left, move |e, window, cx| {
+                    cx.stop_propagation();
+                    seek_at(&down, e.position.x, track_down.get());
+                    window.refresh();
+                })
+                .on_mouse_move(move |e, window, _| {
+                    if e.pressed_button == Some(MouseButton::Left) && track_drag.get().contains(&e.position) {
+                        seek_at(&drag, e.position.x, track_drag.get());
+                        window.refresh();
+                    }
+                }),
+        )
+        .child(format!("{} / {}", clock(time), duration.map_or("--:--".into(), clock)))
+        .into_any_element()
+}
+
+/// How far along `time` is, 0..1.
+fn fraction(time: f64, duration: f64) -> f32 {
+    if duration > 0.0 { (time / duration).clamp(0.0, 1.0) as f32 } else { 0.0 }
+}
+
+/// Where a click at `x` falls on a track starting at `left`, `width` wide, 0..1.
+fn fraction_at(x: f32, left: f32, width: f32) -> f64 {
+    if width > 0.0 { ((x - left) / width).clamp(0.0, 1.0) as f64 } else { 0.0 }
+}
+
+/// `m:ss`, or `h:mm:ss` from an hour.
+fn clock(seconds: f64) -> String {
+    let s = seconds.max(0.0).round() as u64;
+    if s >= 3600 { format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60) } else { format!("{}:{:02}", s / 60, s % 60) }
 }
 
 /// herdr's `videoPlay`, `videoPause`, `videoSeek`, `nextVideoEvent`.
