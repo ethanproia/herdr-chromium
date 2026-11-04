@@ -5,7 +5,7 @@ import { div, svg } from "gpui-kit";
 import { v_flex } from "gpui-base";
 import { run, props, closeOverlay, openOverlay, theme, keys, terminals, spaces, panes, agents, exec, shared, setShared } from "herdr";
 import { SELF } from "../self.js";
-import { icon, menuRow, keysym, copyText, groupLabel } from "../look.js";
+import { icon, menuRow, keysym, copyText, groupLabel, openInTab } from "../look.js";
 import { menuHeight } from "../pure.js";
 import { sectionLocked } from "../sections-pure.js";
 import { escapeLabel, tabLeaf } from "../labels.js";
@@ -51,6 +51,19 @@ function items(p, git) {
           : []),
         ...(parent ? [[`Send Back to ${parent.name || parent.address}`, "terminal.park", { terminal: term.address }]] : []),
         ["Close Pane", "pane.close", { pane: tg.pane }],
+      ];
+    }
+    case "tabbar": {
+      // Right-click on the tab bar's empty space: a new tab, the + menu's tools, the side-panel tools as pin checks
+      // (pinned ones show at the top right), and renaming the space.
+      const reg = shared("core.registry"), tools = Array.isArray(reg?.tools) ? reg.tools : [];
+      const tabTools = tools.filter((x) => (x.places ?? []).includes("tab") && x.id !== "terminal");
+      const sideTools = tools.filter((x) => (x.places ?? []).includes("side"));
+      return [
+        ["New Tab", "tab.new", { space: tg.space }],
+        ...tabTools.map((x) => [x.name, "tool.open", { id: x.id, icon: x.icon }]),
+        ...sideTools.map((x) => [x.name, "panel.pin", { tool: x.id, icon: x.icon }]),
+        ["Rename Space…", "space.rename", { id: tg.space }],
       ];
     }
     case "tab":
@@ -155,6 +168,7 @@ function menuIcon(command, args) {
   if (command === "sidebar.collapse") return icon("sidebar");
   if (command === "machine.add") return icon("plus");
   if (command === "sidebar.toggle") return icon({ spaces: "spaces", agents: "agents", addMachine: "plus", statusBar: "status-bar" }[args?.key] ?? "panel");
+  if (command === "tool.open" || command === "panel.pin") return args?.icon ?? icon("panel");
   if (command === "side.pin") return icon("pin");
   if (command === "side.unpin") return icon("unpin");
   if (command === "side.tab") return icon("turn-into");
@@ -199,7 +213,9 @@ function shortcut(name, args) {
 }
 
 // A hairline sits before some items, which groups them.
-const breaksBefore = (list, i) => i > 0 && ((list[i][1] === "sidebar.toggle" && list[i - 1][1] === "sidebar.collapse") || list[i][1] === "machine.add" || list[i][1].endsWith(".close") || list[i][1] === "app.help" || list[i][1] === "terminal.right_click" || list[i][1] === "copy-link" || (list[i][1] === "space.move" && list[i - 1][1] !== "space.move") || list[i][1] === "tab.rename" || (list[i][1] === "app.theme" && list[i - 1][1] !== "app.theme"));
+// A side-panel tool is pinned when it's in shared panels.pins (pinned tools show at the top right of the tab bar).
+const pinned = (id) => { const p = shared("panels.pins"); return Array.isArray(p) && p.includes(id); };
+const breaksBefore = (list, i) => i > 0 && ((list[i][1] === "sidebar.toggle" && list[i - 1][1] === "sidebar.collapse") || (list[i][1] === "tool.open" && list[i - 1][1] !== "tool.open") || (list[i][1] === "panel.pin" && list[i - 1][1] !== "panel.pin") || (list[i][1] === "space.rename" && list[i - 1][1] === "panel.pin") || list[i][1] === "machine.add" || list[i][1].endsWith(".close") || list[i][1] === "app.help" || list[i][1] === "terminal.right_click" || list[i][1] === "copy-link" || (list[i][1] === "space.move" && list[i - 1][1] !== "space.move") || list[i][1] === "tab.rename" || (list[i][1] === "app.theme" && list[i - 1][1] !== "app.theme"));
 
 export default class Menu {
   init(_props, cx) {
@@ -224,6 +240,8 @@ export default class Menu {
     if (it[1] === "sidebar.toggle") { toggleFromClick(it[2].key); return cx?.notify?.(); }
     if (it[1] === "sidebar.collapse") { closeOverlay(props()?.overlay); return toggleSidebar(); }
     if (it[1] === "machine.add") { closeOverlay(props()?.overlay); return run("mod.open", { name: "machine-add" }); }
+    if (it[1] === "panel.pin") { runSideAction(pinned(it[2].tool) ? "side.unpin" : "side.pin", { tool: it[2].tool }); return cx?.notify?.(); }   // a check flips in place
+    if (it[1] === "tool.open") { closeOverlay(props()?.overlay); const tool = (shared("core.registry")?.tools ?? []).find((x) => x.id === it[2].id); return tool && openInTab(tool, spaces().find((x) => x.active)?.id); }
     closeOverlay(props()?.overlay);
     if (it[1] === "machine.fold") { const cur = shared("machines.folded") ?? []; return setShared("machines.folded", cur.includes(it[2].key) ? cur.filter((k) => k !== it[2].key) : [...cur, it[2].key]); }
     if (it[1] === "space.color") return setShared("space.colors", { ...(shared("space.colors") ?? {}), [it[2].id]: it[2].color });
@@ -253,7 +271,8 @@ export default class Menu {
     if (!live(this.at)) { const k = list.findIndex((_, i) => live(i)); if (k >= 0) this.at = k; }
     const step = (d) => { for (let n = 1; n <= list.length; n++) { const k = (this.at + d * n + list.length * n) % list.length; if (live(k)) return k; } return this.at; };
     const breaks = list.filter((_, i) => breaksBefore(list, i)).length;
-    const label = props()?.tab === "sidebar" ? "Show" : null;   // the + menu's small group label, for the toggles menu
+    const label = props()?.tab === "sidebar" ? "Show" : props()?.tab === "tabbar" ? "Pinned" : null;   // the + menu's small group label, for a toggles group
+    const labelBefore = (it, prev) => (it[1] === "sidebar.toggle" && prev?.[1] !== "sidebar.toggle") || (it[1] === "panel.pin" && prev?.[1] !== "panel.pin");
     // Same look as the + menu: 32px rows, 16px line icon, name, faint shortcut; one highlight that follows
     // the pointer and the arrow keys; hairlines between groups. The root states its height (a popup has none of its own).
     return v_flex()
@@ -275,15 +294,15 @@ export default class Menu {
         list.map((it, i) =>
           v_flex()
             .when(breaksBefore(list, i), (el) => el.child(div().mx(-4).my(4).h(1).bg(t.border)))
-            .when(Boolean(label) && it[1] === "sidebar.toggle" && list[i - 1]?.[1] !== "sidebar.toggle", (el) => el.child(groupLabel(t, label)))
+            .when(Boolean(label) && labelBefore(it, list[i - 1]), (el) => el.child(groupLabel(t, label)))
             .child(menuRow({
               t, id: `mi-${i}`,
               // Show / hide rows (shadcn DropdownMenuCheckboxItem, no switches in menus): a clear check on the right when
               // on, the row's icon dimmed when off.
-              icon: it[1] === "space.color" ? div().size(12).rounded(6).bg(SPACE_COLORS[it[2].color][1]) : svg(menuIcon(it[1], it[2])).size(16).when((it[1] === "sidebar.toggle" && !sections()[it[2].key]) || !live(i), (el) => el.text_color(t.dim)),
+              icon: it[1] === "space.color" ? div().size(12).rounded(6).bg(SPACE_COLORS[it[2].color][1]) : svg(menuIcon(it[1], it[2])).size(15).when((it[1] === "sidebar.toggle" && !sections()[it[2].key]) || (it[1] === "panel.pin" && !pinned(it[2].tool)) || !live(i), (el) => el.text_color(t.dim)),
               name: it[0], active: i === this.at && live(i), enabled: live(i),
               // A toggle shows its state as a check on the right, where other menus show a shortcut.
-              hint: it[1] === "space.color" ? (((shared("space.colors") ?? {})[it[2].id] ?? "ansi6") === it[2].color ? svg(icon("check")).size(14).text_color(t.foreground) : "") : it[1] === "sidebar.collapse" ? shortcut(`${SELF}.toggle-sidebar`) : it[1] === "sidebar.toggle" ? (sections()[it[2].key] ? svg(icon("check")).size(14).text_color(t.foreground).when(sectionLocked(sections(), it[2].key), (el) => el.tooltip("At least one list stays on")) : "") : shortcut(it[1], it[2]),
+              hint: it[1] === "panel.pin" ? (pinned(it[2].tool) ? svg(icon("check")).size(14).text_color(t.foreground) : "") : it[1] === "space.color" ? (((shared("space.colors") ?? {})[it[2].id] ?? "ansi6") === it[2].color ? svg(icon("check")).size(14).text_color(t.foreground) : "") : it[1] === "sidebar.collapse" ? shortcut(`${SELF}.toggle-sidebar`) : it[1] === "sidebar.toggle" ? (sections()[it[2].key] ? svg(icon("check")).size(14).text_color(t.foreground).when(sectionLocked(sections(), it[2].key), (el) => el.tooltip("At least one list stays on")) : "") : shortcut(it[1], it[2]),
               onClick: (_e, cx) => this.choose(i, cx),
               onHover: (cx) => { if (this.at !== i) { this.at = i; cx.notify(); } },
             }))),

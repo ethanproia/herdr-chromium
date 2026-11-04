@@ -436,6 +436,10 @@ fn report_viewport(id: &str) {
 /// script for the loaded page and releases the held input. Measured: input sent the moment
 /// loading ends (or on the first paint after it) is dropped by Chromium under load.
 pub(crate) fn on_loading(id: &str, loading: bool) {
+    if loading {
+        // A new document: the probe world is made again (outside `with_host`: it may answer the app).
+        handlers::world_reset(id);
+    }
     let probe = with_host(|h| {
         let e = h.browsers.get_mut(id)?;
         if loading {
@@ -473,6 +477,17 @@ fn drop_stale_input(queued: &mut Vec<InputEvent>) -> usize {
     let n = queued.len();
     queued.clear();
     n
+}
+
+/// What a debug line may say about an input event: its type, never what was typed or where.
+fn input_kind(event: &InputEvent) -> &'static str {
+    match event {
+        InputEvent::Mouse { .. } => "mouse",
+        InputEvent::Wheel { .. } => "wheel",
+        InputEvent::Key { .. } => "key",
+        InputEvent::Text { .. } => "text",
+        InputEvent::Ime(_) => "ime",
+    }
 }
 
 /// Browsers whose readiness probe is waiting get a mouse move at the pointer's position every
@@ -1005,8 +1020,8 @@ fn browser_msg(m: AppToHost) {
         M::Navigate { id, .. } | M::Back { id } | M::Forward { id } | M::Reload { id, .. } | M::Stop { id } | M::Resize { id, .. }
         | M::Focus { id, .. } | M::SetZoom { id, .. } | M::Input { id, .. } | M::Edit { id, .. } | M::Find { id, .. } | M::StopFind { id, .. }
         | M::DevTools { id, .. } | M::Eval { id, .. } | M::Overlay { id, .. } | M::PickInfo { id, .. } | M::PickRelative { id, .. } | M::Styles { id, .. } | M::SetStyle { id, .. } | M::RevertStyle { id, .. } | M::SetVisible { id, .. } => id.clone(),
-        other => {
-            debug(format_args!("not a browser message, dropped: {}", encode(&other)));
+        _ => {
+            debug(format_args!("not a browser message, dropped"));
             return;
         }
     };
@@ -1086,7 +1101,7 @@ fn browser_msg(m: AppToHost) {
                     .is_some()
             })
             .unwrap_or(false);
-            debug(format_args!("{id}: input {} {}", if queued { "held" } else { "sent" }, encode(&event).chars().take(60).collect::<String>()));
+            debug(format_args!("{id}: input {} {}", if queued { "held" } else { "sent" }, input_kind(&event)));
             if !queued {
                 input(&host, event);
             }
@@ -1124,45 +1139,51 @@ fn browser_msg(m: AppToHost) {
         }
         // Pick payload (S4): fork-host implements; until then "nothing there".
         M::PickInfo { req, x, y, .. } => {
-            let call = handlers::pick_message(&id, req, x, y);
-            if host.send_dev_tools_message(Some(&call)) == 0 {
+            if let Some(call) = handlers::pick_message(&id, req, x, y)
+                && host.send_dev_tools_message(Some(&call)) == 0
+            {
                 handlers::eval_unsent(&id);
                 send(HostToApp::PickInfoResult { id, req, ok: false, selector: String::new(), label: String::new(), rect: herdr_browser_protocol::CssRect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 } });
             }
         }
         // HERDR: arrow keys while picking (parent, first child, siblings).
         M::PickRelative { req, ref from, step, .. } => {
-            let call = handlers::pick_relative_message(&id, req, from, step);
-            if host.send_dev_tools_message(Some(&call)) == 0 {
+            if let Some(call) = handlers::pick_relative_message(&id, req, from, step)
+                && host.send_dev_tools_message(Some(&call)) == 0
+            {
                 handlers::eval_unsent(&id);
                 send(HostToApp::PickInfoResult { id, req, ok: false, selector: String::new(), label: String::new(), rect: herdr_browser_protocol::CssRect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 } });
             }
         }
         // Style panel (S10): the host side is fork-host's slice; until it lands every request answers "no such element".
         M::Styles { req, ref node, ref props, .. } => {
-            let call = handlers::styles_message(&id, req, node, props);
-            if host.send_dev_tools_message(Some(&call)) == 0 {
+            if let Some(call) = handlers::styles_message(&id, req, node, props)
+                && host.send_dev_tools_message(Some(&call)) == 0
+            {
                 handlers::eval_unsent(&id);
                 send(HostToApp::StylesResult { id, req, ok: false, rows: vec![] });
             }
         }
         M::SetStyle { req, ref node, ref prop, ref value, .. } => {
-            let call = handlers::set_style_message(&id, req, node, prop, value.as_deref());
-            if host.send_dev_tools_message(Some(&call)) == 0 {
+            if let Some(call) = handlers::set_style_message(&id, req, node, prop, value.as_deref())
+                && host.send_dev_tools_message(Some(&call)) == 0
+            {
                 handlers::eval_unsent(&id);
                 send(HostToApp::StylesResult { id, req, ok: false, rows: vec![] });
             }
         }
         M::RevertStyle { req, ref node, .. } => {
-            let call = handlers::revert_style_message(&id, req, node);
-            if host.send_dev_tools_message(Some(&call)) == 0 {
+            if let Some(call) = handlers::revert_style_message(&id, req, node)
+                && host.send_dev_tools_message(Some(&call)) == 0
+            {
                 handlers::eval_unsent(&id);
                 send(HostToApp::StylesResult { id, req, ok: false, rows: vec![] });
             }
         }
         M::Overlay { req, epoch, query, .. } => {
-            let call = handlers::overlay_message(&id, req, epoch, &query);
-            if host.send_dev_tools_message(Some(&call)) == 0 {
+            if let Some(call) = handlers::overlay_message(&id, req, epoch, &query)
+                && host.send_dev_tools_message(Some(&call)) == 0
+            {
                 handlers::eval_unsent(&id);
                 send(HostToApp::OverlayRects { id, req, epoch, rects: vec![], frames: vec![] });
             }
@@ -1292,6 +1313,13 @@ fn write_png(s: &Surface, path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::popup_place;
+
+    #[test]
+    fn input_debug_lines_name_the_type_only() {
+        let typed = herdr_browser_protocol::InputEvent::Text { text: "hunter2".into() };
+        assert_eq!(super::input_kind(&typed), "text");
+        assert!(!format!("input sent {}", super::input_kind(&typed)).contains("hunter2"));
+    }
 
     #[test]
     fn a_new_load_drops_input_held_for_the_old_document() {

@@ -116,7 +116,7 @@ export default class Tabs {
           if (from !== null && from !== i) run("tab.move", { id: shown[from].id, index: space.tabs.findIndex((x) => x.id === c.id) + 1 });
           else run("tab.select", { id: c.id });
         })
-        .on_mouse_down("right", () => openOverlay({ mod: SELF, kind: "popup", width: 260, height: 220, props: { role: "menu", tab: "tab", target: { id: c.id, space: space.id } } }))
+        .on_mouse_down("right", (_e, cx) => { cx.stop_propagation(); openOverlay({ mod: SELF, kind: "popup", width: 260, height: 220, props: { role: "menu", tab: "tab", target: { id: c.id, space: space.id } } }); })
         .child(this.tabIcon(c, agentPane, program, t))
         .child(fadeLabel(this, `tabname-${c.id}`, { text: c.zoomed ? `${name} Z` : name, bg: over(t.chrome, chip), outer: (el) => el.min_w(0).max_w(170) }))
         .when(c.status === "working", (el) => el.child(svg("mods/workspace-chrome/spinner.svg").size(12).flex_none().text_color(t.working).spin(900)))
@@ -124,17 +124,21 @@ export default class Tabs {
         .when(c.active, (el) => el.child(div().id(`close-${c.id}`).text_color(t.dim).on_mouse_down("left", stop).on_click((_e, cx) => { cx.stop_propagation(); run("tab.close", { id: c.id }); }).child(svg(icon("close")).size(12))));
     };
     const panel = find(layout(), "panel"), body = find(layout(), "panel-body");
-    const enabled = this.enabledPanels();   // always shown, as today; a tool closed in the strip comes back pinned
-    const panelButton = (id, label, ico) => {
+    // Top right: only the tools the person pinned, as compact icon buttons (Chrome's pinned tabs). Files and Changes
+    // are not always-on: they live in the + menu's Tools and open in the side panel (Ethan, 18:20 via orchestrator).
+    const pins = (() => { const p = shared("panels.pins"); return Array.isArray(p) ? p : []; })();
+    const panelButton = (id) => {
+      const tool = this.reg.tools.find((x) => x.id === id);
       const on = panel && !panel.hidden && body?.active === id;
-      return h_flex().id(`panel-${id}`).h(26).px(8).gap(5).flex_none().items_center().rounded(6)
-        .text_size(12).bg(on ? t.selected : t.chrome).text_color(on ? t.foreground : t.muted)
-        .hover((s) => s.bg(t.hover)).on_mouse_down("left", stop)
+      return div().id(`panel-${id}`).size(26).flex_none().flex().items_center().justify_center().rounded(6)
+        .bg(on ? t.selected : t.chrome).text_color(on ? t.foreground : t.muted)
+        .hover((s) => s.bg(t.hover)).on_mouse_down("left", stop).tooltip(tool?.name ?? id)
+        .on_mouse_down("right", (_e, cx) => { cx.stop_propagation(); openOverlay({ mod: SELF, kind: "popup", width: 260, height: 8 + 3 * 32 + 9, props: { role: "menu", tab: "side", target: { tool: id } } }); })
         .on_click(() => {
           if (on) run("layout.hide", { id: "panel" });
           else if (!(body?.children ?? []).some((c) => c.id === id)) openInSide(id, "pinned");
           else { run("layout.select", { stack: "panel-body", child: id }); run("layout.show", { id: "panel" }); }
-        }).child(svg(ico).size(14)).child(label);
+        }).child(tool?.icon ? svg(tool.icon).size(14) : div().size(14));
     };
     // Stock 0.1.12's rule: in a windowed macOS (titlebar none) the window buttons sit over the layout at
     // traffic_lights; when the sidebar is narrower than them (the 44px rail), the tabs start after them.
@@ -145,11 +149,12 @@ export default class Tabs {
     return h_flex().size_full().min_w(0).pl(lightsPadding).pr(10).gap(3).items_center().bg(t.chrome).border_b(1).border_color(t.border)
       .on_mouse_up("left", () => { this.pressed = null; })
       .on_scroll_wheel((e) => { if (Math.abs(e.delta.y) >= 1) run(e.delta.y > 0 ? "tab.prev" : "tab.next"); })
+      // Right-click on the empty part of the bar: new tab, tools, pinned panels, rename space (shared menu rows).
+      .on_mouse_down("right", () => openOverlay({ mod: SELF, kind: "popup", width: 260, height: 520, props: { role: "menu", tab: "tabbar", target: { space: space?.id } } }))
       // + sits right after the last tab, as in Chrome, Figma and Paper (it scrolls with the tabs).
       .child(h_flex().id("tab-scroll").flex_1().min_w(0).h_full().items_center().gap(3).overflow_x_scrollbar().children(shown.map(item))
         .child(button("tab-new", "+", () => openOverlay({ mod: SELF, kind: "popup", width: 260, height: 575, props: { role: "plus" } }))))
-      .when(enabled.includes("files"), (el) => el.child(panelButton("files", "Files", icon("file"))))
-      .when(enabled.includes("changes"), (el) => el.child(panelButton("changes", "Changes", icon("changes"))))
+      .children(pins.map((id) => panelButton(id)))
       .when(window()?.buttons, (el) => el.child(button("minimize", "−", () => run("window.minimize")))
         .child(button("maximize", "□", () => run("window.maximize")))
         .child(button("close-window", svg(icon("close")).size(13), () => run("window.close"))));

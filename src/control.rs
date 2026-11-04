@@ -85,7 +85,11 @@ fn serve(stream: UnixStream, tx: async_channel::Sender<Request>) {
             // HERDR: browser block. Commands the browser host answers wait on it: a page
             // screenshot or script gets the 30 s a window shot gets; a new page's first load 15 s.
             let browser = cmd.get("do").and_then(Value::as_str).filter(|n| n.starts_with("browser."));
+            let waits_for_person = browser == Some("browser.pick")
+                || (browser == Some("browser.annotations") && cmd.pointer("/args/wait").and_then(Value::as_bool) == Some(true));
             let timeout = Duration::from_secs(match browser {
+                // The person picks or sends when they're ready; the agent side drops the waiter at the same bound.
+                _ if waits_for_person => crate::browser::agent::PERSON_WAIT.as_secs(),
                 Some("browser.screenshot" | "browser.eval") => 30,
                 Some("browser.find" | "browser.open") => 15,
                 _ if cmd.get("shot").is_some() => 30,
