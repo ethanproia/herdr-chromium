@@ -13,11 +13,11 @@ pub fn init(cx: &mut App) {
         MenuItem::separator(),
         MenuItem::os_submenu("Services", SystemMenuType::Services),
         MenuItem::separator(),
-        MenuItem::action("Hide Herdr", Hide),
+        MenuItem::action(format!("Hide {}", crate::brand::NAME), Hide),
         MenuItem::action("Hide Others", HideOthers),
         MenuItem::action("Show All", ShowAll),
         MenuItem::separator(),
-        MenuItem::action("Quit Herdr", Quit),
+        MenuItem::action(format!("Quit {}", crate::brand::NAME), Quit),
     ])]);
 }
 
