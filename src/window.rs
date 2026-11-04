@@ -1471,6 +1471,12 @@ impl AppWindow {
         // A mod copy lives while its slot is in the layout, hidden or not (an
         // inactive stack child, a hidden column, a pane in another tab), so it
         // keeps its place; only shown slots start a copy. Gone or changed: dropped.
+        // HERDR: the shown layout reaches mods before any new copy starts: a copy's first
+        // layout() otherwise saw the previous layout, and core's start-time layout.set wrote that
+        // stale tree over the new layout's file (switching to a core layout rewrote it as stock).
+        if mods::publish_layout(&self.chrome) {
+            self.refresh_snapshot_mods(cx);
+        }
         let owned = self.owned_mods();
         let gone: Vec<_> = self.copies.iter().filter(|(slot, copy)| owned.get(*slot).is_none_or(|inst| *inst != copy.inst)).map(|(slot, _)| slot.clone()).collect();
         for slot in gone {
