@@ -82,7 +82,7 @@ impl<A: SurfaceAlloc> StubHost<A> {
         use AppToHost as M;
         let mut out = Vec::new();
         match msg {
-            M::Hello { .. } => out.push(HostToApp::Ready { version: PROTOCOL_VERSION, cef_version: "stub".into(), cdp_port: None, cdp_pipe: false }),
+            M::Hello { .. } => out.push(HostToApp::Ready { version: PROTOCOL_VERSION, cef_version: "stub".into(), cdp_port: None, cdp_pipe: false, sandboxed: false }),
             M::Create { id, url, size, scale, profile } => {
                 if let Some(p) = profile.as_deref().filter(|p| !p.is_empty() && *p != "default")
                     && !crate::downloads::is_profile_name(p)

@@ -902,13 +902,17 @@ fn cdp_pipe_without_fds_is_refused() {
     let _ = child.wait();
 }
 
-/// SEC4: every helper the host starts (GPU, renderers, network and other utilities) runs in
-/// Chromium's sandbox, as the kernel reports it; none was started with --no-sandbox.
+/// SEC4: the host's helpers for the named roles (GPU, renderer, network and storage utilities) run in
+/// Chromium's sandbox, as the kernel reports it, and none was started with --no-sandbox. macOS only, and
+/// not part of the ordinary suite: run it explicitly against the bundle under test, where a missing host
+/// fails instead of passing silently:
+///   HERDR_BROWSER_HOST=<bundle>/Contents/MacOS/herdr-browser-host \
+///     cargo test -p herdr-browser-host --features cef --test cef -- --ignored every_helper_runs_sandboxed
+#[cfg(target_os = "macos")]
 #[test]
+#[ignore = "needs HERDR_BROWSER_HOST: a real SEC4 host bundle (run with --ignored)"]
 fn every_helper_runs_sandboxed() {
-    if real_host().is_none() {
-        return;
-    }
+    assert!(real_host().is_some(), "HERDR_BROWSER_HOST is not set: this test checks a real host bundle and cannot pass without one");
     unsafe extern "C" {
         fn sandbox_check(pid: i32, operation: *const std::ffi::c_char, kind: i32, ...) -> i32;
     }
@@ -917,36 +921,47 @@ fn every_helper_runs_sandboxed() {
     create(&mut h, "b1", &p.url("a"), 200.0, 100.0, 1.0);
     let (seq, _) = h.frame_where("b1", 100, 50, |px| px == BLUE);
     h.send(AppToHost::FrameAck { id: "b1".into(), seq });
-    // The host's descendants, with their command lines.
-    let ps = std::process::Command::new("ps").args(["-axww", "-o", "pid=,ppid=,command="]).output().unwrap();
-    let rows: Vec<(u32, u32, String)> = String::from_utf8_lossy(&ps.stdout)
-        .lines()
-        .filter_map(|l| {
-            let mut it = l.split_whitespace();
-            let (pid, ppid) = (it.next()?.parse().ok()?, it.next()?.parse().ok()?);
-            Some((pid, ppid, it.collect::<Vec<_>>().join(" ")))
-        })
-        .collect();
-    let mut family = vec![h.pid()];
-    while let Some(next) = rows.iter().find(|(pid, ppid, _)| family.contains(ppid) && !family.contains(pid)) {
-        family.push(next.0);
-    }
-    let helpers: Vec<&(u32, u32, String)> = rows.iter().filter(|(pid, _, cmd)| family.contains(pid) && cmd.contains("--type=")).collect();
+    // Storage: the page touches localStorage and IndexedDB, so Chromium starts its storage utility.
+    let (ok, _) = h.eval("b1", 9001, "localStorage.setItem('sec4', '1'); indexedDB.open('sec4'); 1");
+    assert!(ok, "storage eval failed");
     let kind = |cmd: &str| {
         let arg = |k: &str| cmd.split_whitespace().find_map(|a| a.strip_prefix(k)).unwrap_or("").to_owned();
         let sub = arg("--utility-sub-type=");
         if sub.is_empty() { arg("--type=") } else { format!("utility:{sub}") }
     };
-    let mut seen = Vec::new();
-    for (pid, _, cmd) in &helpers {
-        let boxed = unsafe { sandbox_check(*pid as i32, std::ptr::null(), 0) } == 1;
-        assert!(boxed, "helper {pid} ({}) is not sandboxed", kind(cmd));
+    const ROLES: [&str; 4] = ["gpu-process", "renderer", "utility:network.mojom.NetworkService", "utility:storage.mojom.StorageService"];
+    // The host's descendants with their command lines, polled until every role is there (at most 15 s).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let (helpers, seen) = loop {
+        let ps = std::process::Command::new("ps").args(["-axww", "-o", "pid=,ppid=,command="]).output().expect("ps did not run");
+        assert!(ps.status.success(), "ps failed: {}", String::from_utf8_lossy(&ps.stderr));
+        let rows: Vec<(u32, u32, String)> = String::from_utf8_lossy(&ps.stdout)
+            .lines()
+            .filter_map(|l| {
+                let mut it = l.split_whitespace();
+                let (pid, ppid) = (it.next()?.parse().ok()?, it.next()?.parse().ok()?);
+                Some((pid, ppid, it.collect::<Vec<_>>().join(" ")))
+            })
+            .collect();
+        let mut family = vec![h.pid()];
+        while let Some(next) = rows.iter().find(|(pid, ppid, _)| family.contains(ppid) && !family.contains(pid)) {
+            family.push(next.0);
+        }
+        let helpers: Vec<(u32, String)> = rows.into_iter().filter(|(pid, _, cmd)| family.contains(pid) && cmd.contains("--type=")).map(|(pid, _, cmd)| (pid, cmd)).collect();
+        let mut seen: Vec<String> = helpers.iter().map(|(_, cmd)| kind(cmd)).collect();
+        seen.sort();
+        let missing: Vec<&str> = ROLES.iter().copied().filter(|r| !seen.iter().any(|k| k == r)).collect();
+        if missing.is_empty() {
+            break (helpers, seen);
+        }
+        assert!(std::time::Instant::now() < deadline, "no {missing:?} helper within 15 s; seen {seen:?}");
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    };
+    for (pid, cmd) in &helpers {
+        let boxed = unsafe { sandbox_check(*pid as i32, std::ptr::null(), 0) };
+        assert!(boxed >= 0, "the kernel could not report helper {pid} ({})", kind(cmd));
+        assert_eq!(boxed, 1, "helper {pid} ({}) is not sandboxed", kind(cmd));
         assert!(!cmd.contains("--no-sandbox"), "helper {pid} started with --no-sandbox");
-        seen.push(kind(cmd));
-    }
-    seen.sort();
-    for want in ["gpu-process", "renderer", "utility:network.mojom.NetworkService"] {
-        assert!(seen.iter().any(|k| k == want), "no {want} helper among {seen:?}");
     }
     println!("sandboxed helpers: {seen:?}");
     h.shutdown();

@@ -494,6 +494,22 @@ fn read(stream: UnixStream, shared: Arc<Mutex<Shared>>, generation: u64) {
                 continue;
             }
         };
+        // HERDR (SEC4): a real host must say its helpers are sandboxed. One from before SEC4 doesn't, and
+        // would browse unsandboxed without a word: end it here, every view shows why. The stub (tests) is exempt.
+        if let Some(reason) = unsandboxed(&msg) {
+            tracing::warn!("{reason}");
+            let mut s = shared.lock().unwrap();
+            if s.generation == generation {
+                s.generation += 1;
+                let crash = HostToApp::Crashed { id: None, reason };
+                for tx in s.subs.values() {
+                    let _ = tx.try_send(crash.clone());
+                }
+                drop(s);
+                tell_tap(&shared, &crash);
+            }
+            return;
+        }
         let mut s = shared.lock().unwrap();
         if s.generation != generation {
             return;
@@ -527,6 +543,16 @@ fn read(stream: UnixStream, shared: Arc<Mutex<Shared>>, generation: u64) {
         }
         drop(s);
         tell_tap(&shared, &crash);
+    }
+}
+
+/// HERDR (SEC4): why a host's Ready can't be used, if it can't: a real host that doesn't report sandboxed helpers.
+fn unsandboxed(msg: &HostToApp) -> Option<String> {
+    match msg {
+        HostToApp::Ready { sandboxed: false, cef_version, .. } if cef_version != "stub" => Some(format!(
+            "this browser host (CEF {cef_version}) does not run its helpers sandboxed, so it is not used: rebuild it with scripts/fork-host-bundle.sh (or reinstall with scripts/install-fork-macos)"
+        )),
+        _ => None,
     }
 }
 
@@ -3317,6 +3343,20 @@ pub fn socket_of(dir: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use herdr_browser_protocol::Size;
+
+    // HERDR (SEC4): a real host without sandboxed helpers (pre-SEC4: no `sandboxed` field) is refused with a reason;
+    // a SEC4 host and the test stub are used.
+    #[::core::prelude::v1::test]
+    fn a_host_without_sandboxed_helpers_is_refused() {
+        let ready = |cef: &str, sandboxed| HostToApp::Ready { version: 1, cef_version: cef.into(), cdp_port: None, cdp_pipe: true, sandboxed };
+        assert!(super::unsandboxed(&ready("156.0.14", false)).is_some_and(|r| r.contains("not used") && r.contains("fork-host-bundle.sh")));
+        assert_eq!(super::unsandboxed(&ready("156.0.14", true)), None);
+        assert_eq!(super::unsandboxed(&ready("stub", false)), None, "the test stub is exempt");
+        // An old host's Ready has no `sandboxed`: it reads as false.
+        let old: HostToApp = herdr_browser_protocol::decode(r#"{"type":"ready","version":1,"cef_version":"150.0","cdp_port":null}"#).unwrap();
+        assert!(super::unsandboxed(&old).is_some());
+        assert_eq!(super::unsandboxed(&HostToApp::Title { id: "b1".into(), title: "t".into() }), None);
+    }
 
     #[::core::prelude::v1::test]
     fn the_cdp_port_opens_only_for_a_number_in_a_developer_build() {
