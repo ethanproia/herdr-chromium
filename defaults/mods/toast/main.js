@@ -1,10 +1,12 @@
 // How notifications look. Anything can post one with notify({ title, body,
 // level, icon, action }); replace this mod to restyle them all. Click to
-// run its action (e.g. go to the agent) and dismiss it.
+// run its action (e.g. go to the agent), mark it read in the bell's history,
+// and dismiss it. Closing or letting it time out leaves it unread.
 
 import { View, div, image } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { props, closeOverlay, run, theme } from "herdr";
+import * as herdr from "herdr";
+const { props, closeOverlay, run, theme } = herdr;
 
 const DOT = { error: "blocked", warning: "working", success: "done", info: "accent" };
 
@@ -23,6 +25,8 @@ export default class Toast extends View {
       .hover((s) => s.bg(t.hover))
       .on_click(() => {
         if (p.action?.name) run(p.action.name, p.action.args ?? {});
+        // Stock Herdr has no history: feature-detect it.
+        if (p.notification_id && typeof herdr.markRead === "function") herdr.markRead(p.notification_id);
         closeOverlay(p.overlay);
       })
       .child(p.icon ? image(p.icon).w(18).h(18).flex_none() : div().size(8).rounded(4).flex_none().bg(t[DOT[p.level] ?? "accent"]))

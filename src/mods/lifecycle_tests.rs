@@ -184,6 +184,46 @@ export default class extends View {
     assert!(seen[1].contains("terminal.kill: unknown argument(s): id; valid arguments: terminal"), "{}", seen[1]);
 }
 
+// HERDR: the bell panel feature-detects these on stock Herdr with a namespace import; a mod
+// without `"permissions": { "notifications": "all" }` sees only its own items and can't mute.
+#[gpui::test]
+fn notifications_are_namespace_exports_and_a_plain_mod_sees_only_its_own(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    crate::mods::publish_notifications(json!({
+        "unread": 2,
+        "items": [
+            { "id": "n_2", "source": "mods", "from": "test", "title": "mine", "read": false },
+            { "id": "n_1", "source": "agents", "from": "Claude Code", "title": "t7 needs you", "read": false },
+        ],
+        "settings": { "dnd": false, "muted_sources": [] },
+    }));
+    let fixture = Fixture::new(r#"
+import { View, div } from "gpui-kit";
+import * as herdr from "herdr";
+import { note } from "fixture";
+export default class extends View {
+  init() {
+    note(["notifications", "markRead", "clearNotifications", "setNotificationMute", "notify"].map((f) => typeof herdr[f]).join(","));
+    const n = herdr.notifications();
+    note(`${n.unread} ${n.items.map((i) => i.title).join("|")} ${n.settings === undefined}`);
+    try { herdr.setNotificationMute({ dnd: true }); note("muted"); } catch (e) { note("refused"); }
+  }
+  render() { return div(); }
+}"#);
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let calls = seen.clone();
+    gpui_shell::policy::set_default(Policy::new()
+        .with_host_module(module(Instance { name: "test".into(), props: Value::Null }, 0)).unwrap()
+        .with_host_module(HostModule::new("fixture").function("note", move |a| {
+            calls.borrow_mut().push(a.string(0)?.to_owned());
+            Ok(HostValue::Null)
+        })).unwrap());
+    let runtime = ShellRuntime::new_isolated().unwrap();
+    let window = cx.add_window(|_, _| Empty);
+    let _root = window.update(cx, |_, window, cx| runtime.try_load(&fixture.0, window, cx).unwrap()).unwrap();
+    assert_eq!(*seen.borrow(), ["function,function,function,function,function", "1 mine true", "refused"]);
+}
+
 #[gpui::test]
 fn focus_command_lets_a_mod_take_arrow_keys(cx: &mut TestAppContext) {
     cx.update(gpui_shell::init);

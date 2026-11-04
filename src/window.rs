@@ -467,6 +467,10 @@ pub struct AppWindow {
     /// What's waiting, in words (`update_label`).
     update_ready: Option<String>,
     update_dismissed: Option<String>,
+    /// HERDR: the bell's history (src/notifications.rs); saved from the poll when it changed.
+    notes: crate::notifications::Store,
+    /// HERDR: the core update error last put in the bell (a keyed item, read once it clears).
+    core_error_noted: Option<String>,
     /// HERDR: the pointer is over the toast deck since then: every toast's timer waits.
     deck_hover: Option<Instant>,
     /// HERDR: each toast card's last two y's in the deck (design px), for the move animation.
@@ -557,6 +561,8 @@ impl AppWindow {
             polls: 0,
             update_ready: None,
             update_dismissed: None,
+            notes: crate::notifications::Store::load(&crate::notifications::path(), model::now_ms()),
+            core_error_noted: None,
             deck_hover: None,
             deck_moves: RefCell::default(),
             update_success: false,
@@ -601,7 +607,7 @@ impl AppWindow {
         w.show_layout_notes(window, cx);
         if let (Some(n), false) = (&name, gone.is_empty()) {
             let note = json!({ "title": format!("{n} needs mods that aren't here"), "body": format!("Showing Herdr instead. Missing: {}. Your {n} layout file is still there.", gone.join(", ")), "level": "info", "timeout": 12000 });
-            w.open_overlay(mods::new_overlay_id(), json!({ "kind": "toast", "notification": note }), window, cx);
+            w.post_note("app", "Herdr", note, window, cx);
         }
 
         w._tasks.push(cx.spawn_in(window, async move |this, cx| {
@@ -1127,13 +1133,13 @@ impl AppWindow {
     /// What installing layouts kept of the person's own, as toasts.
     fn show_layout_notes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         for clone in mods::take_sync_notes() {
-            let n = json!({ "title": format!("Your edits are in {clone}"), "body": "Herdr's own layouts and mods can't be changed: clone one to make it yours.", "level": "info", "timeout": 12000 });
-            self.open_overlay(mods::new_overlay_id(), json!({ "kind": "toast", "notification": n }), window, cx);
+            let n = json!({ "title": format!("Your edits are in {clone}"), "body": "Herdr's own layouts and mods can't be changed: clone one to make it yours.", "level": "info", "timeout": 12000, "keep": false });
+            self.post_note("app", "Herdr", n, window, cx);
         }
         // HERDR: keys a mod wanted that the person already uses (src/mod_keys.rs).
         for line in crate::mod_keys::take_notes() {
             let n = json!({ "title": "Mod keys", "body": line, "level": "info", "timeout": 12000 });
-            self.open_overlay(mods::new_overlay_id(), json!({ "kind": "toast", "notification": n }), window, cx);
+            self.post_note("app", "Herdr", n, window, cx);
         }
     }
 
@@ -1529,6 +1535,11 @@ impl AppWindow {
         if self.window_active {
             let visible = self.visible_addresses();
             self.model.mark_seen(&visible);
+            // HERDR: what the person is looking at reads its bell items.
+            let read: usize = visible.iter().map(|a| self.notes.resolve_prefix(&format!("agent:{a}:"))).sum();
+            if read > 0 {
+                self.publish_notes(cx);
+            }
         }
         self.share_seen(cx);
         self.publish(cx);
@@ -1850,8 +1861,7 @@ impl AppWindow {
     }
 
     fn layout_notice(&mut self, title: &str, body: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let spec = json!({"kind":"toast", "notification":{"title":title,"body":body,"level":"info"}});
-        self.open_overlay(mods::new_overlay_id(), spec, window, cx);
+        self.post_note("machines", "Herdr", json!({"title":title,"body":body,"level":"info"}), window, cx);
     }
 
     /// Finish the accepted edit and any newer projection before the window goes.
@@ -2074,7 +2084,8 @@ impl AppWindow {
     /// toast (drawn by the `toast` mod; click it to go there) unless they're
     /// looking at that agent.
     fn alert(&mut self, addr: &str, alert: model::Alert, looking: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if settings::get().sounds.enabled {
+        // HERDR: Do Not Disturb or muted agents: no sound (the bell still records it).
+        if settings::get().sounds.enabled && settings::get().notifications.speaks("agents") {
             crate::sound::play(if alert == model::Alert::Blocked { "blocked" } else { "done" });
         }
         // Needing the person brings a settled tab back.
@@ -2103,11 +2114,13 @@ impl AppWindow {
             model::Alert::Blocked => (format!("{name} needs you"), "error"),
             model::Alert::Done => (format!("{name} finished"), "info"),
         };
+        // HERDR: one bell item per agent and state; a repeat bumps it, focusing the agent reads it.
+        let key = format!("agent:{addr}:{}", if alert == model::Alert::Blocked { "blocked" } else { "done" });
         let notification = json!({
-            "title": title, "body": place, "level": level,
+            "title": title, "body": place, "level": level, "key": key,
             "action": { "name": "agent.focus", "args": { "terminal": addr } },
         });
-        self.open_overlay(mods::new_overlay_id(), json!({ "kind": "toast", "notification": notification }), window, cx);
+        self.post_note("agents", &name, notification, window, cx);
     }
 
     /// Keeps the model true to core, on every listing: drops panes whose terminal
@@ -2327,7 +2340,7 @@ impl AppWindow {
             }).await;
             if let Some(body) = failure {
                 let _ = this.update_in(cx, |this, window, cx| {
-                    this.open_overlay(mods::new_overlay_id(), json!({"kind":"toast", "notification":{"title":"Terminal failed to start", "body":body, "level":"error"}}), window, cx);
+                    this.post_note("app", "Herdr", json!({"title":"Terminal failed to start", "body":body, "level":"error"}), window, cx);
                 });
             }
         }).detach();
@@ -2733,8 +2746,8 @@ impl AppWindow {
     fn run(&mut self, name: &str, args: Value, window: &mut Window, cx: &mut Context<Self>) {
         // A click or key has nobody to read the reply: show why it failed.
         if let Some(error) = self.run_as(name, args, true, window, cx).get("error").and_then(Value::as_str) {
-            let spec = json!({"kind":"toast", "notification":{"title":format!("{name} failed"),"body":error,"level":"error"}});
-            self.open_overlay(mods::new_overlay_id(), spec, window, cx);
+            let n = json!({"title":format!("{name} failed"),"body":error,"level":"error","key":format!("cmd:{name}")});
+            self.post_note("app", "Herdr", n, window, cx);
         }
     }
 
@@ -3320,6 +3333,22 @@ impl AppWindow {
                 self.open_overlay(mods::new_overlay_id(), spec, window, cx);
                 return;
             }
+            // HERDR: the bell's history (also what the bell panel's header buttons run).
+            "notifications.read_all" => {
+                self.notes.mark_read(&crate::notifications::Target::All);
+                self.publish_notes(cx);
+                return;
+            }
+            "notifications.clear_all" => {
+                self.notes.clear(&crate::notifications::Target::All);
+                self.publish_notes(cx);
+                return;
+            }
+            "notifications.toggle_dnd" => {
+                self.write_person(|p| p.notifications.dnd = !p.notifications.dnd, window, cx);
+                self.publish_notes(cx);
+                return;
+            }
             "app.settings" => {
                 // Once: a second press doesn't stack another; asking for a section opens it there.
                 let section = Self::owned(a, "section");
@@ -3688,6 +3717,7 @@ impl AppWindow {
             Request::OpenOverlay { id, spec } => self.open_overlay(id, spec, window, cx),
             Request::CloseOverlay { id } => self.close_overlay(&id, window, cx),
             Request::Refresh => self.refresh_mods(cx),
+            Request::Notes { op, arg, folder, owner } => self.mod_notes(op, arg, folder, owner, window, cx),
             // HERDR: browser block. `browser.*` may answer later (eval, screenshot): the reply goes with it.
             // browser.new over the control socket is anyone's (agents included): it opens an agent-profile
             // browser, never the person's logins; the person's own path is the menu and keys (`run`).
@@ -3758,6 +3788,12 @@ impl AppWindow {
                 "layout": self.layout_name,
                 "agent": self.shown_agent(),
                 "floats": self.float_status(),
+                // HERDR: the bell, for agents and tests (no item text).
+                "notifications": {
+                    "unread": self.notes.unread(&settings::get().notifications.muted_sources),
+                    "total": self.notes.items.len(),
+                    "dnd": settings::get().notifications.dnd,
+                },
                 "overlays": self.overlays.iter().map(|o| match &o.layout {
                     Some(_) => Some("layout".to_owned()),
                     None => self.copies.get(&o.slot).map(|c| c.inst.name.clone()),
@@ -3838,6 +3874,31 @@ impl AppWindow {
             self.reload_config(window, cx);
             self.check_layout_file(window, cx);
             self.sync_folders(window, cx);
+        }
+        // HERDR: a failed herdr-core update is one bell item; it reads as read once the update works.
+        let core_error = crate::update::core().error;
+        if core_error != self.core_error_noted {
+            match &core_error {
+                Some(e) => self.post_note("updates", "herdr-core", json!({
+                    "title": "herdr-core update failed", "body": e, "level": "error", "key": "updates:core",
+                    // The pinned banner already shows it: history only, no toast.
+                    "silent": true,
+                    "action": { "name": "app.settings", "args": { "section": "updates" } },
+                }), window, cx),
+                None => {
+                    if self.notes.resolve("updates:core") {
+                        self.publish_notes(cx);
+                    }
+                }
+            }
+            self.core_error_noted = core_error;
+        }
+        // HERDR: the bell's history is written at most once a poll; `history: false` keeps it in memory.
+        if self.notes.dirty && settings::get().notifications.history {
+            if let Err(e) = self.notes.save(&crate::notifications::path()) {
+                tracing::warn!("notifications: cannot save the history: {e}");
+                self.notes.dirty = false;
+            }
         }
         let now = Instant::now();
         // HERDR: toasts wait while the pointer is over the deck; a timed-out one fades, then goes.
@@ -4186,8 +4247,12 @@ impl AppWindow {
                 }
                 // A download finished or failed: a toast, like other notices.
                 crate::browser::view::BrowserEvent::Notice(n) => {
-                    let spec = json!({ "kind": "toast", "notification": n });
-                    this.open_overlay(mods::new_overlay_id(), spec, window, cx);
+                    // A failed download's URL goes into the history without its query or fragment.
+                    let mut n = serde_json::to_value(n).unwrap_or(Value::Null);
+                    if let Some(b) = n["body"].as_str() {
+                        n["body"] = json!(crate::notifications::strip_query(b));
+                    }
+                    this.post_note("browser", "Browser", n, window, cx);
                     return;
                 }
             };
@@ -4322,8 +4387,7 @@ impl AppWindow {
                     cx.notify();
                 }
                 Err(e) => {
-                    let spec = json!({"kind":"toast", "notification":{"title":"Remote desktop failed","body":e,"level":"error"}});
-                    this.open_overlay(mods::new_overlay_id(), spec, window, cx);
+                    this.post_note("machines", "Remote desktop", json!({"title":"Remote desktop failed","body":e,"level":"error"}), window, cx);
                 }
             });
         })
@@ -4542,6 +4606,70 @@ impl AppWindow {
                 set(children, &a_id, Span::Weight { weight: sum * new_a / total });
                 set(children, &b_id, Span::Weight { weight: sum * (total - new_a) / total });
             }
+        }
+    }
+
+    /// HERDR: every notice goes through here: recorded in the bell's history (unless private or a
+    /// quick confirmation) and shown as a toast unless Do Not Disturb or its source is muted.
+    /// `n` is a toast's notification: title, body, level, icon, action, timeout, key, keep, private.
+    fn post_note(&mut self, source: &str, from: &str, mut n: Value, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::notifications::{Note, keeps};
+        let level = n["level"].as_str().unwrap_or("info").to_owned();
+        if keeps(&level, n["timeout"].as_u64(), n["keep"].as_bool(), n["private"].as_bool().unwrap_or(false)) {
+            let text = |k: &str| n[k].as_str().unwrap_or_default().to_owned();
+            let note = Note {
+                source: source.to_owned(),
+                from: from.to_owned(),
+                title: text("title"),
+                body: text("body"),
+                level,
+                icon: n["icon"].as_str().map(str::to_owned),
+                action: n.get("action").filter(|a| a.is_object()).cloned(),
+                key: n["key"].as_str().map(str::to_owned),
+            };
+            let id = self.notes.post(note, model::now_ms());
+            n["notification_id"] = json!(id);
+            self.publish_notes(cx);
+        }
+        if !n["silent"].as_bool().unwrap_or(false) && settings::get().notifications.speaks(source) {
+            let toast = n["toast_id"].as_str().map(str::to_owned).unwrap_or_else(mods::new_overlay_id);
+            self.open_overlay(toast, json!({ "kind": "toast", "notification": n }), window, cx);
+        }
+    }
+
+    /// HERDR: a mod's notify / markRead / clearNotifications / setNotificationMute.
+    fn mod_notes(&mut self, op: &str, arg: Value, folder: String, owner: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::notifications::Target;
+        match op {
+            "post" => self.post_note("mods", &folder, arg, window, cx),
+            "read" | "clear" => {
+                let Some(t) = Target::from_value(&arg) else { return };
+                if op == "read" { self.notes.mark_read_as(&t, owner.as_deref()); } else { self.notes.clear_as(&t, owner.as_deref()); }
+                self.publish_notes(cx);
+            }
+            "mute" if owner.is_none() => {
+                self.write_person(|p| {
+                    let n = &mut p.notifications;
+                    if let Some(d) = arg["dnd"].as_bool() {
+                        n.dnd = d;
+                    }
+                    if let Some(src) = arg["source"].as_str() {
+                        n.muted_sources.retain(|m| m != src);
+                        if arg["muted"].as_bool().unwrap_or(true) {
+                            n.muted_sources.push(src.to_owned());
+                        }
+                    }
+                }, window, cx);
+                self.publish_notes(cx);
+            }
+            _ => {}
+        }
+    }
+
+    /// HERDR: mods reading `notifications()` re-render; the file is written from the poll.
+    fn publish_notes(&mut self, cx: &mut Context<Self>) {
+        if mods::publish_notifications(crate::notifications::view(&self.notes, &settings::get().notifications)) {
+            self.refresh_snapshot_mods(cx);
         }
     }
 
