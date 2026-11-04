@@ -70,7 +70,9 @@ harness = false
 [[test]]
 name = "browser_profile_fixed"
 path = "tests/browser_profile_fixed.rs"
+harness = false
 
+[[test]]
 name = "browser_shot_mask"
 path = "tests/browser_shot_mask.rs"
 harness = false
