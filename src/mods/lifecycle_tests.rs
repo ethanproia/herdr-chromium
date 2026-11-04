@@ -192,7 +192,7 @@ fn notifications_are_namespace_exports_and_a_plain_mod_sees_only_its_own(cx: &mu
     crate::mods::publish_notifications(json!({
         "unread": 2,
         "items": [
-            { "id": "n_2", "source": "mods", "from": "test", "title": "mine", "read": false },
+            { "id": "n_2", "source": "mods", "owner": "test", "from": "test", "title": "mine", "read": false },
             { "id": "n_1", "source": "agents", "from": "Claude Code", "title": "t7 needs you", "read": false },
         ],
         "settings": { "dnd": false, "muted_sources": [] },
@@ -207,6 +207,12 @@ export default class extends View {
     const n = herdr.notifications();
     note(`${n.unread} ${n.items.map((i) => i.title).join("|")} ${n.settings === undefined}`);
     try { herdr.setNotificationMute({ dnd: true }); note("muted"); } catch (e) { note("refused"); }
+    for (const c of ["notifications.clear_all", "notifications.read_all", "notifications.toggle_dnd"]) {
+      try { herdr.run(c, {}); note("ran " + c); } catch (e) { note("refused " + c); }
+    }
+    for (const bad of ["just a string", ["a"], 7]) {
+      try { herdr.notify(bad); note("posted"); } catch (e) { note("refused notify"); }
+    }
   }
   render() { return div(); }
 }"#);
@@ -221,7 +227,11 @@ export default class extends View {
     let runtime = ShellRuntime::new_isolated().unwrap();
     let window = cx.add_window(|_, _| Empty);
     let _root = window.update(cx, |_, window, cx| runtime.try_load(&fixture.0, window, cx).unwrap()).unwrap();
-    assert_eq!(*seen.borrow(), ["function,function,function,function,function", "1 mine true", "refused"]);
+    assert_eq!(*seen.borrow(), [
+        "function,function,function,function,function", "1 mine true", "refused",
+        "refused notifications.clear_all", "refused notifications.read_all", "refused notifications.toggle_dnd",
+        "refused notify", "refused notify", "refused notify",
+    ]);
 }
 
 #[gpui::test]
