@@ -24,6 +24,9 @@ pub const PRESETS: [Preset; 3] = [
     Preset { name: "iPad Air", w: 820.0, h: 1180.0, scale: 2.0, mobile: true, user_agent: Some(IPAD_UA) },
 ];
 
+/// The most backing pixels a device mode may ask the host for (about a 5K display).
+pub const PIXEL_BUDGET: f32 = 16_000_000.0;
+
 /// A block's device mode: a preset or a custom size (desktop UA, no touch), maybe rotated.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Mode {
@@ -41,10 +44,16 @@ impl Mode {
         Some(Mode { name: p.name.into(), w: p.w, h: p.h, scale: p.scale, mobile: p.mobile, user_agent: p.user_agent.map(Into::into) })
     }
 
-    /// A custom size: clamped to sane bounds, desktop UA, no touch.
-    pub fn custom(w: f32, h: f32, scale: Option<f32>) -> Mode {
+    /// A custom size: clamped to sane bounds, desktop UA, no touch. Refused when its backing
+    /// pixels (w × h × scale²) pass `PIXEL_BUDGET` (the host renders every one of them).
+    pub fn custom(w: f32, h: f32, scale: Option<f32>) -> Result<Mode, String> {
         let (w, h) = (w.clamp(200.0, 3840.0).round(), h.clamp(200.0, 3840.0).round());
-        Mode { name: "Custom".into(), w, h, scale: scale.unwrap_or(2.0).clamp(1.0, 4.0), mobile: false, user_agent: None }
+        let scale = scale.unwrap_or(2.0).clamp(1.0, 4.0);
+        let pixels = w * h * scale * scale;
+        if pixels > PIXEL_BUDGET {
+            return Err(format!("{w}×{h} at {scale}x is {} megapixels; the most is {} (use a smaller size or scale)", (pixels / 1e6).round(), PIXEL_BUDGET / 1e6));
+        }
+        Ok(Mode { name: "Custom".into(), w, h, scale, mobile: false, user_agent: None })
     }
 
     pub fn rotated(&self) -> Mode {
@@ -80,7 +89,13 @@ mod tests {
         assert_eq!(m.fit(4000.0, 4000.0), 1.0, "never blown up");
         assert_eq!(m.label(0.5), "iPhone 15 · 390×844 @3x · 50%");
         assert!(Mode::preset("Nokia").is_none());
-        let c = Mode::custom(10.0, 99999.0, None);
-        assert_eq!((c.w, c.h, c.mobile, c.user_agent.is_none()), (200.0, 3840.0, false, true), "custom is clamped and never sets a UA");
+        let c = Mode::custom(10.0, 1600.0, Some(2.0)).unwrap();
+        assert_eq!((c.w, c.h, c.mobile, c.user_agent.is_none()), (200.0, 1600.0, false, true), "custom is clamped and never sets a UA");
+        // 3840×3840 at 4x is 236 MP: over the budget.
+        assert!(Mode::custom(3840.0, 3840.0, Some(4.0)).unwrap_err().contains("megapixels"));
+        assert!(Mode::custom(1920.0, 1080.0, Some(2.0)).is_ok());
+        for p in PRESETS.iter() {
+            assert!(p.w * p.h * p.scale * p.scale <= PIXEL_BUDGET, "{} fits the budget", p.name);
+        }
     }
 }
