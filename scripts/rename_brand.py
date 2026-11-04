@@ -25,13 +25,15 @@ if not re.fullmatch(r"[a-z][a-z0-9-]*", slug) or slug in ("herdr", "fork"):
     sys.exit(f"rename-brand: slug {slug!r} must be lowercase letters, digits and -, and not herdr or fork")
 
 mods = sorted(d[len("fork-"):] for d in os.listdir(os.path.join(root, "defaults", "mods")) if d.startswith("fork-"))
-rules = [  # (name, pattern, replacement), longest first so herdr-app doesn't eat herdr-app-x
-    ("herdr-browser-host", r"(?<![\w-])herdr-browser-host(?![\w])", f"{slug}-browser-host"),
-    ("herdr-browser-protocol", r"(?<![\w-])herdr-browser-protocol(?![\w])", f"{slug}-browser-protocol"),
-    ("herdr-browser-surface", r"(?<![\w-])herdr-browser-surface(?![\w])", f"{slug}-browser-surface"),
+# (name, pattern, replacement), longest first. A hyphenated name may follow `_`
+# (`CARGO_BIN_EXE_herdr-browser-host`), never a letter, digit or `-`.
+rules = [
+    ("herdr-browser-host", r"(?<![A-Za-z0-9-])herdr-browser-host(?![\w])", f"{slug}-browser-host"),
+    ("herdr-browser-protocol", r"(?<![A-Za-z0-9-])herdr-browser-protocol(?![\w])", f"{slug}-browser-protocol"),
+    ("herdr-browser-surface", r"(?<![A-Za-z0-9-])herdr-browser-surface(?![\w])", f"{slug}-browser-surface"),
     ("herdr_browser_*", r"(?<![\w])herdr_browser_(host|protocol|surface)(?![\w])", rf"{snake}_browser_\1"),
     # Not stock Herdr's own paths (its home .config/herdr-app and CLI link .local/bin/herdr-app).
-    ("herdr-app", r"(?<![\w-])(?<!\.config/)(?<!bin/)herdr-app(?![\w-])", f"{slug}-app"),
+    ("herdr-app", r"(?<![A-Za-z0-9-])(?<!\.config/)(?<!bin/)herdr-app(?![\w-])", f"{slug}-app"),
     ("herdr_app", r"(?<![\w])herdr_app(?![\w])", f"{snake}_app"),
     ("HERDR_", r"(?<![\w])HERDR_(?=[A-Z])", f"{upper}_"),
 ] + [(f"fork-{m}", rf"(?<![\w-])fork-{re.escape(m)}(?![\w-])", f"{slug}-{m}") for m in mods] + [
@@ -45,6 +47,9 @@ URL = re.compile(r"://")
 # The stock CLI user mods call (and its guide) keeps its name under defaults/.
 CLI_KEEP = {"herdr-app"}
 STOCK_PATH = re.compile(r"(?:\.config/|bin/)herdr-app(?![\w-])")
+
+# The rename's own tooling and its guide name the old words on purpose.
+SELF = {os.path.join("scripts", f) for f in ("rename_brand.py", "rename-brand.sh", "test-rename-brand.sh")} | {os.path.join("docs", "branding.md")}
 
 changed, counts, protected = [], {}, {}
 def bump(d, k, n=1):
@@ -63,6 +68,9 @@ for dirpath, dirs, files in os.walk(root, topdown=True):
     for f in files:
         rel = os.path.normpath(os.path.join(rel_dir, f))
         if f == ".git":  # a worktree's pointer to its repository
+            continue
+        if rel in SELF:
+            bump(protected, "the rename's own scripts and guide")
             continue
         if SKIP_FILE.match(f):
             bump(protected, "licence/notice files")

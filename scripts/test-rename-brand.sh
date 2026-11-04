@@ -22,7 +22,7 @@ b = json.load(open("brand.json"))
 b.update(name=s.capitalize(), slug=s, bundle_id=f"dev.{s}.app", cli=s, home=f".config/{s}", session=s, layout=s)
 json.dump(b, open("brand.json", "w"), indent=2)
 PY
-git init -q . && git add -A >/dev/null && git -c user.email=t@t -c user.name=t commit -qm scratch
+git init -q . && git checkout -qb scratch/rename-brand && git add -A >/dev/null && git -c user.email=t@t -c user.name=t commit -qm scratch
 echo "== deep rename to $slug"
 scripts/rename-brand.sh --deep . | sed -n '/^files:/,/^renamed paths/p'
 git add -A >/dev/null
