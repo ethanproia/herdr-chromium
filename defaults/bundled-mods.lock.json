@@ -3,9 +3,9 @@
   "mods": {
     "agents-named": {
       "branch": "main",
-      "commit": "ec71dee685393fa2476e4c75eb1c0d864d418f0c",
+      "commit": "d1c770490e00c04932ffab1347763972bbc1efb0",
       "version": "0.1.0",
-      "pr": "essexlabs/labs#1334 (merged to main)",
+      "pr": "essexlabs/labs#1337 (merged to main; on #1334)",
       "path": "projects/herdr-mods/clones/mac/agents-named"
     },
     "board": {
@@ -30,9 +30,9 @@
     },
     "core": {
       "branch": "main",
-      "commit": "ec71dee685393fa2476e4c75eb1c0d864d418f0c",
+      "commit": "d1c770490e00c04932ffab1347763972bbc1efb0",
       "version": "0.1.0",
-      "pr": "essexlabs/labs#1334 (merged to main)",
+      "pr": "essexlabs/labs#1337 (merged to main; on #1334)",
       "path": "projects/herdr-mods/core",
       "rename": "paths",
       "exec": [
@@ -80,9 +80,9 @@
     },
     "spaces-browser": {
       "branch": "main",
-      "commit": "ec71dee685393fa2476e4c75eb1c0d864d418f0c",
+      "commit": "d1c770490e00c04932ffab1347763972bbc1efb0",
       "version": "0.1.0",
-      "pr": "essexlabs/labs#1334 (merged to main)",
+      "pr": "essexlabs/labs#1337 (merged to main; on #1334)",
       "path": "projects/herdr-mods/clones/mac/spaces-browser",
       "exec": [
         "git"
@@ -91,9 +91,9 @@
   },
   "layout": {
     "branch": "main",
-    "commit": "ec71dee685393fa2476e4c75eb1c0d864d418f0c",
+    "commit": "d1c770490e00c04932ffab1347763972bbc1efb0",
     "version": "0.1.0",
-    "pr": "essexlabs/labs#1334 (merged to main)",
+    "pr": "essexlabs/labs#1337 (merged to main; on #1334)",
     "path": "projects/herdr-mods/clones/mac/layouts/Labs.json",
     "preview": "projects/herdr-mods/clones/mac/layouts/labs.svg"
   },
