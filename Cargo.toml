@@ -10,7 +10,7 @@ publish = false
 
 [package]
 name = "herdr-app"
-version = "0.1.12"
+version = "0.1.13"
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
@@ -95,6 +95,21 @@ harness = false
 [[test]]
 name = "browser_device_cef"
 path = "tests/browser_device_cef.rs"
+harness = false
+
+[[test]]
+name = "browser_device_overlays"
+path = "tests/browser_device_overlays.rs"
+harness = false
+
+[[test]]
+name = "browser_device_overlays_cef"
+path = "tests/browser_device_overlays_cef.rs"
+harness = false
+
+[[test]]
+name = "browser_device_menu"
+path = "tests/browser_device_menu.rs"
 harness = false
 
 [[test]]
@@ -183,6 +198,11 @@ path = "tests/browser_send_to.rs"
 harness = false
 
 [[test]]
+name = "browser_text_edit"
+path = "tests/browser_text_edit.rs"
+harness = false
+
+[[test]]
 name = "browser_annotations_agent"
 path = "tests/browser_annotations_agent.rs"
 harness = false
@@ -225,7 +245,7 @@ herdr-browser-protocol = { path = "crates/herdr-browser-protocol" }
 gpui_windows = { package = "gpui-pre-windows", version = "=0.3.8", features = ["render-to-image"] }
 uds_windows = "1.2"
 raw-window-handle = "0.6"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Console", "Win32_Media_Multimedia"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Console", "Win32_System_Com", "Win32_Media_Multimedia"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"

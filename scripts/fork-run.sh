@@ -58,7 +58,8 @@ case $cmd in
       echo "fork-run: $bin has no HERDR_APP_HEADLESS switch (old build?); refusing to start it" >&2
       exit 1
     fi
-    HERDR_APP_HEADLESS=1 nohup "$bin" >"$root/app.log" 2>&1 </dev/null &
+    # Headless test homes get the test-only input commands (mod.click); HERDR_APP_TEST_INPUT=0 leaves them out.
+    HERDR_APP_TEST_INPUT=${HERDR_APP_TEST_INPUT-1} HERDR_APP_HEADLESS=1 nohup "$bin" >"$root/app.log" 2>&1 </dev/null &
     echo $! >"$root/pid"
     for _ in $(seq 100); do "$bin" status >/dev/null 2>&1 && break; sleep 0.2; done
     "$bin" status >/dev/null 2>&1 || { echo "fork-run: window did not answer; see $root/app.log" >&2; exit 1; }

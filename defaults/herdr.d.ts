@@ -20,11 +20,11 @@ export function home(): string;
 /** The app's folder (`~/.config/herdr-app`, or `$HERDR_APP_HOME`): settings.json, keys.json, layouts/. */
 export function appHome(): string;
 
-/** Reads UTF-8 text (up to 1 MiB), or null if absent. Runs off the UI thread.
+/** Reads UTF-8 text (up to 16 MiB), or null if absent. Runs off the UI thread.
  *  `on`: from that machine (a space's `machine`). */
 export function readTextFile(path: string, options?: { on?: string | null }): Promise<string | null>;
 /** Writes UTF-8 text only if it still matches expected (null creates a new file).
- * Rejects on a stale snapshot; existing files are replaced atomically. */
+ * Rejects on a stale snapshot; existing files are replaced atomically. Up to 16 MiB. */
 export function writeTextFile(path: string, text: string, expected: string | null): Promise<null>;
 
 /** The agents people can start from a menu (entries with `run` in programs.json), most picked
@@ -62,6 +62,7 @@ export function playSound(sound: string): null;
  *   terminal.peek {terminal} (peek over the tab, with keep-as-tab and close),
  *   terminal.show {terminal?, pane?} (shown in the pane for now, in place of its own), terminal.copy, terminal.paste,
  *   terminal.right_click {to: "program" | "menu", terminal?} (right-clicks to a program that takes the mouse; Shift: the menu).
+ *   terminal.scroll {lines | pages | to: "top" | "bottom", terminal?} (Herdr's view of the history: negative goes up; pages may be fractional).
  * Agents: agent.next, agent.prev (the agents list's order), agent.focus {terminal} (sub-agents too).
  * Layout (the shown layout's nodes by id): layout.toggle|show|hide {id}, layout.resize {id, px | weight},
  *   layout.select {stack, child}, layout.set {layout} (personal trees; shipped layouts: click/look fields only), layout.switch {name?} (no name: the next one).
@@ -455,9 +456,10 @@ export function nextCommand(): Promise<string>;
 export function watchFolder(path: string): Promise<string[]>;
 
 /**
- * Plays the video element with this `.id()` (macOS; ids are window-wide, so prefix them with your
- * mod's name). A clip shows a still until played; at most 4 play at once (the one playing
- * longest pauses), and one off screen for a second pauses. Throws when no such video is on screen.
+ * Plays this mod copy's video element with this `.id()` (macOS; another copy's same id is a
+ * different clip). A clip shows a still until played; at most 4 play at once (the one playing
+ * longest pauses), and one outside its window's visible area for a second pauses. Throws when no
+ * such video is on screen.
  */
 export function videoPlay(id: string): null;
 /** Pauses it: the player is released and the last frame stays. */
@@ -466,7 +468,8 @@ export function videoPause(id: string): null;
 export function videoSeek(id: string, seconds: number): null;
 /**
  * The next event of that video: `{id, type, time, duration, error?}`, type `ready`, `time`
- * (4 a second while playing), `paused`, `ended` or `error`.
+ * (4 a second while playing), `paused`, `ended` or `error`. Throws when no such video is on screen;
+ * rejects when the video goes away (its element left, or its path changed).
  *   cx.spawn(async (cx) => { for (;;) { const e = await nextVideoEvent("board-clip-1"); ...; cx.notify(); } });
  */
 export function nextVideoEvent(id: string): Promise<{ id: string; type: "ready" | "time" | "paused" | "ended" | "error"; time: number; duration: number | null; error?: string }>;

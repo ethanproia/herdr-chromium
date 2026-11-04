@@ -76,6 +76,17 @@ pub struct Geometry {
     pub size: Pt,
 }
 
+/// Page DIPs to drawn DIPs: in responsive mode the page is drawn at `fit` of its size (inside the
+/// letterboxed box, whose top-left is the overlays' origin). The one place overlays scale.
+pub fn to_drawn((x, y, w, h): (f32, f32, f32, f32), fit: f32) -> (f32, f32, f32, f32) {
+    (x * fit, y * fit, w * fit, h * fit)
+}
+
+/// Drawn DIPs back to page DIPs (pointer positions over the box).
+pub fn from_drawn(p: Pt, fit: f32) -> Pt {
+    Pt { x: p.x / fit, y: p.y / fit }
+}
+
 impl Geometry {
     /// Frame CSS px (inside the iframes `frames`, outermost first) to viewport CSS px.
     pub fn frame_to_viewport(p: Pt, frames: &[Pt]) -> Pt {
@@ -256,6 +267,11 @@ mod tests {
     #[test]
     fn zoom_levels_are_chromes() {
         assert!(close(zoom_factor(0.0), 1.0));
+        // Responsive mode: drawn = page × fit, and back.
+        assert_eq!(to_drawn((100.0, 200.0, 40.0, 20.0), 0.5), (50.0, 100.0, 20.0, 10.0));
+        assert_eq!(to_drawn((100.0, 200.0, 40.0, 20.0), 1.0), (100.0, 200.0, 40.0, 20.0));
+        let back = from_drawn(Pt { x: 50.0, y: 100.0 }, 0.5);
+        assert!(close(back.x, 100.0) && close(back.y, 200.0));
         assert!(close(zoom_factor(1.0), 1.2));
         assert!(close(zoom_factor(-1.0), 1.0 / 1.2));
         assert!(close(zoom_factor(2.0), 1.44));

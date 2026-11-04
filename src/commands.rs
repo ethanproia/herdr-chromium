@@ -62,9 +62,11 @@ pub const COMMANDS: &[Command] = &[
     cmd("pane.swap", &[req("direction")], "Swap the focused pane with its neighbor in a direction."),
     cmd("terminal.peek", &[req("terminal")], "Peek at a running terminal over the tab, with keep-as-tab and close controls."),
     cmd("terminal.show", &[opt("terminal"), opt("pane")], "Show a terminal in a pane for now, in place of its own (no terminal: back)."),
-    cmd("terminal.copy", &[], "Copy the focused terminal's selection."),
+    cmd("terminal.copy", &[], "Copy the focused terminal's selection. With nothing selected, that key goes to the program."),
+    cmd("terminal.scroll", &[opt("lines"), opt("pages"), opt("to"), opt("terminal")], "Scroll a terminal's view of its history (default: the focused one). Give exactly one of: lines (a whole number; negative goes up, toward history), pages (a number, fractions allowed; one page is the terminal's rows), to: \"top\" (oldest history) or \"bottom\" (the live screen). This scrolls Herdr's view, not the program."),
     cmd("terminal.paste", &[], "Paste into the focused terminal (copied files as if dropped; an image alone as terminal.paste_image pastes it)."),
     cmd("terminal.paste_image", &[], "Ctrl+V: the clipboard's image as a file on the focused terminal's machine, when that's another one; on Windows, paste clipboard text; otherwise Ctrl+V goes to the terminal."),
+    cmd("terminal.search", &[], "Search the focused terminal's screen and scrollback; the find bar and query stay with that terminal."),
     cmd("agent.focus", &[req("terminal")], "Show an agent (sub-agents too)."),
     cmd("agent.next", &[], "Show the next agent, in the order the agents list shows them."),
     cmd("agent.prev", &[], "Show the previous agent."),
@@ -99,7 +101,7 @@ pub const COMMANDS: &[Command] = &[
     cmd("browser.remote", &[opt("machine")], "Open a remote desktop: the person's + menu only (not `herdr-app do`, where browser.* goes to the agent and an agent must not start the bridge). Starts the labs bridge (labs_checkout in settings.json) and opens its page in a new browser block with raw chords (Cmd+A/Z go to the remote machine). No machine: the page asks."),
     cmd("browser.devtools", &[opt("id"), opt("pane"), opt("open")], "Open a browser's DevTools (open: false closes them)."),
     // The app.
-    cmd("app.help", &[], "Show the keys."),
+    cmd("app.help", &[], "Toggle the keys dialog."),
     cmd("app.welcome", &[], "Show the welcome again."),
     cmd("app.whats_new", &[], "Show what this release brought (it opens once by itself after an update)."),
     cmd("app.feedback", &[opt("message"), opt("from")], "Draft feedback for the person to review and send (from: person or agent)."),
@@ -126,8 +128,26 @@ pub const COMMANDS: &[Command] = &[
     cmd("window.native", &[], "macOS: the title bar as the system sees it (see-through, full-size content, title hidden, fullscreen), for checking it."),
 ];
 
+// HERDR: test-only input, never in a normal run (an agent could click a mod's approval prompt).
+// It exists only when the app started with HERDR_APP_TEST_INPUT=1 (fork-run.sh's headless homes);
+// otherwise it is an unknown command, and `herdr-app commands` never lists it.
+pub const TEST_COMMANDS: &[Command] = &[
+    cmd("mod.click", &[req("copy"), req("x"), req("y")], "Test runs only: a left click (mouse down and up) at x, y in pixels from the top left of a shown mod copy (its slot: a block id)."),
+];
+
+/// HERDR: read once, at start: a later change to the environment can't turn it on.
+pub fn test_input() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("HERDR_APP_TEST_INPUT").as_deref() == Ok("1"))
+}
+
 pub fn find(name: &str) -> Option<&'static Command> {
-    COMMANDS.iter().find(|c| c.name == name)
+    find_with(name, test_input())
+}
+
+fn find_with(name: &str, test_input: bool) -> Option<&'static Command> {
+    let tests: &'static [Command] = if test_input { TEST_COMMANDS } else { &[] };
+    COMMANDS.iter().chain(tests).find(|c| c.name == name)
 }
 
 /// A key's `name:value` shorthand: the value fills the first argument (a
@@ -244,5 +264,14 @@ mod tests {
         assert_eq!(missing(move_, &json!({ "id": "sp1", "index": 1 })), None);
         // Names are optional: none is Herdr's automatic one.
         assert_eq!(missing(find("space.new").unwrap(), &json!({})), None);
+    }
+
+    // HERDR: test-only input exists only with HERDR_APP_TEST_INPUT=1, and is never listed.
+    #[test]
+    fn mod_click_only_with_test_input() {
+        assert!(super::find_with("mod.click", false).is_none(), "unknown in a normal run");
+        assert!(super::find_with("mod.click", true).is_some());
+        assert!(super::COMMANDS.iter().all(|c| c.name != "mod.click"), "never in the listed commands");
+        assert!(super::find_with("space.new", false).is_some());
     }
 }

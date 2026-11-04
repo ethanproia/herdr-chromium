@@ -185,12 +185,13 @@ impl Markup {
     }
 
     /// Draws the shapes (and the stroke in progress) over the page; `origin` is the page's top-left.
-    pub fn paint(&self, origin: gpui::Point<Pixels>, window: &mut Window) {
+    /// Draws the shapes (kept in page DIPs) at `fit` of their size from `origin`.
+    pub fn paint(&self, origin: gpui::Point<Pixels>, fit: f32, window: &mut Window) {
         for shape in self.visible() {
             for line in shape.polylines() {
                 let mut b = PathBuilder::stroke(px(WIDTH));
                 for (i, (x, y)) in line.iter().enumerate() {
-                    let p = origin + point(px(*x), px(*y));
+                    let p = origin + point(px(*x * fit), px(*y * fit));
                     if i == 0 { b.move_to(p) } else { b.line_to(p) }
                 }
                 if let Ok(path) = b.build() {
@@ -230,9 +231,9 @@ pub fn png(img: &RgbaImage) -> Vec<u8> {
 }
 
 /// The canvas element the view puts over the page while markup is shown (absolute, full size).
-pub fn element(markup: gpui::Entity<Markup>) -> impl gpui::IntoElement {
+pub fn element(markup: gpui::Entity<Markup>, fit: f32) -> impl gpui::IntoElement {
     use gpui::Styled as _;
-    gpui::canvas(|_, _, _| (), move |bounds: Bounds<Pixels>, _, window, cx| markup.read(cx).paint(bounds.origin, window)).absolute().size_full()
+    gpui::canvas(|_, _, _| (), move |bounds: Bounds<Pixels>, _, window, cx| markup.read(cx).paint(bounds.origin, fit, window)).absolute().size_full()
 }
 
 #[cfg(test)]
