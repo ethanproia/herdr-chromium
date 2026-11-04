@@ -271,6 +271,19 @@ impl BrowserInput {
         }
     }
 
+    /// Closes every annotation layer (pick, markup, comment, text edit) wherever it sits in the
+    /// stack; browse and an agent's lease stay.
+    pub fn close_annotation(&mut self) {
+        let before = self.owners.len();
+        self.owners.retain(|o| !matches!(o, Owner::Pick | Owner::Markup | Owner::Comment | Owner::TextEdit));
+        if self.owners.is_empty() {
+            self.owners.push(Owner::Browse);
+        }
+        if self.owners.len() != before {
+            self.overlay.push(OverlayEvent::Owner(self.owner()));
+        }
+    }
+
     /// Esc: the top layer closes (a comment back to pick, pick back to browse). In browse the page
     /// gets Esc; under a lease nothing changes. Returns false when Esc belongs to the page.
     pub fn escape(&mut self) -> bool {
@@ -1096,6 +1109,19 @@ mod tests {
     fn with<R>(cx: &mut gpui::VisualTestContext, block: &Entity<Block>, f: impl FnOnce(&mut BrowserInput) -> R) -> R {
         let input = block.read_with(cx, |b, _| b.input.clone());
         cx.update(|_, cx| input.update(cx, |i, _| f(i)))
+    }
+
+    #[test]
+    fn turning_a_device_on_closes_annotation_across_the_stack() {
+        // Under an agent's lease: the pick below it is stripped, the lease stays on top.
+        let mut j = BrowserInput::new("b1".into(), Arc::new(Recording::default()));
+        assert!(j.enter(Owner::Pick));
+        j.grant_lease("agent-7");
+        j.close_annotation();
+        assert_eq!(j.owner(), Owner::Agent);
+        j.end_lease();
+        assert_eq!(j.owner(), Owner::Browse, "no pick left under the lease");
+        assert!(j.enter(Owner::Markup), "and annotating still works in device mode");
     }
 
     #[test]

@@ -1502,7 +1502,7 @@ fn materialize_component(
         // HERDR: the host's player draws it, keyed by the script's `.id()`.
         Component::Video(spec) => {
             warn_unhonoured_a11y(&behavior, "video", &[]);
-            crate::video::render(&spec, element_id(id, behavior.key.clone()), behavior.key.clone(), refinement, window, cx)
+            crate::video::render(&spec, element_id(id, behavior.key.clone()), behavior.key.clone(), crate::video::scope_of(runtime), refinement, window, cx)
         }
         Component::Path {
             fill,

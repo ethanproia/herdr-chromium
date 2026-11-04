@@ -455,9 +455,10 @@ export function nextCommand(): Promise<string>;
 export function watchFolder(path: string): Promise<string[]>;
 
 /**
- * Plays the video element with this `.id()` (macOS; ids are window-wide, so prefix them with your
- * mod's name). A clip shows a still until played; at most 4 play at once (the one playing
- * longest pauses), and one off screen for a second pauses. Throws when no such video is on screen.
+ * Plays this mod copy's video element with this `.id()` (macOS; another copy's same id is a
+ * different clip). A clip shows a still until played; at most 4 play at once (the one playing
+ * longest pauses), and one outside its window's visible area for a second pauses. Throws when no
+ * such video is on screen.
  */
 export function videoPlay(id: string): null;
 /** Pauses it: the player is released and the last frame stays. */
@@ -466,7 +467,8 @@ export function videoPause(id: string): null;
 export function videoSeek(id: string, seconds: number): null;
 /**
  * The next event of that video: `{id, type, time, duration, error?}`, type `ready`, `time`
- * (4 a second while playing), `paused`, `ended` or `error`.
+ * (4 a second while playing), `paused`, `ended` or `error`. Throws when no such video is on screen;
+ * rejects when the video goes away (its element left, or its path changed).
  *   cx.spawn(async (cx) => { for (;;) { const e = await nextVideoEvent("board-clip-1"); ...; cx.notify(); } });
  */
 export function nextVideoEvent(id: string): Promise<{ id: string; type: "ready" | "time" | "paused" | "ended" | "error"; time: number; duration: number | null; error?: string }>;

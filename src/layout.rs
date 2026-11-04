@@ -77,6 +77,14 @@ pub fn browser_blocks(n: &Node) -> Vec<(String, BrowserBlock)> {
             }
         }
     }
+    // Popup ids are the host's alone: a layout block named like one never becomes a browser.
+    out.retain(|(id, _)| {
+        let popup = herdr_browser_protocol::is_popup_id(id);
+        if popup {
+            tracing::warn!("layout block {id:?} uses the popup id marker; not opened");
+        }
+        !popup
+    });
     out
 }
 
@@ -839,6 +847,16 @@ pub fn snap(x: f32, y: f32, w: f32, h: f32) -> (Edge, Align) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn layout_blocks_cant_take_popup_ids() {
+        let n: Node = serde_json::from_value(serde_json::json!({ "id": "root", "type": "row", "children": [
+            { "id": "web", "type": "block", "content": { "browser": { "url": "https://a.test" } } },
+            { "id": "mine~pop1", "type": "block", "content": { "browser": { "url": "https://b.test" } } }
+        ] })).unwrap();
+        let ids: Vec<String> = super::browser_blocks(&n).into_iter().map(|(id, _)| id).collect();
+        assert_eq!(ids, vec!["web".to_string()]);
+    }
     use super::*;
 
     #[test]

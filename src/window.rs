@@ -471,6 +471,9 @@ pub struct AppWindow {
     update_dismissed: Option<String>,
     /// HERDR: the bell's history (src/notifications.rs); saved from the poll when it changed.
     notes: crate::notifications::Store,
+    /// HERDR: the history file was read (once, when settings first load with `history` on).
+    notes_loaded: bool,
+    notes_save_failed: bool,
     /// HERDR: the core update error last put in the bell (a keyed item, read once it clears).
     core_error_noted: Option<String>,
     /// HERDR: the pointer is over the toast deck since then: every toast's timer waits.
@@ -564,7 +567,10 @@ impl AppWindow {
             polls: 0,
             update_ready: None,
             update_dismissed: None,
-            notes: crate::notifications::Store::load(&crate::notifications::path(), model::now_ms()),
+            // Loaded with the person's settings (reload_config), not before: `history: false` reads nothing.
+            notes: crate::notifications::Store::default(),
+            notes_loaded: false,
+            notes_save_failed: false,
             core_error_noted: None,
             deck_hover: None,
             deck_moves: RefCell::default(),
@@ -610,7 +616,7 @@ impl AppWindow {
         w.show_layout_notes(window, cx);
         if let (Some(n), false) = (&name, gone.is_empty()) {
             let note = json!({ "title": format!("{n} needs mods that aren't here"), "body": format!("Showing Herdr instead. Missing: {}. Your {n} layout file is still there.", gone.join(", ")), "level": "info", "timeout": 12000 });
-            w.post_note("app", "Herdr", note, window, cx);
+            w.post_note("app", "herdr", "Herdr", note, window, cx);
         }
 
         w._tasks.push(cx.spawn_in(window, async move |this, cx| {
@@ -901,6 +907,14 @@ impl AppWindow {
                     // HERDR: a changed mods_disabled list: find mods again and rebind keys.
                     let off_changed = p.mods_disabled != self.person.mods_disabled;
                     self.person = p;
+                    // HERDR: the bell's history loads with the first settings that keep it, and every
+                    // settings change (DND, muted sources) reaches the snapshot at once.
+                    if !self.notes_loaded && self.person.notifications.history {
+                        self.notes_loaded = true;
+                        let saved = crate::notifications::Store::load(&crate::notifications::path(), model::now_ms());
+                        self.notes.merge_loaded(saved);
+                    }
+                    self.publish_notes(cx);
                     if off_changed {
                         self.sync_folders(window, cx);
                         self.watched.keys = Some(std::time::SystemTime::UNIX_EPOCH);
@@ -1137,12 +1151,12 @@ impl AppWindow {
     fn show_layout_notes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         for clone in mods::take_sync_notes() {
             let n = json!({ "title": format!("Your edits are in {clone}"), "body": "Herdr's own layouts and mods can't be changed: clone one to make it yours.", "level": "info", "timeout": 12000, "keep": false });
-            self.post_note("app", "Herdr", n, window, cx);
+            self.post_note("app", "herdr", "Herdr", n, window, cx);
         }
         // HERDR: keys a mod wanted that the person already uses (src/mod_keys.rs).
         for line in crate::mod_keys::take_notes() {
             let n = json!({ "title": "Mod keys", "body": line, "level": "info", "timeout": 12000 });
-            self.post_note("app", "Herdr", n, window, cx);
+            self.post_note("app", "herdr", "Herdr", n, window, cx);
         }
     }
 
@@ -1471,6 +1485,12 @@ impl AppWindow {
         // A mod copy lives while its slot is in the layout, hidden or not (an
         // inactive stack child, a hidden column, a pane in another tab), so it
         // keeps its place; only shown slots start a copy. Gone or changed: dropped.
+        // HERDR: the shown layout reaches mods before any new copy starts: a copy's first
+        // layout() otherwise saw the previous layout, and core's start-time layout.set wrote that
+        // stale tree over the new layout's file (switching to a core layout rewrote it as stock).
+        if mods::publish_layout(&self.chrome) {
+            self.refresh_snapshot_mods(cx);
+        }
         let owned = self.owned_mods();
         let gone: Vec<_> = self.copies.iter().filter(|(slot, copy)| owned.get(*slot).is_none_or(|inst| *inst != copy.inst)).map(|(slot, _)| slot.clone()).collect();
         for slot in gone {
@@ -1864,13 +1884,15 @@ impl AppWindow {
     }
 
     fn layout_notice(&mut self, title: &str, body: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.post_note("machines", "Herdr", json!({"title":title,"body":body,"level":"info"}), window, cx);
+        self.post_note("machines", "herdr", "Herdr", json!({"title":title,"body":body,"level":"info"}), window, cx);
     }
 
     /// Finish the accepted edit and any newer projection before the window goes.
     pub fn drain_documents(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.draining { return; }
         self.save();
+        // HERDR: the bell's history is written before the window goes.
+        self.flush_notes();
         self.draining = true;
         QUITTING.store(true, std::sync::atomic::Ordering::SeqCst);
         while let Some(address) = self.pending_terminals.keys().next().cloned() {
@@ -2088,7 +2110,7 @@ impl AppWindow {
     /// looking at that agent.
     fn alert(&mut self, addr: &str, alert: model::Alert, looking: bool, window: &mut Window, cx: &mut Context<Self>) {
         // HERDR: Do Not Disturb or muted agents: no sound (the bell still records it).
-        if settings::get().sounds.enabled && settings::get().notifications.speaks("agents") {
+        if settings::get().sounds.enabled && self.person.notifications.speaks("agents") {
             crate::sound::play(if alert == model::Alert::Blocked { "blocked" } else { "done" });
         }
         // Needing the person brings a settled tab back.
@@ -2123,7 +2145,7 @@ impl AppWindow {
             "title": title, "body": place, "level": level, "key": key,
             "action": { "name": "agent.focus", "args": { "terminal": addr } },
         });
-        self.post_note("agents", &name, notification, window, cx);
+        self.post_note("agents", "herdr", &name, notification, window, cx);
     }
 
     /// Keeps the model true to core, on every listing: drops panes whose terminal
@@ -2343,7 +2365,7 @@ impl AppWindow {
             }).await;
             if let Some(body) = failure {
                 let _ = this.update_in(cx, |this, window, cx| {
-                    this.post_note("app", "Herdr", json!({"title":"Terminal failed to start", "body":body, "level":"error"}), window, cx);
+                    this.post_note("app", "herdr", "Herdr", json!({"title":"Terminal failed to start", "body":body, "level":"error"}), window, cx);
                 });
             }
         }).detach();
@@ -2787,7 +2809,7 @@ impl AppWindow {
         // A click or key has nobody to read the reply: show why it failed.
         if let Some(error) = self.run_as(name, args, true, window, cx).get("error").and_then(Value::as_str) {
             let n = json!({"title":format!("{name} failed"),"body":error,"level":"error","key":format!("cmd:{name}")});
-            self.post_note("app", "Herdr", n, window, cx);
+            self.post_note("app", "herdr", "Herdr", n, window, cx);
         }
     }
 
@@ -3835,9 +3857,9 @@ impl AppWindow {
                 "floats": self.float_status(),
                 // HERDR: the bell, for agents and tests (no item text).
                 "notifications": {
-                    "unread": self.notes.unread(&settings::get().notifications.muted_sources),
+                    "unread": self.notes.unread(&self.person.notifications.muted_sources),
                     "total": self.notes.items.len(),
-                    "dnd": settings::get().notifications.dnd,
+                    "dnd": self.person.notifications.dnd,
                 },
                 "overlays": self.overlays.iter().map(|o| match &o.layout {
                     Some(_) => Some("layout".to_owned()),
@@ -3924,7 +3946,7 @@ impl AppWindow {
         let core_error = crate::update::core().error;
         if core_error != self.core_error_noted {
             match &core_error {
-                Some(e) => self.post_note("updates", "herdr-core", json!({
+                Some(e) => self.post_note("updates", "herdr", "herdr-core", json!({
                     "title": "herdr-core update failed", "body": e, "level": "error", "key": "updates:core",
                     // The pinned banner already shows it: history only, no toast.
                     "silent": true,
@@ -3939,12 +3961,7 @@ impl AppWindow {
             self.core_error_noted = core_error;
         }
         // HERDR: the bell's history is written at most once a poll; `history: false` keeps it in memory.
-        if self.notes.dirty && settings::get().notifications.history {
-            if let Err(e) = self.notes.save(&crate::notifications::path()) {
-                tracing::warn!("notifications: cannot save the history: {e}");
-                self.notes.dirty = false;
-            }
-        }
+        self.flush_notes();
         let now = Instant::now();
         // HERDR: toasts wait while the pointer is over the deck; a timed-out one fades, then goes.
         if self.deck_hover.is_none() {
@@ -4292,12 +4309,15 @@ impl AppWindow {
                 }
                 // A download finished or failed: a toast, like other notices.
                 crate::browser::view::BrowserEvent::Notice(n) => {
-                    // A failed download's URL goes into the history without its query or fragment.
+                    // A failed download's URL goes into the history without its user, query or fragment.
                     let mut n = serde_json::to_value(n).unwrap_or(Value::Null);
-                    if let Some(b) = n["body"].as_str() {
+                    // Only a failure names a URL; a finished download's body is its saved path, kept as is.
+                    if n["level"] == "error"
+                        && let Some(b) = n["body"].as_str()
+                    {
                         n["body"] = json!(crate::notifications::strip_query(b));
                     }
-                    this.post_note("browser", "Browser", n, window, cx);
+                    this.post_note("browser", "herdr", "Browser", n, window, cx);
                     return;
                 }
             };
@@ -4432,7 +4452,7 @@ impl AppWindow {
                     cx.notify();
                 }
                 Err(e) => {
-                    this.post_note("machines", "Remote desktop", json!({"title":"Remote desktop failed","body":e,"level":"error"}), window, cx);
+                    this.post_note("machines", "herdr", "Remote desktop", json!({"title":"Remote desktop failed","body":e,"level":"error"}), window, cx);
                 }
             });
         })
@@ -4662,13 +4682,18 @@ impl AppWindow {
     /// HERDR: every notice goes through here: recorded in the bell's history (unless private or a
     /// quick confirmation) and shown as a toast unless Do Not Disturb or its source is muted.
     /// `n` is a toast's notification: title, body, level, icon, action, timeout, key, keep, private.
-    fn post_note(&mut self, source: &str, from: &str, mut n: Value, window: &mut Window, cx: &mut Context<Self>) {
+    /// `owner`: who posted it, assigned here (a mod's folder, or "herdr"); `from` is only what it shows.
+    fn post_note(&mut self, source: &str, owner: &str, from: &str, mut n: Value, window: &mut Window, cx: &mut Context<Self>) {
         use crate::notifications::{Note, keeps};
+        // The history's id is ours: a caller can't hand the toast one (the toast marks it read).
+        let Some(fields) = n.as_object_mut() else { return };
+        fields.remove("notification_id");
         let level = n["level"].as_str().unwrap_or("info").to_owned();
         if keeps(&level, n["timeout"].as_u64(), n["keep"].as_bool(), n["private"].as_bool().unwrap_or(false)) {
             let text = |k: &str| n[k].as_str().unwrap_or_default().to_owned();
             let note = Note {
                 source: source.to_owned(),
+                owner: owner.to_owned(),
                 from: from.to_owned(),
                 title: text("title"),
                 body: text("body"),
@@ -4681,7 +4706,7 @@ impl AppWindow {
             n["notification_id"] = json!(id);
             self.publish_notes(cx);
         }
-        if !n["silent"].as_bool().unwrap_or(false) && settings::get().notifications.speaks(source) {
+        if !n["silent"].as_bool().unwrap_or(false) && self.person.notifications.speaks(source) {
             let toast = n["toast_id"].as_str().map(str::to_owned).unwrap_or_else(mods::new_overlay_id);
             self.open_overlay(toast, json!({ "kind": "toast", "notification": n }), window, cx);
         }
@@ -4691,7 +4716,7 @@ impl AppWindow {
     fn mod_notes(&mut self, op: &str, arg: Value, folder: String, owner: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
         use crate::notifications::Target;
         match op {
-            "post" => self.post_note("mods", &folder, arg, window, cx),
+            "post" => self.post_note("mods", &folder, &folder, arg, window, cx),
             "read" | "clear" => {
                 let Some(t) = Target::from_value(&arg) else { return };
                 if op == "read" { self.notes.mark_read_as(&t, owner.as_deref()); } else { self.notes.clear_as(&t, owner.as_deref()); }
@@ -4716,9 +4741,26 @@ impl AppWindow {
         }
     }
 
+    /// HERDR: writes the history if it changed. A failed write stays dirty and is tried again on
+    /// the next poll (warned once until it works); quitting flushes it too.
+    fn flush_notes(&mut self) {
+        if !self.notes.dirty || !self.person.notifications.history {
+            return;
+        }
+        match self.notes.save(&crate::notifications::path()) {
+            Ok(()) => self.notes_save_failed = false,
+            Err(e) => {
+                if !self.notes_save_failed {
+                    tracing::warn!("notifications: cannot save the history (will retry): {e}");
+                }
+                self.notes_save_failed = true;
+            }
+        }
+    }
+
     /// HERDR: mods reading `notifications()` re-render; the file is written from the poll.
     fn publish_notes(&mut self, cx: &mut Context<Self>) {
-        if mods::publish_notifications(crate::notifications::view(&self.notes, &settings::get().notifications)) {
+        if mods::publish_notifications(crate::notifications::view(&self.notes, &self.person.notifications)) {
             self.refresh_snapshot_mods(cx);
         }
     }
