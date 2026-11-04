@@ -70,13 +70,15 @@ export default class PaneHeader {
     // A note flush shares one notepad.flushReq. Hold the button until this one finishes
     // so a second click cannot replace the request the first handshake is waiting on.
     if (claim.hold) this.copying = true;
-    runPaneCopy(src[0], src[1], this.me()?.mod, cx).then((ok) => {
+    // A click's cx is gone after its first await; the copy runs in an AsyncContext from cx.spawn.
+    const mod = this.me()?.mod;
+    cx.spawn(async (cx) => {
+      let ok = false;
+      try { ok = await runPaneCopy(src[0], src[1], mod, cx); } catch { ok = false; }
       if (claim.hold) this.copying = false;
       this.copied = ok;
       cx.notify();
       if (ok) cx.timer.after(1200, (cx) => { this.copied = false; cx.notify(); });
-    }, () => {
-      if (claim.hold) this.copying = false;
     });
   }
 

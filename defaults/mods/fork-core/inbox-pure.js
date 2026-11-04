@@ -85,23 +85,35 @@ export function badgeState(snap) {
   return { show: true, dot, tone: dot ? (error ? "error" : "accent") : null, dnd: snap.settings?.dnd === true, unread: snap.unread };
 }
 
+// A notification action is host-supplied (browser, mods, agents) and core holds notifications: "all".
+// A click may only navigate: focus a pane or agent, select a tab, show or select a layout part, or open a mod.
+// Anything else (terminal.kill, pane.close, layout.set / layout.reset, …) is dropped. Mark-read and close still happen.
+const CLICK_EXACT = new Set(["pane.focus", "agent.focus", "tab.select", "mod.open", "layout.show", "layout.hide", "layout.select", "layout.toggle"]);
+export function actionAllowed(name) {
+  return typeof name === "string" && CLICK_EXACT.has(name);
+}
+
+// The command a click may run, or null when the row is stale, has no action, or the name is not allowed.
+function clickRun(it) {
+  if (!it || it.stale || !it.action || !actionAllowed(it.action.name)) return null;
+  return { name: it.action.name, args: it.action.args ?? {} };
+}
+
 // One row's look and what a click may do. A stale row (its terminal or agent is gone) is dimmed and its
-// action does not run; a click still marks it read.
+// action does not run; a click still marks it read. A disallowed action is not dimmed, and does not run.
 export function rowState(it) {
-  const actionable = !it.stale && Boolean(it.action);
   return {
     unread: !it.read,
     dim: it.stale,
-    actionable,
+    actionable: clickRun(it) !== null,
     tall: Boolean(it.body),
     countLabel: it.count > 1 ? `×${it.count}` : "",
   };
 }
 
-// What a row click does, as data: run its action (when it can), mark it read, close the panel.
+// What a row click does, as data: run its action when clickRun allows it, mark it read, close the panel.
 export function rowClickPlan(it) {
-  const s = rowState(it);
-  return { run: s.actionable ? { name: it.action.name, args: it.action.args ?? {} } : null, markRead: it.id, close: true };
+  return { run: clickRun(it), markRead: it.id, close: true };
 }
 
 // Which icon a row shows: the item's own, else the level's for a warning or error, else its source's.
@@ -124,7 +136,8 @@ export function inboxHeight(snap, now) {
   return Math.min(INBOX_MAX_H, h);
 }
 
-// The bell's right-click menu: [label, command, args, enabled].
+// The bell's right-click menu: [label, command, args, enabled]. The command ids are local. They are not
+// host commands; bellMenuPlan maps them onto the same calls as the panel header.
 export function bellMenuItems(snap) {
   const s = snap ?? { unread: 0, items: [], settings: { dnd: false } };
   return [
@@ -132,4 +145,14 @@ export function bellMenuItems(snap) {
     ["Do Not Disturb", "notifications.toggle_dnd", {}],
     ["Clear All", "notifications.clear_all", {}, s.items.length > 0],
   ];
+}
+
+// What one bell-menu row does. null means this is some other menu row, and the menu handles it itself.
+// stay: the Do Not Disturb check flips in place; the other two close the menu. DND follows the snapshot,
+// same as the panel's button (missing snapshot is "off", so the click turns it on).
+export function bellMenuPlan(command, snap) {
+  if (command === "notifications.read_all") return { fn: "markRead", arg: "all", stay: false };
+  if (command === "notifications.clear_all") return { fn: "clearNotifications", arg: "all", stay: false };
+  if (command === "notifications.toggle_dnd") return { fn: "setDnd", arg: snap?.settings?.dnd !== true, stay: true };
+  return null;
 }

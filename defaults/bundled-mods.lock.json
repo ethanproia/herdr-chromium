@@ -2,18 +2,18 @@
   "repo": "essexlabs/labs",
   "mods": {
     "agents-named": {
-      "branch": "ethan/herdr-core-retire",
-      "commit": "f3ab809ed6c5aaffa42ca54f4e5bc14bc5f936a4",
+      "branch": "main",
+      "commit": "d1c770490e00c04932ffab1347763972bbc1efb0",
       "version": "0.1.0",
-      "pr": "essexlabs/labs#1319",
+      "pr": "essexlabs/labs#1337 (merged to main; on #1334)",
       "path": "projects/herdr-mods/clones/mac/agents-named"
     },
     "board": {
-      "branch": "ethan/herdr-board",
-      "commit": "d2b77dbdbb3ab08a3eb7b14c6a88a29092009e4e",
+      "branch": "main",
+      "commit": "10be36df6fa83ce75bc72e89acfa9ea3877d6160",
       "path": "projects/herdr-mods/board/mods/board",
       "version": "0.1.0",
-      "pr": "essexlabs/labs#1329 (merged to main 10be36df6)",
+      "pr": "essexlabs/labs#1329 (merged to main; board ethan/herdr-board d2b77dbdb)",
       "exec": [
         "cp",
         "mkdir",
@@ -29,10 +29,10 @@
       "exec_note": "also runs ffmpeg by its found path (toolPath), not a literal name"
     },
     "core": {
-      "branch": "ethan/herdr-core-retire",
-      "commit": "f3ab809ed6c5aaffa42ca54f4e5bc14bc5f936a4",
+      "branch": "main",
+      "commit": "d1c770490e00c04932ffab1347763972bbc1efb0",
       "version": "0.1.0",
-      "pr": "essexlabs/labs#1319",
+      "pr": "essexlabs/labs#1337 (merged to main; on #1334)",
       "path": "projects/herdr-mods/core",
       "rename": "paths",
       "exec": [
@@ -41,14 +41,15 @@
       ]
     },
     "notepad": {
-      "branch": "ethan/herdr-mods",
-      "commit": "8d50bcaf1147ed2fdd5278a97378dc82af272a3d",
+      "branch": "main",
+      "commit": "ec71dee685393fa2476e4c75eb1c0d864d418f0c",
       "path": "projects/herdr-mods/notepad",
       "version": "0.1.0",
-      "pr": "essexlabs/labs#1314",
+      "pr": "essexlabs/labs#1334 (merged to main)",
       "exec": [
         "cp",
         "curl",
+        "dig",
         "find",
         "git",
         "mkdir",
@@ -57,29 +58,31 @@
         "rm",
         "rmdir",
         "sh",
-        "sips"
+        "sips",
+        "test"
       ]
     },
     "notepad-view": {
       "path": "projects/herdr-mods/notepad-view",
       "version": "0.1.0",
-      "branch": "ethan/herdr-mods",
-      "commit": "06cb848eb980cf99fc4c4f238c75141bee540cf4",
-      "pr": "essexlabs/labs#1294 (merged)"
+      "branch": "main",
+      "commit": "ec71dee685393fa2476e4c75eb1c0d864d418f0c",
+      "pr": "essexlabs/labs#1334 (merged to main)"
     },
     "remote-desktop": {
-      "branch": "ethan/herdr-mods-notepad",
-      "commit": "9bfdce0a9fbb95e66e70f289f1fed51bb9862171",
+      "branch": "main",
+      "commit": "1e99085dbda6c6a0ae0ba6abedb5ecacb8178522",
       "path": "projects/herdr-mods/remote-desktop/mod",
       "version": "0.1.0",
       "ship": false,
-      "why": "duplicates the native browser.remote entry; held until Ethan picks one"
+      "why": "duplicates the native browser.remote entry; held until Ethan picks one",
+      "pr": "essexlabs/labs#1325 (merged to main)"
     },
     "spaces-browser": {
-      "branch": "ethan/herdr-core-retire",
-      "commit": "f3ab809ed6c5aaffa42ca54f4e5bc14bc5f936a4",
+      "branch": "main",
+      "commit": "d1c770490e00c04932ffab1347763972bbc1efb0",
       "version": "0.1.0",
-      "pr": "essexlabs/labs#1319",
+      "pr": "essexlabs/labs#1337 (merged to main; on #1334)",
       "path": "projects/herdr-mods/clones/mac/spaces-browser",
       "exec": [
         "git"
@@ -87,10 +90,10 @@
     }
   },
   "layout": {
-    "branch": "ethan/herdr-core-retire",
-    "commit": "f3ab809ed6c5aaffa42ca54f4e5bc14bc5f936a4",
+    "branch": "main",
+    "commit": "d1c770490e00c04932ffab1347763972bbc1efb0",
     "version": "0.1.0",
-    "pr": "essexlabs/labs#1303 (on #1298)",
+    "pr": "essexlabs/labs#1337 (merged to main; on #1334)",
     "path": "projects/herdr-mods/clones/mac/layouts/Labs.json",
     "preview": "projects/herdr-mods/clones/mac/layouts/labs.svg"
   },
