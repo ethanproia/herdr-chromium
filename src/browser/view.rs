@@ -633,6 +633,11 @@ pub struct BrowserView {
     popup_closed: bool,
     /// Made by the host already (a popup): the first layout resizes it instead of creating it.
     adopted: bool,
+    /// Responsive mode: the device the page is previewed as (its real viewport), and the page
+    /// area's own size (the device is letterboxed into it); the device menu while open.
+    device: Option<super::devices::Mode>,
+    measured: Option<(Dips, f32)>,
+    device_menu: bool,
     /// Site permission requests waiting on the person, oldest first (req, origin, kinds); the bar
     /// shows the first. The host denies any left after 60 s, on close and when the page changes.
     prompts: std::collections::VecDeque<(u64, String, Vec<String>)>,
@@ -907,6 +912,9 @@ impl BrowserView {
             opener: None,
             popup_closed: false,
             adopted: false,
+            device: None,
+            measured: None,
+            device_menu: false,
             prompts: Default::default(),
             prompt_remember: false,
             load_error: None,
@@ -1231,6 +1239,9 @@ impl BrowserView {
         if self.crashed.is_some() || size.w < 1.0 || size.h < 1.0 {
             return;
         }
+        self.measured = Some((size, scale));
+        // Responsive mode: the page gets the device's real viewport, whatever the block's size.
+        let (size, scale) = self.device.as_ref().map_or((size, scale), |d| (Dips { w: d.w, h: d.h }, d.scale));
         match self.sized {
             None if self.adopted => {
                 self.link.send(AppToHost::Resize { id: self.id.clone(), size, scale });
@@ -1271,6 +1282,49 @@ impl BrowserView {
     pub fn set_prompt_remember(&mut self, on: bool, cx: &mut Context<Self>) {
         self.prompt_remember = on && self.block.profile == super::agent::PERSON_PROFILE;
         cx.notify();
+    }
+
+    /// Responsive mode on (a device) or off: the page is resized to the device (or back to the
+    /// block) and told the device's UA and touch (or that every override is gone).
+    pub fn set_device(&mut self, mode: Option<super::devices::Mode>, cx: &mut Context<Self>) {
+        if mode == self.device {
+            return;
+        }
+        self.device = mode;
+        self.device_menu = false;
+        let off = self.device.is_some();
+        self.input.update(cx, |i, _| i.set_annotate_off(off));
+        self.drain_overlay(cx);
+        self.link.send(AppToHost::SetDevice { id: self.id.clone(), device: self.device.as_ref().map(|d| d.device()) });
+        if let Some((size, scale)) = self.measured {
+            self.laid_out(size, scale);
+        }
+        cx.notify();
+    }
+
+    /// The device being previewed, if any.
+    pub fn device(&self) -> Option<&super::devices::Mode> {
+        self.device.as_ref()
+    }
+
+    fn device_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.device_menu {
+            return None;
+        }
+        let item = |id: &'static str, label: String| div().id(id).px_2().py_1().rounded_sm().cursor_pointer().hover(|s| s.bg(hsla(0., 0., 1., 0.1))).child(label);
+        let mut menu = div().id("device-menu").absolute().top(px(2.)).right(px(8.)).flex().flex_col().p_1().rounded_md().text_xs().bg(rgb(0x1f1f1f)).text_color(rgb(0xf2f2f2));
+        menu = menu.child(item("device-off", "Responsive off".into()).on_click(cx.listener(|v, _, _, cx| v.set_device(None, cx))));
+        for (i, p) in super::devices::PRESETS.iter().enumerate() {
+            let name = p.name;
+            menu = menu.child(item(["device-0", "device-1", "device-2"][i.min(2)], format!("{} · {}×{}", p.name, p.w, p.h)).on_click(cx.listener(move |v, _, _, cx| v.set_device(super::devices::Mode::preset(name), cx))));
+        }
+        if self.device.is_some() {
+            menu = menu.child(item("device-rotate", "Rotate".into()).on_click(cx.listener(|v, _, _, cx| {
+                let r = v.device.as_ref().map(|d| d.rotated());
+                v.set_device(r, cx);
+            })));
+        }
+        Some(menu.into_any_element())
     }
 
     /// Makes the popups the host announced (needs the window) and drops closed ones.
@@ -2568,11 +2622,20 @@ impl BrowserView {
             .child(div().flex_1().min_w_0().overflow_hidden().child(Input::new(&self.address)))
             .when(self.state.loading, |d| d.child("loading"))
             // A1: one Design button; the strip under the bar holds every design control.
-            .child(button("Design", true).on_click(cx.listener(|v, _, _, cx| v.toggle_mode(Owner::Pick, cx))))
+            .child(if self.device.is_some() {
+                // Pick and markup overlays assume an unscaled page: off while a device is previewed.
+                button("Design", false).tooltip(|_, cx| cx.new(|_| Hint("Turn off device mode to annotate")).into())
+            } else {
+                button("Design", true).on_click(cx.listener(|v, _, _, cx| v.toggle_mode(Owner::Pick, cx)))
+            })
             // The zoom label shows only off 100 %; a click resets it.
             .when(self.zoom_level.abs() > 1e-6, |d| {
                 d.child(div().id("zoom-label").px_1().rounded_sm().cursor_pointer().bg(hsla(0., 0., 0.5, 0.15)).child(zoom::percent(self.zoom_level)).on_click(cx.listener(|v, _, _, cx| v.set_zoom(0.0, cx))))
             })
+            .child(button(if self.device.is_some() { "📱•" } else { "📱" }, true).on_click(cx.listener(|v, _, _, cx| {
+                v.device_menu = !v.device_menu;
+                cx.notify();
+            })))
             .child(button("⬇", true).on_click(cx.listener(|v, _, _, cx| v.toggle_downloads(cx))))
             // S29: what agents may do here. Tinted while any grant is on; "Agent" while one drives it.
             .child({
@@ -2619,6 +2682,14 @@ impl Render for BrowserView {
         self.input.update(cx, |i, _| i.set_focused(focused));
         let me = cx.entity().downgrade();
         let (input_el, focus) = (self.input.clone(), self.focus.clone());
+        // Responsive mode: the device letterboxed into the page area, drawn at `fit`.
+        let fit = match (&self.device, self.measured) {
+            (Some(d), Some((area, _))) => d.fit(area.w, area.h),
+            _ => 1.0,
+        };
+        self.input.update(cx, |i, _| i.set_fit(fit));
+        let boxed = self.device.is_some();
+        let (box_input, box_focus) = (self.input.clone(), self.focus.clone());
         let page = div()
             .id("page")
             .relative()
@@ -2643,7 +2714,11 @@ impl Render for BrowserView {
                         });
                     },
                     // Where the page is, and the window's text input (IME) while focused.
-                    move |bounds, _, window, cx| input::paint(&input_el, &focus, bounds, window, cx),
+                    move |bounds, _, window, cx| {
+                        if !boxed {
+                            input::paint(&input_el, &focus, bounds, window, cx);
+                        }
+                    },
                 )
                 .absolute()
                 .size_full(),
@@ -2673,6 +2748,31 @@ impl Render for BrowserView {
             _ if masked => page.child(
                 div().absolute().size_full().flex().items_center().justify_center().bg(rgb(0x202020)).text_color(rgb(0x909090)).text_sm().child("Hidden in screenshots: marked sensitive"),
             ),
+            (None, Some(frame)) if boxed => {
+                let d = self.device.clone().expect("boxed");
+                page.bg(rgb(0x2a2a2a)).child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .gap_1()
+                        .child(div().text_xs().text_color(rgb(0xb0b0b0)).child(d.label(fit)))
+                        .child(
+                            div()
+                                .relative()
+                                .w(px(d.w * fit))
+                                .h(px(d.h * fit))
+                                .bg(rgb(0xffffff))
+                                .child(div().absolute().size_full().child(frame))
+                                .child(canvas(|_, _, _| (), move |bounds, _, window, cx| input::paint(&box_input, &box_focus, bounds, window, cx)).absolute().size_full()),
+                        ),
+                )
+                .children(self.load_error_card(cx))
+                .children(self.permission_bar(cx))
+            }
             (None, Some(frame)) => page.child(div().absolute().size_full().child(frame)).children(self.load_error_card(cx)).children(self.permission_bar(cx)),
             (None, None) => page.child(
                 div().absolute().size_full().flex().items_center().justify_center().text_color(rgb(0x606060)).text_sm().child(self.shown_url()),
@@ -2740,7 +2840,8 @@ impl Render for BrowserView {
             .child(page)
             .child(self.dialogs.clone())
             .children(self.downloads_panel(cx))
-            .children(self.shield_panel(cx));
+            .children(self.shield_panel(cx))
+            .children(self.device_menu(cx));
         // S10: the style panel in its own column beside the page.
         if let Some(panel) = self.style_panel.clone() {
             for (req, ok, rows) in std::mem::take(&mut self.style_results) {
@@ -2844,6 +2945,25 @@ fn bind_keys(cx: &mut App) {
     }
 }
 
+/// `browser.device`'s arguments: a named device, a custom size, or off. Never a user agent: those
+/// come only from the device list.
+pub fn device_mode(a: &serde_json::Value) -> Result<Option<super::devices::Mode>, String> {
+    if a.get("user_agent").is_some() || a.get("userAgent").is_some() {
+        return Err("browser.device takes a device name or a size, not a user agent".into());
+    }
+    if a.get("off").and_then(serde_json::Value::as_bool) == Some(true) || a.get("name").and_then(serde_json::Value::as_str) == Some("off") {
+        return Ok(None);
+    }
+    if let Some(name) = a.get("name").and_then(serde_json::Value::as_str) {
+        return super::devices::Mode::preset(name).map(Some).ok_or_else(|| format!("no device {name:?}: try iPhone 15, Pixel 8, iPad Air, or w and h"));
+    }
+    let num = |k: &str| a.get(k).and_then(serde_json::Value::as_f64).map(|v| v as f32);
+    match (num("w"), num("h")) {
+        (Some(w), Some(h)) => Ok(Some(super::devices::Mode::custom(w, h, num("scale")))),
+        _ => Err("browser.device needs name, or w and h, or off: true".into()),
+    }
+}
+
 /// The broker's grant check: the agent's grants and the block's profile, read fresh on every call
 /// and event, so a revoked grant or a closed block takes effect at once.
 pub fn broker_authorizer(agent: Arc<Mutex<Agent>>, states: Arc<Mutex<HashMap<BrowserId, BrowserState>>>) -> super::broker::Authorize {
@@ -2857,6 +2977,15 @@ pub fn broker_authorizer(agent: Arc<Mutex<Agent>>, states: Arc<Mutex<HashMap<Bro
         };
         agent.lock().unwrap().broker_allowed(&grants_of, method, profile.as_deref())
     })
+}
+
+/// A small tooltip.
+struct Hint(&'static str);
+
+impl Render for Hint {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().px_2().py_1().rounded_sm().text_xs().bg(rgb(0x1f1f1f)).text_color(rgb(0xf2f2f2)).child(self.0)
+    }
 }
 
 /// Set while `herdr-app shot` renders the window: blocks marked sensitive draw a cover instead of the page.
@@ -2934,6 +3063,16 @@ impl Browsers {
             view.update(cx, |v, _| v.ensure_page());
         }
         let focus = Focus { focused: self.focused.clone().filter(|f| self.views.contains_key(f)), block_of_pane };
+        if name == "browser.device" {
+            let r = agent.lock().unwrap().check(name, args, self, &focus).and_then(|id| Ok((id, device_mode(args)?)));
+            reply(r.and_then(|(id, mode)| {
+                let view = self.views.get(&id).map(|(v, _)| v.clone()).ok_or_else(|| format!("no browser {id:?}"))?;
+                let label = mode.as_ref().map(|m| m.label(1.0));
+                view.update(cx, |v, cx| v.set_device(mode, cx));
+                Ok(serde_json::json!({ "id": id, "device": label }))
+            }));
+            return Step::Done;
+        }
         agent.lock().unwrap().run(name, args, self, &focus, reply)
     }
 
@@ -3090,6 +3229,18 @@ mod tests {
         assert_eq!(cdp_port(Some("9222"), true), Some(9222));
         assert_eq!(cdp_port(Some(" 0 "), true), Some(0));
         assert_eq!(cdp_port(Some("9222"), false), None, "release builds never open a port");
+    }
+
+    #[::core::prelude::v1::test]
+    fn browser_device_takes_a_name_or_a_size_never_a_user_agent() {
+        use serde_json::json;
+        assert_eq!(device_mode(&json!({ "name": "Pixel 8" })).unwrap().unwrap().w, 412.0);
+        assert_eq!(device_mode(&json!({ "w": 500, "h": 700 })).unwrap().unwrap().user_agent, None);
+        assert_eq!(device_mode(&json!({ "off": true })).unwrap(), None);
+        assert!(device_mode(&json!({ "name": "iPhone 15", "user_agent": "evil" })).unwrap_err().contains("not a user agent"));
+        assert!(device_mode(&json!({ "w": 500, "userAgent": "evil" })).is_err());
+        assert!(device_mode(&json!({ "name": "Nokia" })).is_err());
+        assert!(device_mode(&json!({})).is_err());
     }
 
     #[::core::prelude::v1::test]
