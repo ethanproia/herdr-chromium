@@ -2,8 +2,7 @@
 
 import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex, Scrollbar, InputState, Input } from "gpui-base";
-// HERDR: appInfo is the fork's build (this frame mod ships only with the fork).
-import { hc, run, theme, themes, fonts, updates, telemetry, settings, layouts, shared, appHome, appInfo, readTextFile, writeTextFile, playSound, props, closeOverlay, window } from "herdr";
+import { hc, run, theme, themes, fonts, updates, telemetry, settings, layouts, shared, appHome, readTextFile, writeTextFile, playSound, props, closeOverlay, window } from "herdr";
 
 const I = (name) => `frame/settings/${name}.svg`;
 
@@ -734,8 +733,8 @@ export default class Settings extends View {
             : u.checks
               ? [result, check("st-check-core")]
               : ["Not checked: a build from source looks for no updates.", null];
-    // HERDR: the fork's build line and its bundled mods' pins, above the stock Herdr rows.
-    const info = appInfo?.();
+    // HERDR: the fork's build (updates().build) and its bundled mods' pins, above the stock Herdr rows.
+    const info = u.build;
     return v_flex()
       .w_full()
       .when(Boolean(info), (el) => el

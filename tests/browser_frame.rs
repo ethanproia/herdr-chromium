@@ -7,6 +7,12 @@
 #[path = "../src/browser/frame.rs"]
 mod frame;
 
+/// frame.rs's HERDR_BROWSER_TRACE calls (the app's trace module needs the whole app): off here.
+#[cfg(target_os = "macos")]
+mod trace {
+    pub fn line(_: &str, _: std::fmt::Arguments) {}
+}
+
 #[cfg(not(target_os = "macos"))]
 fn main() {}
 

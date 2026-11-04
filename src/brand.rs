@@ -8,8 +8,9 @@ pub fn version_line() -> String {
     format!("{NAME} {VERSION} (Herdr {HERDR_BASE}, {GIT_SHA})")
 }
 
-/// The build as mods see it (`appInfo()` in defaults/herdr.d.ts): the name, versions and commit,
+/// The build for the About block in Settings (`updates().build`): the name, versions and commit,
 /// and each bundled mod with the labs commit it is pinned to (defaults/bundled-mods.lock.json).
+/// Not a mod API export: the version shows on the About screen, --version, status and the installer only.
 pub fn app_info() -> serde_json::Value {
     let lock: serde_json::Value = serde_json::from_str(include_str!("../defaults/bundled-mods.lock.json")).unwrap_or_default();
     let mods: Vec<serde_json::Value> = lock["mods"]
@@ -32,7 +33,7 @@ mod tests {
     }
 
     #[test]
-    fn app_info_names_the_build_and_every_pinned_mod() {
+    fn the_about_block_names_the_build_and_every_pinned_mod() {
         let info = super::app_info();
         assert_eq!((info["name"].as_str(), info["version"].as_str(), info["base"].as_str()), (Some(super::NAME), Some(super::VERSION), Some(env!("CARGO_PKG_VERSION"))));
         assert_eq!(info["sha"], super::GIT_SHA);

@@ -634,7 +634,7 @@ The main ones:
   or replaced and a different core answers there, its sidebar offers Connect:
   explicitly forget the old identity and pair again with the same name and target.
   Other unreachable machines don't offer this.
-- Window: `window.minimize`, `window.maximize` (or back), `window.close`;
+- Window: `window.minimize`, `window.maximize` (or back), `window.fullscreen` (macOS full screen, or back; ctrl-cmd-f and View > Enter Full Screen), `window.close`;
   `window.native` (macOS) reports the title bar as the system sees it.
 - macOS: `app.quit`, `app.hide`, `app.hide_others`, `app.show_all`.
 

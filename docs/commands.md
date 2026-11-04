@@ -760,6 +760,12 @@ Maximize the window, or back.
 
 No arguments.
 
+## `window.fullscreen`
+
+Enter or leave full screen (macOS: View > Enter Full Screen, ctrl-cmd-f).
+
+No arguments.
+
 ## `window.native`
 
 macOS: the title bar as the system sees it (see-through, full-size content, title hidden, fullscreen), for checking it.

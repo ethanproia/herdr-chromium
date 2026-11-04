@@ -140,6 +140,8 @@ pub fn status() -> serde_json::Value {
         "checked": *CHECKED.lock().unwrap(),
         "checks": RUNNING.load(Ordering::Relaxed),
         "checking": CHECKING.load(Ordering::Relaxed),
+        // HERDR: the fork's build for its About block in Settings (name, versions, sha, mod pins).
+        "build": crate::brand::app_info(),
     })
 }
 
