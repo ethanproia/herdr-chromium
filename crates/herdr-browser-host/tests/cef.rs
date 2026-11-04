@@ -901,3 +901,53 @@ fn cdp_pipe_without_fds_is_refused() {
     writeln!(w, "{}", encode(&AppToHost::Shutdown)).unwrap();
     let _ = child.wait();
 }
+
+/// SEC4: every helper the host starts (GPU, renderers, network and other utilities) runs in
+/// Chromium's sandbox, as the kernel reports it; none was started with --no-sandbox.
+#[test]
+fn every_helper_runs_sandboxed() {
+    if real_host().is_none() {
+        return;
+    }
+    unsafe extern "C" {
+        fn sandbox_check(pid: i32, operation: *const std::ffi::c_char, kind: i32, ...) -> i32;
+    }
+    let p = pages();
+    let mut h = Host::start_in(&scratch("cef-sandbox"));
+    create(&mut h, "b1", &p.url("a"), 200.0, 100.0, 1.0);
+    let (seq, _) = h.frame_where("b1", 100, 50, |px| px == BLUE);
+    h.send(AppToHost::FrameAck { id: "b1".into(), seq });
+    // The host's descendants, with their command lines.
+    let ps = std::process::Command::new("ps").args(["-axww", "-o", "pid=,ppid=,command="]).output().unwrap();
+    let rows: Vec<(u32, u32, String)> = String::from_utf8_lossy(&ps.stdout)
+        .lines()
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            let (pid, ppid) = (it.next()?.parse().ok()?, it.next()?.parse().ok()?);
+            Some((pid, ppid, it.collect::<Vec<_>>().join(" ")))
+        })
+        .collect();
+    let mut family = vec![h.pid()];
+    while let Some(next) = rows.iter().find(|(pid, ppid, _)| family.contains(ppid) && !family.contains(pid)) {
+        family.push(next.0);
+    }
+    let helpers: Vec<&(u32, u32, String)> = rows.iter().filter(|(pid, _, cmd)| family.contains(pid) && cmd.contains("--type=")).collect();
+    let kind = |cmd: &str| {
+        let arg = |k: &str| cmd.split_whitespace().find_map(|a| a.strip_prefix(k)).unwrap_or("").to_owned();
+        let sub = arg("--utility-sub-type=");
+        if sub.is_empty() { arg("--type=") } else { format!("utility:{sub}") }
+    };
+    let mut seen = Vec::new();
+    for (pid, _, cmd) in &helpers {
+        let boxed = unsafe { sandbox_check(*pid as i32, std::ptr::null(), 0) } == 1;
+        assert!(boxed, "helper {pid} ({}) is not sandboxed", kind(cmd));
+        assert!(!cmd.contains("--no-sandbox"), "helper {pid} started with --no-sandbox");
+        seen.push(kind(cmd));
+    }
+    seen.sort();
+    for want in ["gpu-process", "renderer", "utility:network.mojom.NetworkService"] {
+        assert!(seen.iter().any(|k| k == want), "no {want} helper among {seen:?}");
+    }
+    println!("sandboxed helpers: {seen:?}");
+    h.shutdown();
+}

@@ -82,6 +82,11 @@ impl Host {
         Host::start_in(&scratch(name))
     }
 
+    /// The host process (its helpers are its descendants).
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     pub fn send(&mut self, m: AppToHost) {
         writeln!(self.out, "{}", encode(&m)).unwrap();
     }

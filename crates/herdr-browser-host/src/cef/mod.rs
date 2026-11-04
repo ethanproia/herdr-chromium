@@ -613,6 +613,13 @@ pub fn main(socket: Option<&Path>) -> i32 {
         }
         None => None,
     };
+    // SEC4: a helper enters Chromium's sandbox (its own seatbelt profile per process type) before
+    // the framework loads, as CEF requires; it stays in for the life of the process.
+    let _sandbox = is_helper.then(|| {
+        let mut sandbox = cef::sandbox::Sandbox::new();
+        sandbox.initialize(Args::new().as_main_args());
+        sandbox
+    });
     let exe = std::env::current_exe().expect("current exe");
     let loader = library_loader::LibraryLoader::new(&exe, is_helper);
     if !loader.load() {
@@ -689,7 +696,7 @@ fn serve(socket: &Path, listener: UnixListener, args: &Args) -> io::Result<()> {
 
     let mut app = handlers::app();
     let settings = Settings {
-        no_sandbox: 1,
+        no_sandbox: 0,
         windowless_rendering_enabled: 1,
         external_message_pump: 1,
         root_cache_path: CefString::from(profile_dir.to_string_lossy().as_ref()),

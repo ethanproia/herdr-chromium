@@ -99,8 +99,8 @@ cef-rs examples.
   `browser_subprocess_path`; whether `framework_dir_path`/`main_bundle_path`
   are enough for an unbundled binary is open. Plan on a bundle step.
 - Sandbox and signing: CEF samples load the framework at runtime
-  (`CefScopedLibraryLoader`) for the macOS sandbox; `no_sandbox`, local
-  ad-hoc signing and entitlements are unconfirmed.
+  (`CefScopedLibraryLoader`) for the macOS sandbox. Confirmed (SEC4): the
+  sandbox runs with local ad-hoc signing and no entitlements (docs/fork-host.md).
 - OSR with shared textures: set `windowless_rendering_enabled` and
   `shared_texture_enabled`; frames arrive in `OnAcceleratedPaint` as an
   IOSurface. The `cef` crate's `accelerated_osr` feature imports it through
