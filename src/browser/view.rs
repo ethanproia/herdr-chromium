@@ -982,9 +982,20 @@ impl BrowserView {
     }
 
     /// The layout changed the block (another url typed into the document): follow it.
+    /// The block's profile, fixed when the view was made.
+    pub fn profile(&self) -> &str {
+        &self.block.profile
+    }
+
     pub fn set_block(&mut self, mut block: BrowserBlock, cx: &mut Context<Self>) {
         // The launch url is the view's, used once: the document's copy never brings it back.
         block.launch_url = self.block.launch_url.clone();
+        // A live block's profile is fixed at creation (its cookies, its grants policy): a layout
+        // update can't move it to another profile or turn the person's block into an agent's.
+        if block.profile != self.block.profile {
+            tracing::warn!("browser {}: layout asked to change its profile; ignored (close and reopen the block instead)", self.id);
+            block.profile = self.block.profile.clone();
+        }
         if block == self.block {
             return;
         }
