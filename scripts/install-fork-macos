@@ -199,4 +199,5 @@ fi
 if [[ -z ${FORK_INSTALL_NO_REGISTER:-} ]]; then
   /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$app" || true
 fi
-echo "Installed $app (CLI: $BRAND_CLI). Stock Herdr was not touched. Remove with: $BRAND_CLI uninstall"
+version=$("$app/Contents/MacOS/$name" --version 2>/dev/null || true)
+echo "Installed ${version:-$name} at $app (CLI: $BRAND_CLI). Stock Herdr was not touched. Remove with: $BRAND_CLI uninstall"

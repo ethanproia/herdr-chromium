@@ -2,7 +2,8 @@
 
 import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex, Scrollbar, InputState, Input } from "gpui-base";
-import { hc, run, theme, themes, fonts, updates, telemetry, settings, layouts, shared, appHome, readTextFile, writeTextFile, playSound, props, closeOverlay, window } from "herdr";
+// HERDR: appInfo is the fork's build (this frame mod ships only with the fork).
+import { hc, run, theme, themes, fonts, updates, telemetry, settings, layouts, shared, appHome, appInfo, readTextFile, writeTextFile, playSound, props, closeOverlay, window } from "herdr";
 
 const I = (name) => `frame/settings/${name}.svg`;
 
@@ -733,8 +734,16 @@ export default class Settings extends View {
             : u.checks
               ? [result, check("st-check-core")]
               : ["Not checked: a build from source looks for no updates.", null];
+    // HERDR: the fork's build line and its bundled mods' pins, above the stock Herdr rows.
+    const info = appInfo?.();
     return v_flex()
       .w_full()
+      .when(Boolean(info), (el) => el
+        .child(this.heading(t, info.name))
+        .child(this.row(t, info.line, `Built on Herdr ${info.base}, commit ${info.sha}.`, div()))
+        .child(v_flex().pt(6).gap(2).children(info.mods.map((m) =>
+          div().id(`st-pin-${m.name}`).text_size(12.5).text_color(t.dim).child(`${m.name} · ${String(m.commit).slice(0, 9)}`))))
+        .child(div().h(18)))
       .child(this.heading(t, "Herdr"))
       .child(this.row(t, `Herdr ${u.app.version}`, app[0], h_flex().gap(8).flex_none()
         .child(this.button(t, "st-whats-new", "What's new", () => { closeOverlay(props()?.overlay); run("app.whats_new"); }))

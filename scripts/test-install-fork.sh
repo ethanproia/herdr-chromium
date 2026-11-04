@@ -35,6 +35,7 @@ before=$(stock_sum)
 run() { HOME=$H HERDR_APP_BIN=$HERDR_APP_BIN HERDR_HOST_APP=$host FORK_INSTALL_NO_REGISTER=1 scripts/install-fork-macos "$@"; }
 
 run >"$scratch/install.log" 2>&1 && ok "install runs" || bad "install: $(tail -3 "$scratch/install.log")"
+grep -q "^Installed $BRAND_NAME $BRAND_VERSION (Herdr " "$scratch/install.log" && ok "installer prints the version line" || bad "no version line: $(tail -1 "$scratch/install.log")"
 app="$H/Applications/$BRAND_NAME.app"
 CLI=$H/.local/bin/$BRAND_CLI
 plist="$app/Contents/Info.plist"
