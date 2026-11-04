@@ -98,6 +98,16 @@ path = "tests/browser_device_cef.rs"
 harness = false
 
 [[test]]
+name = "browser_device_overlays"
+path = "tests/browser_device_overlays.rs"
+harness = false
+
+[[test]]
+name = "browser_device_overlays_cef"
+path = "tests/browser_device_overlays_cef.rs"
+harness = false
+
+[[test]]
 name = "browser_device_menu"
 path = "tests/browser_device_menu.rs"
 harness = false
