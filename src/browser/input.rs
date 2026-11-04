@@ -140,6 +140,8 @@ pub struct BrowserInput {
     raw_chords: bool,
     /// The block's top-left in window coordinates, updated every paint.
     origin: Point<Pixels>,
+    /// Responsive mode: the page is drawn at this fraction of its size (pointer positions are divided by it).
+    fit: f32,
     focused: bool,
     caps_lock: bool,
     /// Keys sent down and not yet up, by DOM code, so blur can release them.
@@ -161,7 +163,7 @@ pub struct BrowserInput {
 
 impl BrowserInput {
     pub fn new(id: BrowserId, link: Arc<dyn HostLink>) -> Self {
-        Self { id, link, raw_chords: false, origin: Point::default(), focused: false, caps_lock: false, held_keys: Vec::new(), held_buttons: Vec::new(), last_pos: (0.0, 0.0), marked: None, caret: None, owners: vec![Owner::Browse], lease: None, space_held: false, comment: CommentField::default(), overlay: Vec::new() }
+        Self { id, link, raw_chords: false, origin: Point::default(), fit: 1.0, focused: false, caps_lock: false, held_keys: Vec::new(), held_buttons: Vec::new(), last_pos: (0.0, 0.0), marked: None, caret: None, owners: vec![Owner::Browse], lease: None, space_held: false, comment: CommentField::default(), overlay: Vec::new() }
     }
 
     /// HERDR: raw chords for this block (a remote-desktop page): Cmd+A/Z go to the page as keys.
@@ -174,7 +176,12 @@ impl BrowserInput {
     }
 
     fn local(&self, p: Point<Pixels>) -> (f32, f32) {
-        (f32::from(p.x - self.origin.x), f32::from(p.y - self.origin.y))
+        (f32::from(p.x - self.origin.x) / self.fit, f32::from(p.y - self.origin.y) / self.fit)
+    }
+
+    /// Responsive mode: the page is drawn scaled by `fit` (1 when off).
+    pub fn set_fit(&mut self, fit: f32) {
+        self.fit = if fit > 0.0 { fit } else { 1.0 };
     }
 
     fn mods(&self, m: &gpui::Modifiers) -> protocol::Modifiers {
