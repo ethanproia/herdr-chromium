@@ -71,7 +71,8 @@ pub(crate) struct Host {
     downloads: PathBuf,
     next_req: u64,
     dialogs: HashMap<u64, JsdialogCallback>,
-    choosers: HashMap<u64, FileDialogCallback>,
+    /// Open file choosers: req -> (the browser that asked, its callback).
+    choosers: HashMap<u64, (String, FileDialogCallback)>,
     menus: HashMap<u64, (String, RunContextMenuCallback)>,
     /// Permission requests waiting on the person: req -> (browser, callback, asked at).
     perms: HashMap<u64, (String, PermCb, std::time::Instant)>,
@@ -228,8 +229,34 @@ pub(crate) fn deny_permissions(id: Option<&str>, expired_only: bool) {
     }
 }
 
-pub(crate) fn keep_chooser(req: u64, cb: FileDialogCallback) {
-    with_host(|h| h.choosers.insert(req, cb));
+pub(crate) fn keep_chooser(id: &str, req: u64, cb: FileDialogCallback) {
+    with_host(|h| h.choosers.insert(req, (id.to_string(), cb)));
+}
+
+/// Cancel browser `id`'s open file choosers (it closed or left the page): a late pick never reaches
+/// another page.
+pub(crate) fn cancel_choosers(id: &str) {
+    let gone: Vec<FileDialogCallback> = with_host(|h| {
+        let reqs: Vec<u64> = h.choosers.iter().filter(|(_, (owner, _))| owner == id).map(|(r, _)| *r).collect();
+        reqs.into_iter().filter_map(|r| h.choosers.remove(&r)).map(|(_, cb)| cb).collect()
+    })
+    .unwrap_or_default();
+    for cb in gone {
+        cb.cancel();
+    }
+}
+
+/// The callback for `req` if browser `id` opened it (else it stays for its owner).
+fn take_owned<T>(map: &mut HashMap<u64, (String, T)>, req: u64, id: &str) -> Option<T> {
+    if map.get(&req).is_some_and(|(owner, _)| owner == id) { map.remove(&req).map(|(_, t)| t) } else { None }
+}
+
+/// This run's first request number: random, so an answer meant for an earlier host (it restarted)
+/// never matches a request of this one.
+fn first_req() -> u64 {
+    let mut raw = [0u8; 8];
+    let _ = std::fs::File::open("/dev/urandom").and_then(|mut f| std::io::Read::read_exact(&mut f, &mut raw));
+    (u64::from_le_bytes(raw) >> 16) << 8
 }
 
 enum Painted {
@@ -630,7 +657,7 @@ fn serve(socket: &Path, listener: UnixListener, args: &Args) -> io::Result<()> {
             browsers: HashMap::new(),
             blitter: blit::Blitter::new(),
             downloads,
-            next_req: 0,
+            next_req: first_req(),
             root: profile_dir.clone(),
             contexts: HashMap::new(),
             dark: None,
@@ -844,7 +871,8 @@ fn handle(m: AppToHost) {
             }
         }
         M::FileChooserResult { id, req, paths } => {
-            let Some(cb) = with_host(|h| h.choosers.remove(&req)).flatten() else {
+            // Only the browser that opened this chooser may answer it.
+            let Some(cb) = with_host(|h| take_owned(&mut h.choosers, req, &id)).flatten() else {
                 return send(HostToApp::Error { id: Some(id), message: format!("no file chooser {req}") });
             };
             if paths.is_empty() {
@@ -890,6 +918,7 @@ fn handle(m: AppToHost) {
         }
         M::Close { id } => {
             deny_permissions(Some(&id), false);
+            cancel_choosers(&id);
             let Some(entry) = with_host(|h| h.browsers.remove(&id)).flatten() else { return unknown(&id) };
             if let Some(host) = entry.browser.as_ref().and_then(|b| b.host()) {
                 host.close_browser(1);
@@ -1283,5 +1312,28 @@ mod tests {
         assert_eq!(popup_place((-5, -10, 100, 40), 1.0, (100, 40), (400, 300)), Some(((5, 10), (0, 0), 95, 30)));
         // Entirely outside.
         assert_eq!(popup_place((500, 0, 10, 10), 1.0, (10, 10), (400, 300)), None);
+    }
+}
+
+#[cfg(test)]
+mod chooser_tests {
+    use super::*;
+
+    #[test]
+    fn a_chooser_answer_counts_only_from_its_own_browser() {
+        let mut m: HashMap<u64, (String, &str)> = HashMap::new();
+        m.insert(7, ("b1".into(), "cb"));
+        assert_eq!(take_owned(&mut m, 7, "b2"), None, "another browser can't answer it");
+        assert!(m.contains_key(&7), "and it stays for its owner");
+        assert_eq!(take_owned(&mut m, 8, "b1"), None);
+        assert_eq!(take_owned(&mut m, 7, "b1"), Some("cb"));
+        assert_eq!(take_owned(&mut m, 7, "b1"), None, "answered once");
+    }
+
+    #[test]
+    fn request_numbers_start_somewhere_new_each_run() {
+        let (a, b) = (first_req(), first_req());
+        assert_ne!(a, b, "a restarted host doesn't reuse the last one's numbers");
+        assert!(a > 1 << 20 && b > 1 << 20);
     }
 }
