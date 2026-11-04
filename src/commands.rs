@@ -77,7 +77,7 @@ pub const COMMANDS: &[Command] = &[
     cmd("layout.hide", &[req("id")], "Hide a layout node."),
     cmd("layout.resize", &[req("id"), opt("px"), opt("weight")], "Size a layout node."),
     cmd("layout.select", &[req("stack"), req("child")], "Show one child of a stack."),
-    cmd("layout.reset", &[opt("name")], "Reset a shipped layout and its clicks (the old file is kept aside)."),
+    cmd("layout.reset", &[opt("name")], "Reset a shipped layout (or the fork's labs, to its bundled copy) and its clicks (the old file is kept aside)."),
     cmd("mod.open", &[req("name")], "Toggle a mod as the overlay its mod.json describes; calling again closes it."),
     cmd("overlay.close", &[opt("id")], "Close an overlay (default: the top dialog or popup)."),
     // HERDR: browser block (part 5, src/browser/agent.rs). id: a browser block; else pane's; else the focused one.

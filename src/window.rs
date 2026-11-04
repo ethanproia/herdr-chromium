@@ -144,9 +144,12 @@ const LAYOUTS: &[(&str, &str)] = &[
     ("main", include_str!("../defaults/layouts/main.json")),
     ("terminals", include_str!("../defaults/layouts/terminals.json")),
     ("win98", include_str!("../defaults/layouts/win98.json")),
-    // HERDR: the fork's own layout "labs" (Ethan's), built from the bundled fork-* mods (defaults/bundled-mods.lock.json).
-    ("labs", include_str!("../defaults/layouts/labs.json")),
 ];
+
+// HERDR: the fork's own layout "labs" (Ethan's), built from the bundled fork-* mods (defaults/bundled-mods.lock.json).
+// Not shipped (read-only) but personal: seeded once when layouts/labs.json is missing, then the person's (and core's
+// structural layout.set) to change; layout.reset labs puts this bundled copy back.
+const BUNDLED_LABS: &str = include_str!("../defaults/layouts/labs.json");
 
 /// Pictures shipped layouts name as their `preview`, written beside them.
 const LAYOUT_PREVIEWS: &[(&str, &str)] = &[
@@ -167,6 +170,10 @@ pub fn shipped_layouts() -> Vec<&'static str> {
 }
 
 fn shipped_layout(name: &str) -> &'static str {
+    // HERDR: labs falls back to its bundled copy, not to main.
+    if name == FORK_DEFAULT_LAYOUT {
+        return BUNDLED_LABS;
+    }
     LAYOUTS.iter().find(|(n, _)| *n == name).unwrap_or(&LAYOUTS[0]).1
 }
 
@@ -249,11 +256,29 @@ fn missing_mods(name: &str) -> Vec<String> {
 }
 
 fn install_layouts() {
+    // HERDR: labs used to be shipped: take it off the shipped record first, so the sync doesn't remove it
+    // (with its clicks) as a dropped layout. The file and layouts/.state/labs.json stay, now the person's.
+    adopt_labs(&mods::app_dir());
     if let Err(e) = mods::sync_layouts(&mods::app_dir(), LAYOUTS) {
         tracing::warn!("cannot install layouts: {e}");
     }
+    // HERDR: seeded once from the bundled copy; never written over.
+    let labs = layout_path(FORK_DEFAULT_LAYOUT);
+    if !labs.exists() && !write_atomic(&labs, BUNDLED_LABS) {
+        tracing::warn!("cannot seed layouts/labs.json");
+    }
     for (name, text) in LAYOUT_PREVIEWS {
         let _ = std::fs::write(file(&format!("layouts/{name}")), text);
+    }
+}
+
+/// HERDR: drops `layout:labs` from installed.json (labs was a shipped layout before it became personal).
+fn adopt_labs(home: &std::path::Path) {
+    let record = home.join("installed.json");
+    let Ok(text) = std::fs::read_to_string(&record) else { return };
+    let Ok(mut v) = serde_json::from_str::<Value>(&text) else { return };
+    if v.as_object_mut().and_then(|o| o.remove("layout:labs")).is_some() {
+        let _ = std::fs::write(&record, serde_json::to_string_pretty(&v).unwrap_or(text));
     }
 }
 
@@ -3265,7 +3290,8 @@ impl AppWindow {
             }
             "layout.reset" => {
                 let name = Self::owned(a, "name").unwrap_or_else(|| self.layout_name.clone());
-                let Some((_, text)) = LAYOUTS.iter().find(|(n, _)| *n == name) else {
+                // HERDR: labs resets to its bundled copy.
+                let Some(text) = LAYOUTS.iter().find(|(n, _)| *n == name).map(|(_, t)| *t).or((name == FORK_DEFAULT_LAYOUT).then_some(BUNDLED_LABS)) else {
                     return self.fail(format!("{name:?} isn't a layout Herdr ships"));
                 };
                 // Theirs is kept under a name nothing else has (never over an older one).
