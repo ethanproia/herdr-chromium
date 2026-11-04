@@ -36,6 +36,36 @@ pub struct Annotation {
     pub target: Target,
     pub comment: String,
     pub state: State,
+    // HERDR: S13. An inline text edit made on the target: what its text was and is now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_edit: Option<TextChange>,
+}
+
+/// HERDR: S13. A saved inline text edit. Both sides are the page's text (the after side holds
+/// the person's typing inside it), so both travel fenced as page data.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TextChange {
+    pub before: String,
+    pub after: String,
+}
+
+/// HERDR: S13. The two sides cut to at most `max` characters around the part that changed
+/// (Cursor's 120), with "…" where text was left out.
+pub fn change_window(before: &str, after: &str, max: usize) -> (String, String) {
+    let (b, a): (Vec<char>, Vec<char>) = (before.chars().collect(), after.chars().collect());
+    let pre = b.iter().zip(&a).take_while(|(x, y)| x == y).count();
+    let suf = b[pre..].iter().rev().zip(a[pre..].iter().rev()).take_while(|(x, y)| x == y).count();
+    let side = |v: &[char]| {
+        let end = v.len() - suf;
+        // Centre the changed part; near an end, the window slides to keep `max` characters.
+        let room = max.saturating_sub(end - pre);
+        let mut from = pre.saturating_sub(room / 2);
+        let to = (from + max).min(v.len());
+        from = from.min(to.saturating_sub(max));
+        let text: String = v[from..to].iter().collect();
+        format!("{}{text}{}", if from > 0 { "…" } else { "" }, if to < v.len() { "…" } else { "" })
+    };
+    (side(&b), side(&a))
 }
 
 /// The queue for one browser block.
@@ -59,8 +89,18 @@ impl Annotations {
     /// Adds an annotation on the current page and returns its number.
     pub fn add(&mut self, target: Target, comment: &str) -> u32 {
         let n = self.count() as u32 + 1;
-        self.list.push(Annotation { n, page: self.page.clone(), target, comment: comment.trim().to_owned(), state: State::Pending });
+        self.list.push(Annotation { n, page: self.page.clone(), target, comment: comment.trim().to_owned(), state: State::Pending, text_edit: None });
         n
+    }
+
+    /// HERDR: S13. A saved inline text edit becomes a pin of its own (no comment yet).
+    pub fn add_text_edit(&mut self, target: Target, before: &str, after: &str) -> Option<u32> {
+        if before == after {
+            return None;
+        }
+        let n = self.add(target, "");
+        self.pending_mut(n)?.text_edit = Some(TextChange { before: before.to_owned(), after: after.to_owned() });
+        Some(n)
     }
 
     pub fn set_comment(&mut self, n: u32, comment: &str) -> bool {
@@ -129,6 +169,23 @@ mod tests {
 
     fn target(sel: &str) -> Target {
         Target { selector: sel.into(), label: sel.into(), rect: (10., 20., 100., 40.) }
+    }
+
+    #[test]
+    fn a_text_edit_is_a_pin_and_its_sides_are_cut_around_the_change() {
+        let mut q = Annotations::default();
+        q.set_page("https://a.test/");
+        assert_eq!(q.add_text_edit(target("h1"), "Hello", "Hello"), None, "no change, no pin");
+        let n = q.add_text_edit(target("h1"), "Hello", "Hello v2").unwrap();
+        assert_eq!(q.visible().find(|a| a.n == n).unwrap().text_edit, Some(TextChange { before: "Hello".into(), after: "Hello v2".into() }));
+        assert_eq!(change_window("short", "shorter", 120), ("short".into(), "shorter".into()));
+        let before = format!("{}OLD{}", "a".repeat(300), "z".repeat(300));
+        let after = format!("{}NEW{}", "a".repeat(300), "z".repeat(300));
+        let (b, a) = change_window(&before, &after, 120);
+        assert!(b.starts_with('…') && b.ends_with('…') && b.contains("OLD") && a.contains("NEW"), "{b}");
+        assert_eq!(b.chars().filter(|c| *c != '…').count(), 120);
+        let (b, _) = change_window(&format!("x{}", "a".repeat(300)), &format!("y{}", "a".repeat(300)), 120);
+        assert!(b.starts_with('x') && b.ends_with('…'), "a change at the start keeps the start: {b}");
     }
 
     #[test]

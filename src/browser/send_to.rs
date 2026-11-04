@@ -193,7 +193,7 @@ mod tests {
             url: "https://example.com/".into(),
             title: "t".into(),
             scroll: (0.0, 0.0),
-            annotations: vec![Annotation { n: 1, page: "https://example.com/".into(), target: Target { selector: "#a".into(), label: "a".into(), rect: (0.0, 0.0, 1.0, 1.0) }, comment: "bigger".into(), state: State::Pending }],
+            annotations: vec![Annotation { n: 1, page: "https://example.com/".into(), target: Target { selector: "#a".into(), label: "a".into(), rect: (0.0, 0.0, 1.0, 1.0) }, comment: "bigger".into(), state: State::Pending, text_edit: None }],
             css_edits: None,
             css_was: vec![],
             picture: None,
