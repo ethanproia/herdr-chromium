@@ -26,17 +26,17 @@ fn main() {
     let v = p.view.clone();
     p.cx.update(|cx| v.update(cx, |v, cx| v.set_device(crate::browser::devices::Mode::preset("iPhone 15"), cx)));
     p.run_for(Duration::from_millis(300));
+    // Markup mode first: its strip moves the page down and changes the fit.
+    p.cx.update(|cx| v.update(cx, |v, cx| v.toggle_mode(crate::browser::input::Owner::Markup, cx)));
+    p.run_for(Duration::from_millis(300));
     // The device's box: where the input layer sits (window DIPs), and the fit it draws at.
     let input = p.cx.update(|cx| v.read(cx).input().clone());
     let origin = p.cx.update(|cx| input.read(cx).origin());
     let (ox, oy) = (f32::from(origin.x), f32::from(origin.y));
-    let page_area = p.size.1 - p.page_top();
-    let fit = (p.size.0 / 390.0).min(page_area / 844.0).min(1.0);
+    let fit = p.cx.update(|cx| v.read(cx).fit());
     assert!(fit < 1.0, "the iPhone is scaled down to fit ({fit})");
 
     // Draw a rect on the box from drawn (40, 60) to (140, 160).
-    p.cx.update(|cx| v.update(cx, |v, cx| v.toggle_mode(crate::browser::input::Owner::Markup, cx)));
-    p.pump();
     let top = p.page_top();
     let (a, b) = ((ox + 40.0, oy + 60.0 - top), (ox + 140.0, oy + 160.0 - top));
     p.drag(a, b, 6);

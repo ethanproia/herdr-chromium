@@ -2117,7 +2117,7 @@ impl BrowserView {
     }
 
     /// Responsive mode: how much the page is scaled to fit its block (1 when off).
-    fn fit(&self) -> f32 {
+    pub fn fit(&self) -> f32 {
         match (&self.device, self.measured) {
             (Some(d), Some((area, _))) => d.fit(area.w, area.h),
             _ => 1.0,
