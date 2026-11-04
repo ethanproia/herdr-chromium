@@ -10,7 +10,7 @@
     },
     "board": {
       "branch": "ethan/herdr-board",
-      "commit": "b8f13e93d540780d16c263743e85fc83dc734884",
+      "commit": "c9534769181f4f048fe6abf6eb9c5993a06e4463",
       "path": "projects/herdr-mods/board/mods/board",
       "version": "0.1.0",
       "pr": "essexlabs/labs#1280 (merged)",

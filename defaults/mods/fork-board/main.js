@@ -4505,6 +4505,10 @@ var kindOf = (p3) => {
   const e5 = extOf(p3);
   return e5 === "gif" ? "gif" : IMAGE_EXTS.includes(e5) ? "image" : VIDEO_EXTS.includes(e5) ? "video" : null;
 };
+function openableMedia(path, kind) {
+  if (typeof path !== "string" || kind !== "gif" && kind !== "video") return false;
+  return kindOf(path) === kind;
+}
 var makeId = () => Array.from({ length: 8 }, () => Math.floor(Math.random() * 256).toString(16).padStart(2, "0")).join("");
 var assetsDirFor = (boardFile) => `${boardFile.replace(/\.[^./]+$/, "")}.assets`;
 var relAssetFor = (boardFile, name) => `${basename(assetsDirFor(boardFile))}/${name}`;
@@ -4539,10 +4543,62 @@ function indexGroups(elements) {
   }
   return index;
 }
+var TIERS = [256, 1024, 0];
+var MAKE_COPY = [
+  'px=$(sips -g pixelWidth -g pixelHeight "$1" 2>/dev/null); w=$(printf "%s\\n" "$px" | sed -n "s/.*pixelWidth: *//p"); h=$(printf "%s\\n" "$px" | sed -n "s/.*pixelHeight: *//p")',
+  '[ "$w" -gt 0 ] 2>/dev/null && [ "$h" -gt 0 ] 2>/dev/null || exit 1',
+  'long=$w; [ "$h" -gt "$long" ] && long=$h',
+  'if [ "$3" -gt 0 ] && [ "$long" -gt "$3" ]; then set -- "$1" "$2" -Z "$3"; else set -- "$1" "$2"; fi',
+  'src=$1; out=$2; shift 2; sips "$@" -s format png "$src" --out "$out.part.png" >/dev/null || exit 1; mv -f "$out.part.png" "$out" || exit 1',
+  'echo "$w $h"'
+].join("\n");
+var rank = (t2) => t2 === 0 ? Infinity : t2;
+function tierFor(needPx, max = 0) {
+  const t2 = TIERS.find((side) => side !== 0 && needPx <= side) ?? 0;
+  return rank(t2) <= rank(max) ? t2 : max;
+}
+function pickTier(want, built) {
+  const have = [...built];
+  if (!have.length) return null;
+  if (have.includes(want)) return want;
+  const bigger = have.filter((t2) => rank(t2) > rank(want)).sort((a2, b2) => rank(a2) - rank(b2));
+  return bigger.length ? bigger[0] : have.sort((a2, b2) => rank(b2) - rank(a2))[0];
+}
+function tierFile(key, tier) {
+  return tier === 1024 ? `${key}.png` : tier === 0 ? `${key}.full.png` : `${key}.t${tier}.png`;
+}
 function cacheKey(boardFile, fileId, size, mtime) {
   let h3 = 5381;
   for (const c3 of boardFile) h3 = (h3 * 33 ^ c3.charCodeAt(0)) >>> 0;
   return `${h3.toString(36)}_${fileId.replace(/[^A-Za-z0-9_-]/g, "_")}_${size}_${mtime}`;
+}
+function animAttempt(out, stamp) {
+  if (typeof stamp !== "string" || !/^[A-Za-z0-9_-]+$/.test(stamp)) throw new Error("anim attempt needs a unique stamp");
+  const tmp = `${out}.${stamp}.part.gif`;
+  const fail = `${out}.${stamp}.fail`;
+  return { tmp, fail, clear: [`${out}.fail`, `${out}.part.gif`, fail, tmp] };
+}
+function ffmpegAnimArgs(bin, src, vf, tmp, out, fail) {
+  const script = '( "$1" -v error -y -t 60 -i "$2" -an -vf "$3" -loop 0 "$4" && mv "$4" "$5" || { rm -f "$4"; touch "$6"; } ) >/dev/null 2>&1 &';
+  return ["sh", ["-c", script, "sh", bin, src, vf, tmp, out, fail]];
+}
+function applyDerivedFiles(scene, history, pending) {
+  const ready = [];
+  for (const item of pending) {
+    const el = scene.getElement(item.elementId);
+    if (!el || el.isDeleted) continue;
+    ready.push(item);
+  }
+  if (!ready.length) return 0;
+  history.record(scene.getElementsIncludingDeleted());
+  let n2 = 0;
+  for (const item of ready) {
+    const el = scene.getElement(item.elementId);
+    if (!el || el.isDeleted) continue;
+    scene.mutateElement(el, { fileId: item.fileId });
+    n2++;
+  }
+  return n2;
 }
 var STICKY_COLORS = ["#ffe58a", "#fbcfe8", "#bbf7d0", "#bfdbfe"];
 var STICKY_INK = "#1e1e1e";
@@ -5026,6 +5082,11 @@ function resolveBoardPath(file, { home: homeDir, base } = {}) {
 }
 
 // src/geometry.js
+var layoutScale = (vz) => vz;
+function textBox(d2, vz) {
+  const lineHeight = d2.fontSize * d2.lineHeight * vz;
+  return { left: d2.x * vz, top: d2.y * vz, w: Math.max(d2.w, 1) * vz, h: d2.lines.length * lineHeight, lineHeight, fontSize: d2.fontSize * vz };
+}
 var LAYER_OPS = 4e4;
 var BATCH_ITEMS = 200;
 var NAMED = { black: "000000", white: "ffffff", red: "ff0000", green: "008000", blue: "0000ff", gray: "808080", grey: "808080" };
@@ -5531,6 +5592,29 @@ function pointerLeftPane(pointer, paneHover, leftDuringGesture = false) {
   return pointer != null && (paneHover === false || leftDuringGesture === true);
 }
 
+// src/drop-target.js
+function canvasHint({ count, editing, pointer, dragOver }) {
+  if (dragOver) return "drop";
+  return count || editing || pointer ? null : "empty";
+}
+function dashedBorder(el) {
+  return typeof el.border_dashed === "function" ? el.border_dashed() : el;
+}
+function wireDrop(el, target, importPaths) {
+  const set = (over, cx) => {
+    if (target.over !== over) {
+      target.over = over;
+      cx.notify();
+    }
+  };
+  el = el.on_drop((e5, cx) => {
+    set(false, cx);
+    importPaths(e5.paths, cx);
+  });
+  if (typeof el.on_drag_enter !== "function" || typeof el.on_drag_leave !== "function") return el;
+  return el.on_drag_enter((_e2, cx) => set(true, cx)).on_drag_leave((_e2, cx) => set(false, cx));
+}
+
 // src/save-gate.js
 function createSaveGate() {
   let depth = 0;
@@ -5610,6 +5694,10 @@ var commonOf = (els, map) => {
 var ICONS = `mods/${MOD}/icons`;
 var CACHE = "data/herdr-board";
 var CACHE_SIDE = 1024;
+var SWAP_MS = 1500;
+var TIER_TRIES = 4;
+var DEVICE_PX = 2;
+var ASSET_CHECK = 'd=$(cd "$(dirname "$1")" 2>/dev/null && pwd -P) || exit 1; a=$(cd "$2" 2>/dev/null && pwd -P) || exit 1; [ -L "$1" ] && exit 1; [ -L "$2" ] && exit 1; [ "$d" = "$a" ] || exit 1';
 var SHAPES = ["rectangle", "ellipse", "diamond"];
 var TOOLS = [
   { id: "selection", icon: "selection", key: "V or 1", title: "Select" },
@@ -5671,11 +5759,23 @@ function run(a){
 var CHOOSE_FILES = 'set fs to choose file with prompt "Add to the board" with multiple selections allowed\nset o to ""\nrepeat with f in fs\nset o to o & POSIX path of f & linefeed\nend repeat\nreturn o';
 var GRAY_PROFILE = "/System/Library/ColorSync/Profiles/Generic Gray Profile.icc";
 var HANDLE = 5;
+var ROTATE_RADIUS = 32;
 var hex = (c3, fallback) => typeof c3 === "string" && /^#[0-9a-f]{6}([0-9a-f]{2})?$/i.test(c3) ? c3.slice(0, 7) : fallback;
 var sel = () => hex(theme().accent, "#6c8bff");
 var uiColors = () => {
   const t2 = theme();
   return { surface: t2.popover ?? t2.surface, border: t2.border, swatchBorder: t2.input ?? t2.border, foreground: t2.foreground, muted: t2.muted, selected: t2.selected, hover: t2.hover };
+};
+var isLight = (c3) => {
+  const h3 = hex(c3, "#1e1e1e");
+  const [r2, g2, b2] = [1, 3, 5].map((i2) => parseInt(h3.slice(i2, i2 + 2), 16));
+  return 0.299 * r2 + 0.587 * g2 + 0.114 * b2 > 128;
+};
+var dropColors = () => {
+  const t2 = theme();
+  const light = isLight(t2.background);
+  const accent = hex(t2.accent ?? t2.selected ?? t2.primary, light ? "#315cff" : "#8fb0e0");
+  return { accent, tint: light ? "#eef2ffd6" : `${accent}1f` };
 };
 var MIN_ZOOM = 0.1;
 var MAX_ZOOM = 30;
@@ -5711,9 +5811,14 @@ var Board = class extends View {
     this.enqueueSave = createSaveQueue();
     this.paneHover = void 0;
     this.gestureLeft = false;
+    this.dropTarget = { over: false };
     this.saveAt = 0;
     this.saveError = null;
     this.imageFiles = /* @__PURE__ */ new Map();
+    this.pics = /* @__PURE__ */ new Map();
+    this.picShown = /* @__PURE__ */ new Map();
+    this.tierWant = /* @__PURE__ */ new Set();
+    this.pixels = /* @__PURE__ */ new Map();
     this.preparing = false;
     this.tries = /* @__PURE__ */ new Map();
     this.slideSeq = 0;
@@ -5731,7 +5836,6 @@ var Board = class extends View {
     this.toast = null;
     this.layers = [];
     this.builtVz = 1;
-    this.builtZ = 1;
     this.active = /* @__PURE__ */ new Set();
     this.status = "loading";
     this.panelCollapsed = localStorage.getItem("panelCollapsed") === "1";
@@ -5793,6 +5897,12 @@ var Board = class extends View {
     this.anim = /* @__PURE__ */ new Map();
     this.playing = /* @__PURE__ */ new Set();
     this.playTickets = /* @__PURE__ */ new Map();
+    this.pics = /* @__PURE__ */ new Map();
+    this.picShown = /* @__PURE__ */ new Map();
+    this.tierWant = /* @__PURE__ */ new Set();
+    this.pixels = /* @__PURE__ */ new Map();
+    this.tiering = false;
+    this.swapUntil = 0;
     this.preparing = false;
     this.prepareAgain = false;
     this.groupIdx = null;
@@ -5907,9 +6017,13 @@ var Board = class extends View {
   herdrZoom() {
     return Number(settings()?.zoom) || 1;
   }
-  /** GPUI pixels (paths, pointer positions) per scene unit. */
+  /** Window pixels per scene unit: pointer positions and `on_size_change`. Drawing uses drawScale. */
   scale() {
     return this.vz * this.herdrZoom();
+  }
+  /** Layout pixels per scene unit for paths, text and images. Herdr zoom is applied by the host; including it here squares it. */
+  drawScale() {
+    return layoutScale(this.vz);
   }
   toScene(local) {
     const s2 = this.scale();
@@ -6026,16 +6140,24 @@ var Board = class extends View {
     const ticket = this.boardGen.n;
     cx.spawn(async (cx2) => {
       try {
+        for (let i2 = 0; this.needFit && i2 < 80; i2++) await cx2.sleep(50);
+        let built = 0, rebuiltAt = Date.now();
         do {
           this.prepareAgain = false;
-          const todo = Object.entries(this.doc.files ?? {}).filter(([id]) => !this.imageFiles.has(id) && (this.tries.get(id) ?? 0) < 4);
+          const todo = Object.entries(this.doc.files ?? {}).filter(([id]) => !this.imageFiles.has(id) && (this.tries.get(id) ?? 0) < TIER_TRIES);
           for (const [id] of todo) this.tries.set(id, (this.tries.get(id) ?? 0) + 1);
           for (let i2 = 0; i2 < todo.length; i2 += 6) {
             await Promise.all(todo.slice(i2, i2 + 6).map(([id, f3]) => this.cacheOne(id, f3, ticket)));
             if (!this.boardGen.current(ticket)) return;
-            this.rebuild(cx2);
+            built++;
+            if (Date.now() - rebuiltAt >= 1e3) {
+              rebuiltAt = Date.now();
+              built = 0;
+              this.rebuild(cx2);
+            } else cx2.notify();
           }
         } while (this.prepareAgain);
+        if (built && this.boardGen.current(ticket)) this.rebuild(cx2);
       } finally {
         if (this.boardGen.current(ticket)) this.preparing = false;
       }
@@ -6045,9 +6167,18 @@ var Board = class extends View {
   async safeAsset(rel, file = this.file) {
     const abs = absAsset(file, rel);
     if (!abs) throw new Error("the picture's path leaves the board's assets folder");
-    const r2 = await exec("sh", ["-c", 'd=$(cd "$(dirname "$1")" 2>/dev/null && pwd -P) || exit 1; a=$(cd "$2" 2>/dev/null && pwd -P) || exit 1; [ -L "$1" ] && exit 1; [ -L "$2" ] && exit 1; [ "$d" = "$a" ] || exit 1', "sh", abs, assetsDirFor(file)]);
+    const r2 = await exec("sh", ["-c", ASSET_CHECK, "sh", abs, assetsDirFor(file)]);
     if (r2.code !== 0) throw new Error("the picture is not inside the board's assets folder");
     return abs;
+  }
+  /** safeAsset and cacheName in one process: the checked path and the picture's cache key. */
+  async assetKey(id, rel, file = this.file) {
+    const abs = absAsset(file, rel);
+    if (!abs) throw new Error("the picture's path leaves the board's assets folder");
+    const r2 = await exec("sh", ["-c", `${ASSET_CHECK}; stat -f %z-%m "$1" 2>/dev/null || echo 0-0`, "sh", abs, assetsDirFor(file)]);
+    if (r2.code !== 0) throw new Error("the picture is not inside the board's assets folder");
+    const [size, mtime] = String(r2.stdout).trim().split("-");
+    return { abs, key: cacheKey(file, id, size ?? "0", mtime ?? "0") };
   }
   /** The cache name of a picture: board + id + content (size and modified time). */
   async cacheName(id, abs, file = this.file) {
@@ -6055,26 +6186,38 @@ var Board = class extends View {
     const [size, mtime] = (r2?.code === 0 ? r2.stdout.trim() : "0-0").split("-");
     return cacheKey(file, id, size, mtime);
   }
-  async cacheOne(id, f3, ticket = this.boardGen.n) {
+  async cacheOne(id, f3, ticket = this.boardGen.n, need = 0) {
     const file = this.file;
     const live = () => this.boardGen.current(ticket) && this.file === file;
     try {
       await fs2.mkdir(`${appHome()}/${CACHE}`, { recursive: true });
       const m2 = /^data:image\/([a-z0-9+.-]+);base64,(.*)$/is.exec(f3?.dataURL ?? "");
       if (m2) {
-        const ext2 = { jpeg: "jpg", "svg+xml": "svg" }[m2[1].toLowerCase()] ?? m2[1].toLowerCase();
+        const ext = { jpeg: "jpg", "svg+xml": "svg" }[m2[1].toLowerCase()] ?? m2[1].toLowerCase();
         const safe = cacheKey(file, id, "data", 0);
-        await fs2.writeFile(`${appHome()}/${CACHE}/${safe}.${ext2}`, Buffer.from(m2[2], "base64"));
-        if (live()) this.imageFiles.set(id, `${CACHE}/${safe}.${ext2}`);
+        await fs2.writeFile(`${appHome()}/${CACHE}/${safe}.${ext}`, Buffer.from(m2[2], "base64"));
+        if (live()) this.imageFiles.set(id, `${CACHE}/${safe}.${ext}`);
         return;
       }
       if (!f3?.path) return;
-      const abs = await this.safeAsset(f3.path, file);
-      const ext = extOf(f3.path) === "svg" ? "svg" : "png";
-      const cache = `${CACHE}/${await this.cacheName(id, abs, file)}.${ext}`;
-      const exists3 = await fs2.exists(`${appHome()}/${cache}`);
-      if (!exists3) await this.makeCache(abs, `${appHome()}/${cache}`, f3.kind);
+      const { abs, key } = await this.assetKey(id, f3.path, file);
+      if (extOf(f3.path) === "svg") {
+        const cache2 = `${CACHE}/${key}.svg`;
+        if (!await fs2.exists(`${appHome()}/${cache2}`)) await exec("cp", [abs, `${appHome()}/${cache2}`]);
+        if (!live()) return;
+        this.pics.set(id, { abs, key, single: cache2 });
+        this.imageFiles.set(id, cache2);
+        return;
+      }
+      const max = f3.kind === "video" ? CACHE_SIDE : 0;
+      const tier = tierFor(Math.max(this.needPx(id), need), max);
+      const cache = `${CACHE}/${tierFile(key, tier)}`;
+      if (await this.copyMissing(cache)) {
+        const px = await this.makeCache(abs, `${appHome()}/${cache}`, f3.kind, tier);
+        if (px && live()) this.pixels.set(id, px);
+      }
       if (!live()) return;
+      this.pics.set(id, { abs, key, kind: f3.kind, max, files: /* @__PURE__ */ new Map([[tier, cache]]) });
       this.imageFiles.set(id, cache);
       if (f3.kind === "video" && f3.duration == null) {
         this.probeDuration(abs).then((d2) => {
@@ -6086,12 +6229,11 @@ var Board = class extends View {
       console.log(`board: image ${id}: ${e5?.message ?? e5}`);
     }
   }
-  /** Writes the drawable copy of an asset: a PNG at most CACHE_SIDE on the long side (a video's poster frame, a GIF's first frame). */
-  async makeCache(src, dest, kind) {
-    if (extOf(src) === "svg") {
-      await exec("cp", [src, dest]);
-      return;
-    }
+  /**
+   * Writes one drawable copy of an asset: a PNG at most `side` on the long side (0: the source's
+   * own size; a video's poster frame, a GIF's first frame). Returns the source's pixel size.
+   */
+  async makeCache(src, dest, kind, side = CACHE_SIDE) {
     let from = src;
     if (kind === "video") {
       const tmp = `${appHome()}/${CACHE}/ql-${makeId()}`;
@@ -6099,11 +6241,97 @@ var Board = class extends View {
       await exec("qlmanage", ["-t", "-s", String(CACHE_SIDE), "-o", tmp, src]);
       from = `${tmp}/${src.slice(src.lastIndexOf("/") + 1)}.png`;
     }
-    const px = await this.pixelSize(from);
-    const resize = Math.max(px.w, px.h) > CACHE_SIDE ? ["-Z", String(CACHE_SIDE)] : [];
-    const r2 = await exec("sips", [...resize, "-s", "format", "png", from, "--out", dest]);
+    const r2 = await exec("sh", ["-c", MAKE_COPY, "sh", from, dest, String(side)]);
     if (from !== src) await exec("rm", ["-rf", from.slice(0, from.lastIndexOf("/"))]);
     if (r2.code !== 0) throw new Error(String(r2.stderr || "sips failed").trim());
+    const [w4, h3] = String(r2.stdout).trim().split(" ").map(Number);
+    return w4 > 0 && h3 > 0 ? { w: w4, h: h3 } : null;
+  }
+  /** Device pixels the largest element showing this picture covers on its long side, at the current zoom. */
+  needPx(fileId) {
+    let need = 0;
+    for (const e5 of this.elements()) if (e5.type === "image" && e5.fileId === fileId) need = Math.max(need, e5.width, e5.height);
+    return need * this.scale() * DEVICE_PX;
+  }
+  /**
+   * The file to draw for picture `e` now, and the copy it replaced if that was just now (drawn
+   * under it for a moment: the host loads a new file asynchronously and shows nothing until then).
+   * The replaced copy is remembered per element: two elements can share a file and still need
+   * different tiers, and a swap on one is not a swap on the other. A different picture on the
+   * same element (flip, grayscale, or undo) is not a tier swap. Asks for a better-sized copy
+   * when the view wants one and that tier has not already failed too often.
+   */
+  drawnFile(e5) {
+    const pic = this.pics.get(e5.fileId);
+    if (!pic?.files) return { file: this.imageFiles.get(e5.fileId), under: null };
+    const want = tierFor(Math.max(e5.width, e5.height) * this.scale() * DEVICE_PX, pic.max);
+    const got = pickTier(want, pic.files.keys());
+    if (got !== want && (pic.tierTries?.get(want) ?? 0) < TIER_TRIES) this.tierWant.add(`${e5.fileId}|${want}`);
+    const file = pic.files.get(got) ?? this.imageFiles.get(e5.fileId);
+    const now = Date.now();
+    let slot = this.picShown.get(e5.id);
+    if (!slot || slot.fileId !== e5.fileId) this.picShown.set(e5.id, slot = { file: null, under: null, fileId: e5.fileId });
+    if (slot.file && slot.file !== file) {
+      slot.under = { file: slot.file, until: now + SWAP_MS };
+      this.swapUntil = Math.max(this.swapUntil ?? 0, now + SWAP_MS);
+    }
+    slot.file = file;
+    return { file, under: slot.under && slot.under.until > now ? slot.under.file : null };
+  }
+  /** The drawable copy is not in the cache yet. */
+  async copyMissing(rel) {
+    return !await fs2.exists(`${appHome()}/${rel}`);
+  }
+  /** The asset a later copy would read is still a real file inside `<board>.assets/` (not a symlink out). */
+  async assetStillInside(abs, file = this.file) {
+    const r2 = await exec("sh", ["-c", `${ASSET_CHECK}; [ -f "$1" ]`, "sh", abs, assetsDirFor(file)]);
+    if (r2.code !== 0) throw new Error("the picture is not inside the board's assets folder");
+  }
+  /** Makes the copies the view asked for, six at a time, off the render path. A tier that fails is not tried again in this pass. */
+  buildTiers(cx) {
+    if (this.tiering || !this.tierWant.size) return;
+    this.tiering = true;
+    const ticket = this.boardGen.n, file = this.file;
+    const live = () => this.boardGen.current(ticket) && this.file === file;
+    cx.spawn(async (cx2) => {
+      const attempted = /* @__PURE__ */ new Set();
+      try {
+        while (this.tierWant.size && live()) {
+          const batch = [...this.tierWant].filter((w4) => !attempted.has(w4)).slice(0, 6);
+          if (!batch.length) break;
+          for (const w4 of batch) {
+            this.tierWant.delete(w4);
+            attempted.add(w4);
+          }
+          await Promise.all(batch.map(async (w4) => {
+            const at = w4.lastIndexOf("|");
+            const id = w4.slice(0, at), tier = Number(w4.slice(at + 1));
+            const pic = this.pics.get(id);
+            if (!pic?.files || pic.files.has(tier)) return;
+            if ((pic.tierTries?.get(tier) ?? 0) >= TIER_TRIES) return;
+            const cache = `${CACHE}/${tierFile(pic.key, tier)}`;
+            try {
+              if (await this.copyMissing(cache)) {
+                await this.assetStillInside(pic.abs, file);
+                await this.makeCache(pic.abs, `${appHome()}/${cache}`, pic.kind, tier);
+              }
+              if (live() && this.pics.get(id) === pic) pic.files.set(tier, cache);
+            } catch (e5) {
+              if (live() && this.pics.get(id) === pic) {
+                const n2 = (pic.tierTries?.get(tier) ?? 0) + 1;
+                if (!pic.tierTries) pic.tierTries = /* @__PURE__ */ new Map();
+                pic.tierTries.set(tier, n2);
+                if (n2 < TIER_TRIES) this.tierWant.add(w4);
+              }
+              console.log(`board: image ${id} at ${tier || "full"}: ${e5?.message ?? e5}`);
+            }
+          }));
+          if (live()) cx2.notify();
+        }
+      } finally {
+        if (this.boardGen.current(ticket)) this.tiering = false;
+      }
+    });
   }
   async pixelSize(path) {
     const r2 = await exec("sips", ["-g", "pixelWidth", "-g", "pixelHeight", path]);
@@ -6126,8 +6354,12 @@ var Board = class extends View {
       this.fitView(cx, 1);
       return;
     }
-    if (!this.preparing && Object.keys(this.doc.files ?? {}).some((id) => !this.imageFiles.has(id) && (this.tries.get(id) ?? 0) < 4)) this.prepareImages(cx);
-    if (this.herdrZoom() !== this.builtZ) this.rebuild(cx);
+    if (!this.preparing && Object.keys(this.doc.files ?? {}).some((id) => !this.imageFiles.has(id) && (this.tries.get(id) ?? 0) < TIER_TRIES)) this.prepareImages(cx);
+    if (!this.preparing) this.buildTiers(cx);
+    if (this.swapUntil && Date.now() > this.swapUntil) {
+      this.swapUntil = 0;
+      cx.notify();
+    }
     this.endAbandonedGesture(cx);
     const now = Date.now();
     if (autosaveDue({
@@ -6203,12 +6435,11 @@ var Board = class extends View {
   /** Rebuilds the static layers from every element not drawn live. */
   rebuild(cx) {
     this.groupIdx = null;
-    const scale = this.scale();
     const all = this.elements().filter((e5) => !this.active.has(e5.id));
     const els = [...all.filter(isMarker), ...all.filter((e5) => !isMarker(e5))];
-    this.layers = buildLayers(els, this.map(), scale, this.shapeOptions());
-    this.builtVz = this.vz;
-    this.builtZ = this.herdrZoom();
+    const s2 = this.drawScale();
+    this.layers = buildLayers(els, this.map(), s2, this.shapeOptions());
+    this.builtVz = s2;
     while (this.layerViews.length < this.layers.length) this.layerViews.push(cx.new(this.Layer, { idx: this.layerViews.length }));
     for (const v3 of this.layerViews) cx.notify(v3);
     cx.notify(this.liveView);
@@ -6218,8 +6449,8 @@ var Board = class extends View {
     return draw.map((d2) => {
       if (d2.kind === "path") return window.paint_path(d2.path, d2.color).absolute().top(0).left(0).size_full();
       if (d2.kind === "image") return image(d2.file).absolute().left(d2.x * vz).top(d2.y * vz).w(d2.w * vz).h(d2.h * vz);
-      const lineHeight = d2.fontSize * d2.lineHeight * vz;
-      return div2().absolute().left(d2.x * vz).top(d2.y * vz).w(Math.max(d2.w, 1) * vz).font_family(d2.font).text_size(d2.fontSize * vz).line_height(`${lineHeight}px`).text_color(d2.color).whitespace_nowrap().children(d2.lines.map((line) => {
+      const { left, top, w: w4, lineHeight, fontSize } = textBox(d2, vz);
+      return div2().absolute().left(left).top(top).w(w4).font_family(d2.font).text_size(fontSize).line_height(`${lineHeight}px`).text_color(d2.color).whitespace_nowrap().children(d2.lines.map((line) => {
         const row = div2().w_full().h(lineHeight).child(line || " ");
         return d2.align === "center" ? row.text_center() : d2.align === "right" ? row.text_right() : row;
       }));
@@ -6231,7 +6462,7 @@ var Board = class extends View {
   }
   /** Elements being drawn or dragged, the selection outline, the marquee. */
   renderLive() {
-    const s2 = this.scale();
+    const s2 = this.drawScale(), ws = this.scale();
     const map = this.map();
     const els = [...this.active].map((id) => map.get(id)).filter(Boolean);
     const draw = buildLayers(els, map, s2, this.shapeOptions()).flatMap((l2) => l2.draw);
@@ -6252,7 +6483,7 @@ var Board = class extends View {
     }
     const sb = lin ? null : this.selectionBox();
     if (sb && !sb.markersOnly && !(this.pointer?.mode === "move" && this.pointer.started)) {
-      const wide = sb.box.width * s2 >= 40, tall = sb.box.height * s2 >= 40;
+      const wide = sb.box.width * ws >= 40, tall = sb.box.height * ws >= 40;
       for (const hp of HANDLES) {
         if ((hp === "n" || hp === "s") && !wide) continue;
         if ((hp === "e" || hp === "w") && !tall) continue;
@@ -6272,7 +6503,7 @@ var Board = class extends View {
       draw.push({ kind: "path", color: `${sel()}1f`, path: rectPath(x1 * s2, y1 * s2, x22 * s2, y22 * s2, 0) });
       draw.push({ kind: "path", color: sel(), path: rectPath(x1 * s2, y1 * s2, x22 * s2, y22 * s2, 1) });
     }
-    return div2().absolute().top(0).left(0).size_full().children(this.drawList(draw, this.vz));
+    return div2().absolute().top(0).left(0).size_full().children(this.drawList(draw, s2));
   }
   /**
    * Pictures are drawn here, directly in the board's own render. Herdr only loads image files for
@@ -6282,12 +6513,16 @@ var Board = class extends View {
    */
   imageDivs() {
     const vz = this.vz;
+    const view = this.viewBox();
     const out = [];
     for (const e5 of this.elements()) {
       if (e5.type !== "image" || !this.imageFiles.has(e5.fileId)) continue;
+      if (e5.x > view[2] || e5.x + e5.width < view[0] || e5.y > view[3] || e5.y + e5.height < view[1]) continue;
       const media = isMedia(e5);
       const anim = media && this.playing.has(e5.id) ? this.anim.get(e5.fileId) : null;
-      const file = anim?.state === "ready" ? anim.path : this.imageFiles.get(e5.fileId);
+      const still = this.drawnFile(e5);
+      const file = anim?.state === "ready" ? anim.path : still.file;
+      if (still.under && file === still.file) out.push(image(still.under).absolute().left(e5.x * vz).top(e5.y * vz).w(e5.width * vz).h(e5.height * vz));
       out.push(image(file).absolute().left(e5.x * vz).top(e5.y * vz).w(e5.width * vz).h(e5.height * vz));
       if (media) out.push(...this.mediaControls(e5, anim));
     }
@@ -6394,15 +6629,17 @@ var Board = class extends View {
     const vf = `${f3.kind === "video" ? "fps=15," : ""}${fit},split[a][b];[a]palettegen=max_colors=128[p];[b][p]paletteuse=dither=bayer:bayer_scale=5`;
     await fs2.mkdir(`${appHome()}/${CACHE}`, { recursive: true });
     const bin = await this.toolPath("ffmpeg");
-    const tmp = `${out}.part.gif`;
-    await exec("sh", ["-c", '( "$1" -v error -y -t 60 -i "$2" -an -vf "$3" -loop 0 "$4" && mv "$4" "$5" || touch "$5.fail" ) >/dev/null 2>&1 &', "sh", bin, src, vf, tmp, out]);
+    const attempt = animAttempt(out, makeId());
+    await exec("rm", ["-f", ...attempt.clear]);
+    const [cmd, args] = ffmpegAnimArgs(bin, src, vf, attempt.tmp, out, attempt.fail);
+    await exec(cmd, args);
     for (let i2 = 0; i2 < 1200; i2++) {
       if (!this.boardGen.current(ticket)) throw new Error("board changed");
       await cx.sleep(500);
       if (!this.boardGen.current(ticket)) throw new Error("board changed");
       if (await fs2.exists(out)) return `${CACHE}/${safe}.anim.gif`;
-      if (await fs2.exists(`${out}.fail`)) {
-        await exec("rm", ["-f", `${out}.fail`, tmp]);
+      if (await fs2.exists(attempt.fail)) {
+        await exec("rm", ["-f", attempt.fail, attempt.tmp]);
         throw new Error("ffmpeg could not convert it");
       }
     }
@@ -6418,12 +6655,16 @@ var Board = class extends View {
     }
     throw new Error(`${name} is not installed (brew install ffmpeg)`);
   }
-  /** Static layers whose bounds meet the view. */
-  visibleLayerViews() {
+  /** The view in scene units, with a quarter of its size spare on each side. */
+  viewBox() {
     const s2 = this.scale();
     const w4 = (this.size?.width ?? 4e3) / s2;
     const h3 = (this.size?.height ?? 4e3) / s2;
-    const view = [-this.scrollX - w4 * 0.25, -this.scrollY - h3 * 0.25, -this.scrollX + w4 * 1.25, -this.scrollY + h3 * 1.25];
+    return [-this.scrollX - w4 * 0.25, -this.scrollY - h3 * 0.25, -this.scrollX + w4 * 1.25, -this.scrollY + h3 * 1.25];
+  }
+  /** Static layers whose bounds meet the view. */
+  visibleLayerViews() {
+    const view = this.viewBox();
     return this.layers.map((l2, i2) => [l2.bounds, this.layerViews[i2]]).filter(([b2]) => b2[0] <= view[2] && view[0] <= b2[2] && b2[1] <= view[3] && view[1] <= b2[3]).map(([, v3]) => v3);
   }
   render(_cx) {
@@ -6444,9 +6685,9 @@ var Board = class extends View {
     const ui2 = uiColors();
     const bg = t2.background ?? "#1e1e1e";
     const cursor = (el) => this.tool === "hand" || this.spaceDown ? el.cursor_grab() : this.tool === "text" ? el.cursor_text() : this.tool === "selection" ? el.cursor_default() : el.cursor_crosshair();
-    const canvas = cursor(div2().id("canvas").absolute().top(0).left(0).size_full().bg(bg).overflow_hidden()).on_mouse_down("left", (e5, cx) => this.onDown(e5, cx)).on_mouse_down("middle", (e5, cx) => this.onPanStart(e5, cx)).on_mouse_down("right", (e5, cx) => this.onContext(e5, cx)).on_drop((e5, cx) => this.importPaths(e5.paths, cx)).on_mouse_move((e5, cx) => this.onMove(e5, cx)).on_hover((over, cx) => {
+    const canvas = wireDrop(cursor(div2().id("canvas").absolute().top(0).left(0).size_full().bg(bg).overflow_hidden()).on_mouse_down("left", (e5, cx) => this.onDown(e5, cx)).on_mouse_down("middle", (e5, cx) => this.onPanStart(e5, cx)).on_mouse_down("right", (e5, cx) => this.onContext(e5, cx)).on_mouse_move((e5, cx) => this.onMove(e5, cx)).on_hover((over, cx) => {
       if (!over && this.pointer) this.onUp(cx);
-    }).on_mouse_up("left", (e5, cx) => this.onUp(cx)).on_mouse_up("middle", (e5, cx) => this.onUp(cx)).on_scroll_wheel((e5, cx) => this.onWheel(e5, cx)).child(div2().absolute().left(this.scrollX * this.vz).top(this.scrollY * this.vz).size_full().children([...this.imageDivs(), ...this.visibleLayerViews(), this.liveView, ...this.textEditor()])).child(this.emptyHint(ui2));
+    }).on_mouse_up("left", (e5, cx) => this.onUp(cx)).on_mouse_up("middle", (e5, cx) => this.onUp(cx)).on_scroll_wheel((e5, cx) => this.onWheel(e5, cx)).child(div2().absolute().left(this.scrollX * this.vz).top(this.scrollY * this.vz).size_full().children([...this.imageDivs(), ...this.visibleLayerViews(), this.liveView, ...this.textEditor()])).child(this.emptyHint(ui2)), this.dropTarget, (paths, cx) => this.importPaths(paths, cx));
     return root.track_focus(this.focus).on_hover((hovered) => {
       this.paneHover = hovered;
       if (hovered === false && this.pointer) this.gestureLeft = true;
@@ -6457,10 +6698,20 @@ var Board = class extends View {
       }
     }).children([canvas, this.topBar(ui2), this.quickActions(ui2), this.toolbar(ui2), this.stylePanel(ui2), this.statusBar(ui2), this.renderMenu(ui2)]);
   }
-  /** A first step for an empty board; gone as soon as there is anything on the canvas. */
+  /** State a: a first step for an empty board, gone as soon as there is anything on the canvas.
+   * State b: "Drop to add" while files are dragged over the canvas, on any board. */
   emptyHint(ui2) {
-    if (this.elements().length || this.editing || this.pointer) return div2();
-    return div2().absolute().top(0).left(0).size_full().flex().flex_col().items_center().justify_center().children([
+    const hint = canvasHint({ count: this.elements().length, editing: this.editing, pointer: this.pointer, dragOver: this.dropTarget.over });
+    if (!hint) return div2();
+    const centred = () => div2().flex().flex_col().items_center().justify_center();
+    if (hint === "drop") {
+      const { accent, tint } = dropColors();
+      return dashedBorder(div2().absolute().top(24).left(24).right(24).bottom(24).border(2)).border_color(accent).rounded(6).bg(tint).child(centred().size_full().children([
+        svg(`${ICONS}/drop.svg`).size(28).text_color(accent).mb(12),
+        div2().text_size(13).font_semibold().text_color(accent).child("Drop to add")
+      ]));
+    }
+    return centred().absolute().top(0).left(0).size_full().children([
       svg(`${ICONS}/drop.svg`).size(28).text_color(ui2.foreground).mb(12),
       div2().text_size(13).font_semibold().text_color(ui2.foreground).child("Drop, paste or draw"),
       div2().text_size(11).text_color(ui2.muted).mt(8).child("\u2318V paste \xB7 D draw \xB7 N note \xB7 T text")
@@ -6639,10 +6890,7 @@ var Board = class extends View {
         div2().font_semibold().text_color(t2.foreground).child(basename2(this.file).replace(/\.[^.]+$/, "")),
         div2().child(tildify2(this.file))
       ]),
-      div2().flex().gap(10).items_center().children([
-        div2().text_color(ok ? t2.muted : "#e03131").child(`\u25CF ${state}`),
-        this.elements().length ? div2().child("Paste \u2318V \xB7 Drop files") : div2()
-      ])
+      div2().text_color(ok ? t2.muted : "#e03131").child(`\u25CF ${state}`)
     ]);
   }
   statusBar(t2) {
@@ -6693,8 +6941,7 @@ var Board = class extends View {
         await this.cacheOne(id, entry, ticket);
         if (!here()) return;
         if (kind === "video") entry.duration = await this.probeDuration(`${dir}/${name}`).catch(() => null);
-        const drawn = this.imageFiles.get(id);
-        const px = drawn ? await this.pixelSize(`${appHome()}/${drawn}`) : { w: 400, h: 300 };
+        const px = this.pixels.get(id) ?? await this.pixelSize(`${dir}/${name}`);
         if (!here()) return;
         const size = fitSize(px.w, px.h);
         const mime = { jpg: "jpeg", jpeg: "jpeg", svg: "svg+xml", tif: "tiff", heic: "heic" }[extOf(src)] ?? extOf(src);
@@ -6792,9 +7039,15 @@ var Board = class extends View {
       this.say("Board", String(e5?.message ?? e5), "warning");
     }
   }
+  /** Launch a gif or video. Anything else is refused: `open` would run a script or app shipped in the assets folder. */
   async openMedia(el) {
+    const entry = this.doc.files?.[el?.fileId];
+    if (!openableMedia(entry?.path, el?.customData?.kind)) {
+      this.say("Board", "Only a GIF or video can be opened", "warning");
+      return;
+    }
     try {
-      exec("open", [await this.safeAsset(this.doc.files?.[el.fileId]?.path)]);
+      exec("open", [await this.safeAsset(entry.path)]);
     } catch (e5) {
       this.say("Board", String(e5?.message ?? e5), "warning");
     }
@@ -6806,33 +7059,43 @@ var Board = class extends View {
       this.say("Board", `${how === "flip" ? "Flip" : "Grayscale"} works on still images`);
       return;
     }
+    const ids = imgs.map((el) => el.id);
     const file = this.file, ticket = this.boardGen.n;
     cx.spawn(async (cx2) => {
-      const before = this.scene.getElementsIncludingDeleted().map((e5) => ({ ...e5 }));
-      let changed = false;
-      for (const el of imgs) {
+      const pending = [];
+      for (const elementId of ids) {
         try {
-          const src = await this.safeAsset(this.doc.files?.[el.fileId]?.path);
+          let el = this.scene.getElement(elementId);
+          if (!el || el.isDeleted) continue;
+          const old = this.doc.files?.[el.fileId];
+          const src = await this.safeAsset(old?.path);
           if (!this.boardGen.current(ticket)) return;
-          const id = makeId();
-          const name = `${id}.png`;
+          el = this.scene.getElement(elementId);
+          if (!el || el.isDeleted) continue;
+          const fileId = makeId();
+          const name = `${fileId}.png`;
           const args = how === "flip" ? ["-f", "horizontal"] : ["-m", GRAY_PROFILE];
           const r2 = await exec("sips", [...args, "-s", "format", "png", src, "--out", `${assetsDirFor(file)}/${name}`]);
           if (r2.code !== 0) throw new Error(r2.stderr.trim() || "sips failed");
           if (!this.boardGen.current(ticket)) return;
-          const old = this.doc.files[el.fileId];
-          const entry = { ...old, id, path: relAssetFor(file, name), mimeType: "image/png", created: Date.now(), kind: "image" };
-          await this.cacheOne(id, entry, ticket);
+          el = this.scene.getElement(elementId);
+          if (!el || el.isDeleted) continue;
+          const entry = { ...old, id: fileId, path: relAssetFor(file, name), mimeType: "image/png", created: Date.now(), kind: "image" };
+          await this.cacheOne(fileId, entry, ticket, Math.max(el.width, el.height) * this.scale() * DEVICE_PX);
           if (!this.boardGen.current(ticket)) return;
-          this.doc = { ...this.doc, files: { ...this.doc.files, [id]: entry } };
-          this.scene.mutateElement(el, { fileId: id });
-          changed = true;
+          el = this.scene.getElement(elementId);
+          if (!el || el.isDeleted) continue;
+          pending.push({ elementId, fileId, entry });
         } catch (e5) {
           this.say(`Board: ${how} failed`, String(e5?.message ?? e5), "error");
         }
       }
-      if (!this.boardGen.current(ticket) || !changed) return;
-      this.history.record(before);
+      if (!this.boardGen.current(ticket) || !pending.length) return;
+      if (!applyDerivedFiles(this.scene, this.history, pending)) return;
+      for (const item of pending) {
+        const el = this.scene.getElement(item.elementId);
+        if (el && !el.isDeleted && el.fileId === item.fileId) this.doc = { ...this.doc, files: { ...this.doc.files, [item.fileId]: item.entry } };
+      }
       this.markDirty();
       this.rebuild(cx2);
     });
@@ -6948,7 +7211,8 @@ var Board = class extends View {
     if (lin) {
       const s3 = this.scale();
       for (const [which, pt3] of Object.entries(lin.handles)) {
-        if (Math.abs(local.x - (pt3.x + this.scrollX) * s3) <= HANDLE + 5 && Math.abs(local.y - (pt3.y + this.scrollY) * s3) <= HANDLE + 5) return { kind: "linear", which, el: lin.el };
+        const hit2 = (HANDLE + 5) * this.herdrZoom();
+        if (Math.abs(local.x - (pt3.x + this.scrollX) * s3) <= hit2 && Math.abs(local.y - (pt3.y + this.scrollY) * s3) <= hit2) return { kind: "linear", which, el: lin.el };
       }
       return null;
     }
@@ -6957,7 +7221,8 @@ var Board = class extends View {
     const s2 = this.scale();
     const toLocal = (pt3) => ({ x: (pt3.x + this.scrollX) * s2, y: (pt3.y + this.scrollY) * s2 });
     const wide = sb.box.width * s2 >= 40, tall = sb.box.height * s2 >= 40;
-    const hit = HANDLE + 5;
+    const z3 = this.herdrZoom();
+    const hit = (HANDLE + 5) * z3;
     for (const h3 of HANDLES) {
       if ((h3 === "n" || h3 === "s") && !wide) continue;
       if ((h3 === "e" || h3 === "w") && !tall) continue;
@@ -6965,10 +7230,11 @@ var Board = class extends View {
       if (Math.abs(local.x - c3.x) <= hit && Math.abs(local.y - c3.y) <= hit) return { kind: "resize", handle: h3, sb };
     }
     if (sb.rotatable) {
+      const rotate = ROTATE_RADIUS * z3;
       for (const h3 of ["nw", "ne", "se", "sw"]) {
         const c3 = toLocal(handlePoint(sb.box, h3));
         const dx = (local.x - c3.x) * (h3.includes("e") ? 1 : -1), dy = (local.y - c3.y) * (h3.includes("s") ? 1 : -1);
-        if (dx > 0 && dy > 0 && Math.hypot(dx, dy) < 32) return { kind: "rotate", handle: h3, sb };
+        if (dx > 0 && dy > 0 && Math.hypot(dx, dy) < rotate) return { kind: "rotate", handle: h3, sb };
       }
     }
     return null;
