@@ -366,8 +366,11 @@ export function openOverlay(spec: OverlaySpec): string;
  *  dialog or popup. A kept window closed this way stays closed. */
 export function closeOverlay(id: string): null;
 
-/** Posts a notification. Shown by the `toast` mod (replaceable), which runs `action` when clicked.
- *  Herdr posts one itself when an agent needs you or finished while you weren't looking. Returns its id. */
+/** Posts a notification. Shown by the `toast` mod (replaceable), which runs `action` when clicked,
+ *  and kept in the bell's history (source "mods", from this mod's folder). Herdr posts its own too
+ *  (an agent needs you, a download, a failure). `key`: a repeat bumps the same item. `keep`: stored
+ *  in the history (default: warnings, errors, and anything shown longer than 3 s). `private`: toast
+ *  only, never stored. Do Not Disturb or a muted source shows no toast. Returns the toast's id. */
 export function notify(n: {
   title: string;
   body?: string;
@@ -375,7 +378,46 @@ export function notify(n: {
   timeout?: number;
   icon?: string;
   action?: { name: string; args?: Record<string, unknown> };
+  key?: string;
+  keep?: boolean;
+  private?: boolean;
 }): string;
+
+/** One entry of the bell's history, newest first. `stale`: its action points at a terminal or agent
+ *  from before a restart, so it can't run. */
+export interface Notification {
+  id: string;
+  ts: number;
+  source: "agents" | "machines" | "browser" | "updates" | "mods" | "app";
+  from: string;
+  title: string;
+  body: string;
+  level: "info" | "success" | "warning" | "error";
+  icon?: string;
+  action?: { name: string; args?: Record<string, unknown> };
+  key?: string;
+  count: number;
+  read: boolean;
+  stale: boolean;
+}
+
+/** The bell's history; reading it in render re-renders on change. A mod sees only its own items
+ *  unless its mod.json has `"permissions": { "notifications": "all" }`; only such a mod gets
+ *  `settings`. */
+export function notifications(): {
+  unread: number;
+  items: Notification[];
+  settings?: { dnd: boolean; muted_sources: string[] };
+};
+
+/** Marks notifications read: an id, "all", or { source }. Own items only without the permission. */
+export function markRead(target: string | { source: string }): null;
+
+/** Deletes notifications: an id, "all", or { source }. Own items only without the permission. */
+export function clearNotifications(target: string | { source: string }): null;
+
+/** Do Not Disturb (`dnd`) or one source muted. Needs `"permissions": { "notifications": "all" }`. */
+export function setNotificationMute(m: { dnd?: boolean; source?: string; muted?: boolean }): null;
 
 /** The props this copy of the mod was given in the layout (or overlay).
  *  A layout's terminal_menu mod gets {tab: "pane", target: {pane: string, terminal: string}, overlay: string}.
@@ -411,3 +453,20 @@ export function nextCommand(): Promise<string>;
  * Watch what you show, not a whole home folder (node_modules is a lot of events).
  */
 export function watchFolder(path: string): Promise<string[]>;
+
+/**
+ * Plays the video element with this `.id()` (macOS; ids are window-wide, so prefix them with your
+ * mod's name). A clip shows a still until played; at most 4 play at once (the one playing
+ * longest pauses), and one off screen for a second pauses. Throws when no such video is on screen.
+ */
+export function videoPlay(id: string): null;
+/** Pauses it: the player is released and the last frame stays. */
+export function videoPause(id: string): null;
+/** Moves it to `seconds` (a paused clip shows that frame). */
+export function videoSeek(id: string, seconds: number): null;
+/**
+ * The next event of that video: `{id, type, time, duration, error?}`, type `ready`, `time`
+ * (4 a second while playing), `paused`, `ended` or `error`.
+ *   cx.spawn(async (cx) => { for (;;) { const e = await nextVideoEvent("board-clip-1"); ...; cx.notify(); } });
+ */
+export function nextVideoEvent(id: string): Promise<{ id: string; type: "ready" | "time" | "paused" | "ended" | "error"; time: number; duration: number | null; error?: string }>;

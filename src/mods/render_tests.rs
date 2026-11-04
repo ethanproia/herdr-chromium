@@ -125,7 +125,8 @@ fn module(values: BTreeMap<String, Value>, calls: Rc<RefCell<Calls>>) -> HostMod
         shared.borrow_mut().shared.insert(a.string(0)?.into(), from_host(a.value(1)?));
         Ok(HostValue::Null)
     });
-    for name in ["run", "playSound", "setAgentOrder", "openOverlay", "closeOverlay", "notify", "presentUpdateNotes"] {
+    module = module.function("notifications", |_| Ok(to_host(&json!({ "unread": 0, "items": [] }))));
+    for name in ["run", "playSound", "setAgentOrder", "openOverlay", "closeOverlay", "notify", "presentUpdateNotes", "markRead", "clearNotifications", "setNotificationMute"] {
         let calls = calls.clone();
         module = module.function(name, move |a| {
             if name == "run" {
@@ -151,8 +152,11 @@ fn module(values: BTreeMap<String, Value>, calls: Rc<RefCell<Calls>>) -> HostMod
     module = module.async_function("feedbackPickImages", |_| Ok(async { Ok(HostValue::Array(vec![])) }));
     module = module.async_function("knownAgents", |_| Ok(async { Ok(HostValue::Array(vec![])) }));
     module = module.async_function("pickFolder", |_| Ok(async { Ok(HostValue::Null) }));
-    for name in ["nextCommand", "watchFolder"] {
+    for name in ["nextCommand", "watchFolder", "nextVideoEvent"] {
         module = module.async_function(name, |_| Ok(std::future::pending::<gpui_shell::HostResult>()));
+    }
+    for name in ["videoPlay", "videoPause", "videoSeek"] {
+        module = module.function(name, |_| Ok(HostValue::Null));
     }
     for name in ["exec", "hc", "readTextFile", "writeTextFile", "sendFeedback"] {
         let calls = calls.clone();
@@ -281,6 +285,24 @@ fn shipped_initial_descriptions(cx: &mut TestAppContext) {
         entries.len(),
         start.elapsed()
     );
+}
+
+/// HERDR: `video(path, options)` is an element like `image`; its options are checked strictly.
+#[gpui::test]
+fn a_mod_can_place_a_video_and_bad_options_are_refused(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+    let write = |name: &str, body: &str| {
+        let dir = staged.0.join("mods").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("main.js"), format!("import {{ View, video }} from \"gpui-kit\";\nexport default class V extends View {{ render() {{ return {body}; }} }}\n")).unwrap();
+    };
+    write("vtest", r#"video("mods/vtest/clip.mp4", { autoplay: true, loop: true, muted: true }).id("clip").absolute().w(320).h(180)"#);
+    let tree = describe_with_values(cx, &staged, "mods/vtest", fixture(true, props(), updates("current", "current")), None).unwrap();
+    assert!(tree.contains(r#"video "mods/vtest/clip.mp4" autoplay loop muted"#), "{tree}");
+    write("vbad", r#"video("mods/vbad/clip.mp4", { autoplya: true })"#);
+    let err = describe_with_values(cx, &staged, "mods/vbad", fixture(true, props(), updates("current", "current")), None).unwrap_err();
+    assert!(format!("{err:#}").contains("unknown video option `autoplya`"), "{err:#}");
 }
 
 #[gpui::test]

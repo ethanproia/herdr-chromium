@@ -22,7 +22,7 @@ thread_local! {
 /// `on_dev_tools_method_result`. The answer travels browser process to host only: nothing the page
 /// can print or call reaches it, so a page cannot forge an `EvalResult` (SEC3).
 pub fn eval_message(id: &str, req: u64, expr: &str) -> Vec<u8> {
-    evaluate(id, req, Op::Eval, expr)
+    evaluate(id, req, Op::Eval, expr).expect("the main world sends at once")
 }
 
 /// What a Runtime.evaluate answer turns into.
@@ -46,12 +46,12 @@ pub enum Op {
 pub fn ready_message(id: &str, generation: u64) -> Vec<u8> {
     const INPUT_LIVE: &str = "new Promise(r=>{const f=e=>{if(e.isTrusted){removeEventListener('mousemove',f,true);r(1)}};\
         addEventListener('mousemove',f,true);setTimeout(()=>{removeEventListener('mousemove',f,true);r(0)},5000)})";
-    evaluate(id, 0, Op::Ready { generation }, INPUT_LIVE)
+    evaluate(id, 0, Op::Ready { generation }, INPUT_LIVE).expect("the main world sends at once")
 }
 
 /// Overlay geometry, measured by a privileged DevTools evaluate (the page cannot answer for it).
 /// Rects are viewport CSS px of the top document; `frames` stays empty (no iframe descent yet).
-pub fn overlay_message(id: &str, req: u64, epoch: u64, query: &herdr_browser_protocol::OverlayQuery) -> Vec<u8> {
+pub fn overlay_message(id: &str, req: u64, epoch: u64, query: &herdr_browser_protocol::OverlayQuery) -> Option<Vec<u8>> {
     use herdr_browser_protocol::OverlayQuery as Q;
     const BOX: &str = "r=>({x:r.x,y:r.y,w:r.width,h:r.height})";
     let expr = match query {
@@ -88,14 +88,14 @@ fn style_js(node: &str, body: &str) -> String {
 }
 
 /// `Styles`: one row per property.
-pub fn styles_message(id: &str, req: u64, node: &str, props: &[String]) -> Vec<u8> {
+pub fn styles_message(id: &str, req: u64, node: &str, props: &[String]) -> Option<Vec<u8>> {
     let props = serde_json::to_string(props).expect("strings encode");
     let body = format!("const ps={props};if(!ps.every(okp))return{{ok:false}};return{{ok:true,rows:ps.map(row)}}");
     evaluate(id, req, Op::Styles { set: None, revert: None }, &style_js(node, &body))
 }
 
 /// `SetStyle`: set (or remove) one inline property; report the attribute it had before.
-pub fn set_style_message(id: &str, req: u64, node: &str, prop: &str, value: Option<&str>) -> Vec<u8> {
+pub fn set_style_message(id: &str, req: u64, node: &str, prop: &str, value: Option<&str>) -> Option<Vec<u8>> {
     let (p, v) = (serde_json::to_string(prop).expect("encodes"), serde_json::to_string(&value).expect("encodes"));
     let body = format!(
         "const p={p},v={v};if(!okp(p))return{{ok:false}};const orig=el.getAttribute('style');\
@@ -106,7 +106,7 @@ pub fn set_style_message(id: &str, req: u64, node: &str, prop: &str, value: Opti
 
 /// `RevertStyle`: put back the attribute remembered at the first SetStyle (nothing to do if the
 /// panel never changed this node).
-pub fn revert_style_message(id: &str, req: u64, node: &str) -> Vec<u8> {
+pub fn revert_style_message(id: &str, req: u64, node: &str) -> Option<Vec<u8>> {
     let original = ORIGINAL_STYLE.with_borrow(|m| m.get(&(id.to_string(), node.to_string())).cloned());
     super::debug(format_args!("{id}: revert {node}: original {original:?}"));
     let body = match original {
@@ -125,7 +125,7 @@ pub fn revert_style_message(id: &str, req: u64, node: &str) -> Vec<u8> {
 /// that matches only it (id, else a tag.class:nth-of-type path checked with querySelectorAll),
 /// a label (tag plus up to 30 chars of its own text, aria-label or alt; form fields never give
 /// their value, password fields give nothing) and its box.
-pub fn pick_message(id: &str, req: u64, x: f32, y: f32) -> Vec<u8> {
+pub fn pick_message(id: &str, req: u64, x: f32, y: f32) -> Option<Vec<u8>> {
     let js = format!(
         "(()=>{{const X={x},Y={y};let el=document.elementFromPoint(X,Y);if(!el)return{{ok:false}};\
          while(el.shadowRoot){{const inner=el.shadowRoot.elementFromPoint(X,Y);if(!inner||inner===el)break;el=inner}}\
@@ -156,7 +156,7 @@ const PICK_DESCRIBE: &str = "const root=el.getRootNode(),esc=s=>CSS.escape(s);\
 /// previous / next element sibling (a shadow host's children are its shadow root's; the parent of
 /// a shadow root's child is its host; never above <body>), then describe it like `PickInfo`.
 /// `from` is looked up in the document, so a pick inside a shadow root cannot be stepped from (ok false).
-pub fn pick_relative_message(id: &str, req: u64, from: &str, step: herdr_browser_protocol::PickStep) -> Vec<u8> {
+pub fn pick_relative_message(id: &str, req: u64, from: &str, step: herdr_browser_protocol::PickStep) -> Option<Vec<u8>> {
     use herdr_browser_protocol::PickStep as S;
     let from = serde_json::to_string(from).expect("encodes");
     let step = match step {
@@ -193,27 +193,219 @@ pub fn overlay_rects(value: &serde_json::Value) -> Vec<herdr_browser_protocol::C
         .unwrap_or_default()
 }
 
-fn evaluate(id: &str, req: u64, op: Op, expr: &str) -> Vec<u8> {
+fn next_msg() -> i32 {
     let msg = NEXT_MSG.get();
     NEXT_MSG.set(if msg == i32::MAX { FIRST_EVAL_MSG } else { msg + 1 });
+    msg
+}
+
+fn devtools_call(msg: i32, method: &str, params: serde_json::Value) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({ "id": msg, "method": method, "params": params })).expect("json encodes")
+}
+
+fn eval_call(msg: i32, expr: &str, context: Option<i64>, user_gesture: bool) -> Vec<u8> {
+    let mut params = serde_json::json!({ "expression": expr, "awaitPromise": true, "returnByValue": true, "userGesture": user_gesture });
+    if let Some(c) = context {
+        params["contextId"] = c.into();
+    }
+    devtools_call(msg, "Runtime.evaluate", params)
+}
+
+/// The isolated world passive probes run in: the page's DOM, none of its script (a page can't redefine
+/// `elementFromPoint` or `getComputedStyle` for us, or see our globals).
+const PROBE_WORLD: &str = "herdr-probe";
+
+thread_local! {
+    /// Per browser: the probe world of the current document, and probes waiting for it.
+    static WORLDS: std::cell::RefCell<std::collections::HashMap<String, World>> = Default::default();
+    /// DevTools ids of world setup calls: msg -> (browser id, world generation, stage).
+    static WORLD_CALLS: std::cell::RefCell<std::collections::HashMap<i32, (String, u64, Stage)>> = Default::default();
+}
+
+#[derive(Debug, Default)]
+struct World {
+    context: Option<i64>,
+    generation: u64,
+    starting: bool,
+    /// Probe evals (DevTools msg, expression) to send once the world exists.
+    waiting: Vec<(i32, String)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Stage {
+    FrameTree,
+    Create,
+}
+
+/// A `Runtime.evaluate` for `op`. The agent's own eval and the readiness probe run in the page's world;
+/// every other probe runs in `PROBE_WORLD`. None: the probe waits for that world (sent from
+/// `on_world_answer`); otherwise the message to send now.
+fn evaluate(id: &str, req: u64, op: Op, expr: &str) -> Option<Vec<u8>> {
+    let msg = next_msg();
     // Only an agent's own eval acts as the person (it may click or open a popup). Passive probes
     // (readiness, overlay, pick, styles) never grant the page a user activation.
     let user_gesture = op == Op::Eval;
+    let isolated = !matches!(op, Op::Eval | Op::Ready { .. });
     EVALS.with_borrow_mut(|e| e.insert(msg, (id.to_string(), req, op)));
-    let call = serde_json::json!({
-        "id": msg,
-        "method": "Runtime.evaluate",
-        "params": { "expression": expr, "awaitPromise": true, "returnByValue": true, "userGesture": user_gesture },
+    if !isolated {
+        return Some(eval_call(msg, expr, None, user_gesture));
+    }
+    WORLDS.with_borrow_mut(|w| {
+        let w = w.entry(id.to_string()).or_default();
+        if let Some(c) = w.context {
+            return Some(eval_call(msg, expr, Some(c), false));
+        }
+        w.waiting.push((msg, expr.to_string()));
+        if w.starting {
+            return None;
+        }
+        w.starting = true;
+        let call = next_msg();
+        WORLD_CALLS.with_borrow_mut(|c| c.insert(call, (id.to_string(), w.generation, Stage::FrameTree)));
+        Some(devtools_call(call, "Page.getFrameTree", serde_json::json!({})))
+    })
+}
+
+/// A new document (a load started): its probe world is made again on the next probe; probes still
+/// waiting for the old one fail.
+pub fn world_reset(id: &str) {
+    let waiting = WORLDS.with_borrow_mut(|w| {
+        let w = w.entry(id.to_string()).or_default();
+        w.context = None;
+        w.starting = false;
+        w.generation += 1;
+        std::mem::take(&mut w.waiting)
     });
-    serde_json::to_vec(&call).expect("json encodes")
+    fail_waiting(waiting, "the page changed");
+}
+
+fn fail_waiting(waiting: Vec<(i32, String)>, why: &str) {
+    for (msg, _) in waiting {
+        if let Some((id, req, op)) = EVALS.with_borrow_mut(|e| e.remove(&msg)) {
+            finish(id, req, op, false, serde_json::Value::String(why.into()));
+        }
+    }
+}
+
+/// A world setup call answered. Returns false when `msg` is not one.
+fn on_world_answer(browser: Option<&mut Browser>, self_id: &str, msg: i32, success: bool, result: &[u8]) -> bool {
+    let Some((id, generation, stage)) = WORLD_CALLS.with_borrow_mut(|c| match c.get(&msg) {
+        Some((b, _, _)) if b == self_id => c.remove(&msg),
+        _ => None,
+    }) else {
+        return false;
+    };
+    let current = WORLDS.with_borrow(|w| w.get(&id).is_some_and(|w| w.generation == generation));
+    if !current {
+        return true;
+    }
+    let v: serde_json::Value = serde_json::from_slice(result).unwrap_or_default();
+    let host = browser.and_then(|b| b.host());
+    let fail = |why: &str| {
+        let waiting = WORLDS.with_borrow_mut(|w| {
+            let w = w.entry(id.clone()).or_default();
+            w.starting = false;
+            std::mem::take(&mut w.waiting)
+        });
+        super::debug(format_args!("{id}: probe world: {why}"));
+        fail_waiting(waiting, "the page's probe world could not be made");
+    };
+    match stage {
+        Stage::FrameTree => {
+            let Some(frame) = v["frameTree"]["frame"]["id"].as_str().filter(|_| success) else {
+                fail("no main frame");
+                return true;
+            };
+            let call = next_msg();
+            WORLD_CALLS.with_borrow_mut(|c| c.insert(call, (id.clone(), generation, Stage::Create)));
+            let create = devtools_call(call, "Page.createIsolatedWorld", serde_json::json!({ "frameId": frame, "worldName": PROBE_WORLD, "grantUniveralAccess": false }));
+            if !host.is_some_and(|h| h.send_dev_tools_message(Some(&create)) == 1) {
+                fail("createIsolatedWorld not sent");
+            }
+        }
+        Stage::Create => {
+            let Some(context) = v["executionContextId"].as_i64().filter(|_| success) else {
+                fail("not created");
+                return true;
+            };
+            let waiting = WORLDS.with_borrow_mut(|w| {
+                let w = w.entry(id.clone()).or_default();
+                (w.context, w.starting) = (Some(context), false);
+                std::mem::take(&mut w.waiting)
+            });
+            super::debug(format_args!("{id}: probe world {context} ready, sending {} probes", waiting.len()));
+            let mut unsent = Vec::new();
+            for (msg, expr) in waiting {
+                if !host.as_ref().is_some_and(|h| h.send_dev_tools_message(Some(&eval_call(msg, &expr, Some(context), false))) == 1) {
+                    unsent.push((msg, expr));
+                }
+            }
+            fail_waiting(unsent, "DevTools is not available for this page");
+        }
+    }
+    true
+}
+
+/// An eval's answer, turned into what the app asked for.
+fn finish(id: String, req: u64, op: Op, ok: bool, value: serde_json::Value) {
+    match op {
+        Op::Eval => send(HostToApp::EvalResult { id, req, ok, value }),
+        Op::Styles { set, revert } => {
+            let ok = ok && value["ok"].as_bool() == Some(true);
+            if ok {
+                let key = |node: String| (id.clone(), node);
+                if let Some(node) = set {
+                    let orig = value["orig"].as_str().map(str::to_string);
+                    super::debug(format_args!("{id}: set {node}: page reported original {:?}", value["orig"]));
+                    ORIGINAL_STYLE.with_borrow_mut(|m| {
+                        m.entry(key(node)).or_insert(orig);
+                    });
+                }
+                if let Some(node) = revert.as_ref() {
+                    super::debug(format_args!("{id}: reverted {node}: attribute now {:?}", value["after"]));
+                }
+                if let Some(node) = revert {
+                    ORIGINAL_STYLE.with_borrow_mut(|m| m.remove(&key(node)));
+                }
+            }
+            let rows = if ok { style_rows(&value) } else { vec![] };
+            send(HostToApp::StylesResult { id, req, ok, rows });
+        }
+        Op::Pick => {
+            let ok = ok && value["ok"].as_bool() == Some(true);
+            let text = |k: &str| if ok { value[k].as_str().unwrap_or_default().to_string() } else { String::new() };
+            let f = |k: &str| value["rect"][k].as_f64().unwrap_or(0.0) as f32;
+            let rect = herdr_browser_protocol::CssRect { x: f("x"), y: f("y"), w: f("w"), h: f("h") };
+            send(HostToApp::PickInfoResult { id, req, ok, selector: text("selector"), label: text("label"), rect });
+        }
+        Op::Ready { generation } => {
+            super::debug(format_args!("{id}: input path live: {value}"));
+            super::input_live(&id, generation)
+        }
+        Op::Overlay { epoch } => {
+            if !ok || value.get("error").is_some() {
+                super::debug(format_args!("{id}: overlay {req} found nothing: {value}"));
+            }
+            let rects = if ok { overlay_rects(&value) } else { vec![] };
+            send(HostToApp::OverlayRects { id, req, epoch, rects, frames: vec![] });
+        }
+    }
 }
 
 /// The eval for DevTools message `msg` failed to send: forget it.
 pub fn eval_unsent(id: &str) -> Option<u64> {
-    EVALS.with_borrow_mut(|e| {
+    let (msg, req) = EVALS.with_borrow_mut(|e| {
         let msg = e.iter().filter(|(_, (b, _, _))| b == id).map(|(m, _)| *m).max()?;
-        e.remove(&msg).map(|(_, req, _)| req)
-    })
+        e.remove(&msg).map(|(_, req, _)| (msg, req))
+    })?;
+    // If that send was the probe world's first call, the world never started: let the next probe try again.
+    let others = WORLDS.with_borrow_mut(|w| {
+        let w = w.get_mut(id).filter(|w| w.context.is_none() && w.waiting.iter().any(|(m, _)| *m == msg))?;
+        w.starting = false;
+        Some(std::mem::take(&mut w.waiting).into_iter().filter(|(m, _)| *m != msg).collect::<Vec<_>>())
+    });
+    fail_waiting(others.unwrap_or_default(), "DevTools is not available for this page");
+    Some(req)
 }
 
 /// Turn a `Runtime.evaluate` result into (ok, value).
@@ -476,10 +668,32 @@ wrap_life_span_handler! {
 
         fn on_before_close(&self, _browser: Option<&mut Browser>) {
             super::OPEN.set(super::OPEN.get().saturating_sub(1));
+            super::on_closed(&self.id);
         }
 
-        fn on_before_popup(&self, _browser: Option<&mut Browser>, _frame: Option<&mut Frame>, _popup_id: ::std::os::raw::c_int, target_url: Option<&CefString>, _target_frame_name: Option<&CefString>, target_disposition: WindowOpenDisposition, _user_gesture: ::std::os::raw::c_int, _popup_features: Option<&PopupFeatures>, _window_info: Option<&mut WindowInfo>, _client: Option<&mut Option<Client>>, _settings: Option<&mut BrowserSettings>, _extra_info: Option<&mut Option<DictionaryValue>>, _no_javascript_access: Option<&mut ::std::os::raw::c_int>) -> ::std::os::raw::c_int {
+        // A real popup (window.open with features, after a click) is made by CEF itself, off-screen
+        // like a block, so window.opener, postMessage and window.close work and it shares the
+        // opener's profile; the app shows it over the opener. One without a click is refused.
+        // Tabs, `_blank` and the rest stay the app's (a new block).
+        fn on_before_popup(&self, _browser: Option<&mut Browser>, _frame: Option<&mut Frame>, _popup_id: ::std::os::raw::c_int, target_url: Option<&CefString>, _target_frame_name: Option<&CefString>, target_disposition: WindowOpenDisposition, user_gesture: ::std::os::raw::c_int, popup_features: Option<&PopupFeatures>, window_info: Option<&mut WindowInfo>, client: Option<&mut Option<Client>>, settings: Option<&mut BrowserSettings>, _extra_info: Option<&mut Option<DictionaryValue>>, _no_javascript_access: Option<&mut ::std::os::raw::c_int>) -> ::std::os::raw::c_int {
             let disposition = disposition_name(&target_disposition);
+            if disposition == "new_popup" {
+                if user_gesture == 0 {
+                    send(HostToApp::PopupBlocked { id: self.id.clone(), url: s(target_url) });
+                    return 1;
+                }
+                let (w, h) = popup_features.map_or((None, None), |f| ((f.width_set != 0).then_some(f.width as f32), (f.height_set != 0).then_some(f.height as f32)));
+                if let (Some(info), Some(client), Some(settings)) = (window_info, client, settings)
+                    && let Some(id) = super::adopt_popup(&self.id, w, h)
+                {
+                    *info = WindowInfo { windowless_rendering_enabled: 1, shared_texture_enabled: 1, ..Default::default() };
+                    *client = Some(client_for(&id));
+                    settings.windowless_frame_rate = 60;
+                    send(HostToApp::PopupOpened { opener: self.id.clone(), id, url: s(target_url), w, h });
+                    return 0;
+                }
+                return 1;
+            }
             send(HostToApp::NewWindow { id: self.id.clone(), url: s(target_url), disposition: disposition.into() });
             1 // the app decides; CEF never opens its own window
         }
@@ -843,6 +1057,9 @@ wrap_dev_tools_message_observer! {
     impl DevToolsMessageObserver {
         fn on_dev_tools_method_result(&self, _browser: Option<&mut Browser>, message_id: ::std::os::raw::c_int, success: ::std::os::raw::c_int, result: Option<&[u8]>) {
             if message_id >= FIRST_EVAL_MSG {
+                if on_world_answer(_browser, &self.id, message_id, success != 0, result.unwrap_or_default()) {
+                    return;
+                }
                 // Only the browser that sent the eval may answer it.
                 let owner = EVALS.with_borrow_mut(|e| match e.get(&message_id) {
                     Some((b, _, _)) if *b == self.id => e.remove(&message_id),
@@ -850,48 +1067,11 @@ wrap_dev_tools_message_observer! {
                 });
                 if let Some((id, req, op)) = owner {
                     let (ok, value) = eval_outcome(success != 0, result.unwrap_or_default());
-                    match op {
-                        Op::Eval => send(HostToApp::EvalResult { id, req, ok, value }),
-                        Op::Styles { set, revert } => {
-                            let ok = ok && value["ok"].as_bool() == Some(true);
-                            if ok {
-                                let key = |node: String| (id.clone(), node);
-                                if let Some(node) = set {
-                                    let orig = value["orig"].as_str().map(str::to_string);
-                                    super::debug(format_args!("{id}: set {node}: page reported original {:?}", value["orig"]));
-                                    ORIGINAL_STYLE.with_borrow_mut(|m| {
-                                        m.entry(key(node)).or_insert(orig);
-                                    });
-                                }
-                                if let Some(node) = revert.as_ref() {
-                                    super::debug(format_args!("{id}: reverted {node}: attribute now {:?}", value["after"]));
-                                }
-                                if let Some(node) = revert {
-                                    ORIGINAL_STYLE.with_borrow_mut(|m| m.remove(&key(node)));
-                                }
-                            }
-                            let rows = if ok { style_rows(&value) } else { vec![] };
-                            send(HostToApp::StylesResult { id, req, ok, rows });
-                        }
-                        Op::Pick => {
-                            let ok = ok && value["ok"].as_bool() == Some(true);
-                            let text = |k: &str| if ok { value[k].as_str().unwrap_or_default().to_string() } else { String::new() };
-                            let f = |k: &str| value["rect"][k].as_f64().unwrap_or(0.0) as f32;
-                            let rect = herdr_browser_protocol::CssRect { x: f("x"), y: f("y"), w: f("w"), h: f("h") };
-                            send(HostToApp::PickInfoResult { id, req, ok, selector: text("selector"), label: text("label"), rect });
-                        }
-                        Op::Ready { generation } => {
-                            super::debug(format_args!("{id}: input path live: {value}"));
-                            super::input_live(&id, generation)
-                        }
-                        Op::Overlay { epoch } => {
-                            if !ok || value.get("error").is_some() {
-                                super::debug(format_args!("{id}: overlay {req} found nothing: {value}"));
-                            }
-                            let rects = if ok { overlay_rects(&value) } else { vec![] };
-                            send(HostToApp::OverlayRects { id, req, epoch, rects, frames: vec![] });
-                        }
+                    // The probe world went with its document: make it again for the next probe.
+                    if !ok && op != Op::Eval && value.as_str().is_some_and(|m| m.contains("context")) {
+                        world_reset(&id);
                     }
+                    finish(id, req, op, ok, value);
                 }
                 return;
             }
@@ -908,6 +1088,11 @@ wrap_dev_tools_message_observer! {
 
 pub fn devtools_observer(id: &str) -> DevToolsMessageObserver {
     DevToolsTarget::new(id.to_string())
+}
+
+/// `client` under another name, for callbacks whose parameter is called `client`.
+fn client_for(id: &str) -> Client {
+    client(id)
 }
 
 /// A client for browser `id`: every callback it gets is tagged with that id.
@@ -946,6 +1131,30 @@ mod tests {
     }
 
     #[test]
+    fn probes_wait_for_the_isolated_world_then_run_in_it() {
+        let call = |m: Vec<u8>| serde_json::from_slice::<serde_json::Value>(&m).unwrap();
+        let q = || herdr_browser_protocol::OverlayQuery::HitTest { x: 1.0, y: 1.0 };
+        // The first probe of a document asks for the main frame; the second just waits.
+        let first = call(overlay_message("w1", 1, 1, &q()).unwrap());
+        assert_eq!(first["method"], "Page.getFrameTree");
+        assert!(overlay_message("w1", 2, 1, &q()).is_none());
+        // The agent's own eval and the readiness probe stay in the page's world, at once.
+        assert!(call(eval_message("w1", 3, "1"))["params"].get("contextId").is_none());
+        assert!(call(ready_message("w1", 1))["params"].get("contextId").is_none());
+        // Once the world exists, probes carry its context and no gesture.
+        WORLDS.with_borrow_mut(|w| {
+            let w = w.get_mut("w1").unwrap();
+            (w.context, w.starting) = (Some(7), false);
+            w.waiting.clear();
+        });
+        let probe = call(overlay_message("w1", 4, 1, &q()).unwrap());
+        assert_eq!((probe["method"].as_str(), probe["params"]["contextId"].as_i64(), probe["params"]["userGesture"].as_bool()), (Some("Runtime.evaluate"), Some(7), Some(false)));
+        // A new document drops the world; the next probe makes it again.
+        world_reset("w1");
+        assert_eq!(call(overlay_message("w1", 5, 1, &q()).unwrap())["method"], "Page.getFrameTree");
+    }
+
+    #[test]
     fn eval_outcomes() {
         assert_eq!(eval_outcome(true, br#"{"result":{"type":"number","value":2,"description":"2"}}"#), (true, serde_json::json!(2)));
         assert_eq!(eval_outcome(true, br#"{"result":{"type":"undefined"}}"#), (true, serde_json::Value::Null));
@@ -970,6 +1179,6 @@ mod tests {
         let gesture = |m: Vec<u8>| serde_json::from_slice::<serde_json::Value>(&m).unwrap()["params"]["userGesture"].clone();
         assert_eq!(gesture(eval_message("b1", 1, "1")), true);
         assert_eq!(gesture(ready_message("b1", 1)), false);
-        assert_eq!(gesture(overlay_message("b1", 2, 1, &herdr_browser_protocol::OverlayQuery::HitTest { x: 1.0, y: 1.0 })), false);
+
     }
 }

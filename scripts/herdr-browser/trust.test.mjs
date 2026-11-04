@@ -7,7 +7,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import register from "./agent.mjs";
+import register, { origin } from "./agent.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -60,4 +60,10 @@ test("an MCP argument can't change the operation or smuggle other fields", async
     assert.equal(r.isError, true, name);
     assert.match(r.content[0].text, want, `${name} ${JSON.stringify(args)}`);
   }
+});
+
+test("the person's tabs are listed by origin only: no path, query, fragment or file path", () => {
+  assert.equal(origin("https://bank.example/acct/42?token=abc#frag"), "https://bank.example");
+  assert.equal(origin("file:///Users/x/secret.html"), "file:");
+  assert.equal(origin("not a url"), "");
 });

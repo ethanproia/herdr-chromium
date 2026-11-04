@@ -27,12 +27,14 @@ export function menuRow(o) {
     .when(active && enabled, (el) => el.bg(t.hover))
     .on_hover((h, cx) => { if (h && enabled && o.onHover) o.onHover(cx); })
     .on_click((e, cx) => { if (enabled && o.onClick) o.onClick(e, cx); })
+    // One step down the type scale for every menu (Ethan: menu text was one size too large): 13px names, 11px hints,
+    // icons drawn at 15px in the same 16px slot.
     .child(div().size(16).flex_none().flex().items_center().justify_center().text_color(active ? t.foreground : t.muted).child(o.icon))
-    .child(div().flex_1().min_w(0).truncate().text_size(14).child(o.name))
-    .child(div().flex_none().text_size(12).font_family(KEYFONT).text_color(t.dim).child(o.hint ?? ""));
+    .child(div().flex_1().min_w(0).truncate().text_size(13).child(o.name))
+    .child(div().flex_none().text_size(11).font_family(KEYFONT).text_color(t.dim).child(o.hint ?? ""));
 }
 
-export const toolIcon = (tool, size = 16) => (tool.icon ? svg(tool.icon).size(size) : div().size(size));
+export const toolIcon = (tool, size = 15) => (tool.icon ? svg(tool.icon).size(size) : div().size(size));
 
 // ---- copy: the clipboard only changes when the producer succeeded --------------------------------------------------
 export const tmpDir = () => `${appHome()}/data/${SELF}/tmp`;

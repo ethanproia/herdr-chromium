@@ -117,6 +117,11 @@ impl Page {
     /// A missing CEF host FAILS the test unless `HERDR_PARITY_STUB_ONLY=1` says this run is
     /// stub-only (then CEF pages return None). A missing stub host is always a skip.
     pub fn open_sized(host: Host, url: &str, w: f32, h: f32) -> Option<Page> {
+        Self::open_as(host, url, w, h, "default")
+    }
+
+    /// Open a block in `profile` ("agent": as if an agent opened it).
+    pub fn open_as(host: Host, url: &str, w: f32, h: f32, profile: &str) -> Option<Page> {
         let Some(program) = host.program() else {
             let stub_only = std::env::var("HERDR_PARITY_STUB_ONLY").is_ok_and(|v| v == "1");
             if host == Host::Cef && !stub_only {
@@ -135,7 +140,7 @@ impl Page {
         let link = HostClient::new(HostConfig { dir: dir.clone(), program, args, cdp_port: Some(0) });
         let mut cx = HeadlessAppContext::with_platform(gpui_platform::current_platform(true).text_system(), Arc::new(()), gpui_platform::current_headless_renderer);
         cx.update(gpui_base::init);
-        let block = BrowserBlock { url: url.into(), profile: "default".into(), ..Default::default() };
+        let block = BrowserBlock { url: url.into(), profile: profile.into(), ..Default::default() };
         let l = link.clone();
         let window = cx
             .open_window(size(px(w), px(h)), |window, cx| {

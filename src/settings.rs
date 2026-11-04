@@ -414,6 +414,56 @@ pub struct Person {
     /// backgrounds (sidebar, canvas); panes stay opaque. Off unless set to true.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub glass: bool,
+    /// HERDR: the bell's history, Do Not Disturb and muted sources (src/notifications.rs).
+    #[serde(skip_serializing_if = "NotificationSettings::is_default")]
+    pub notifications: NotificationSettings,
+    /// HERDR: where toasts stack: top right under the top bar (default), or bottom right.
+    #[serde(skip_serializing_if = "ToastCorner::is_top_right")]
+    pub toast_corner: ToastCorner,
+}
+
+/// HERDR: the toast deck's corner (`toast_corner`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ToastCorner {
+    #[default]
+    TopRight,
+    BottomRight,
+}
+
+impl ToastCorner {
+    fn is_top_right(&self) -> bool {
+        *self == Self::TopRight
+    }
+}
+
+/// HERDR: `notifications` in settings.json.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotificationSettings {
+    /// Keep the history on disk (off: this run only).
+    pub history: bool,
+    /// Do Not Disturb: no toasts and no sounds; the bell still counts. Errors don't break through.
+    pub dnd: bool,
+    /// Sources with no toasts, sounds or count: agents, machines, browser, updates, mods, app.
+    pub muted_sources: Vec<String>,
+}
+
+impl Default for NotificationSettings {
+    fn default() -> Self {
+        NotificationSettings { history: true, dnd: false, muted_sources: Vec::new() }
+    }
+}
+
+impl NotificationSettings {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Whether a notice from `source` may show a toast or play a sound.
+    pub fn speaks(&self, source: &str) -> bool {
+        !self.dnd && !self.muted_sources.iter().any(|m| m == source)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -503,6 +553,8 @@ impl Default for Person {
             labs_checkout: None,
             mods_disabled: Vec::new(),
             glass: false,
+            notifications: NotificationSettings::default(),
+            toast_corner: ToastCorner::TopRight,
         }
     }
 }
@@ -538,6 +590,10 @@ pub struct Settings {
     pub sounds: Sounds,
     /// HERDR: see `Person::glass`.
     pub glass: bool,
+    /// HERDR: see `Person::notifications`.
+    pub notifications: NotificationSettings,
+    /// HERDR: see `Person::toast_corner`.
+    pub toast_corner: ToastCorner,
 }
 
 /// Attention sounds: when an agent needs you, and when one finished while you
@@ -580,6 +636,8 @@ impl Default for Settings {
             search_engine: SearchEngine::Google,
             sounds: Sounds::default(),
             glass: false,
+            notifications: NotificationSettings::default(),
+            toast_corner: ToastCorner::TopRight,
         }
     }
 }
@@ -618,6 +676,8 @@ impl Settings {
             option_as_alt: person.option_as_alt,
             search_engine: person.search_engine,
             glass: person.glass,
+            notifications: person.notifications.clone(),
+            toast_corner: person.toast_corner,
         }
     }
 }
@@ -886,6 +946,15 @@ pub const DEFAULT_FONT: &str = "JetBrains Mono";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn toast_corner_is_top_right_unless_set_and_not_written_by_default() {
+        let d = Person::default();
+        assert_eq!(Settings::compose(&d, &crate::layout::Look::default(), true).toast_corner, ToastCorner::TopRight);
+        assert!(!serde_json::to_string(&d).unwrap().contains("toast_corner"));
+        let b: Person = serde_json::from_str(r#"{"toast_corner": "bottom-right"}"#).unwrap();
+        assert_eq!(Settings::compose(&b, &crate::layout::Look::default(), true).toast_corner, ToastCorner::BottomRight);
+    }
 
     #[test]
     fn glass_is_off_unless_set_and_not_written_when_off() {

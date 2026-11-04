@@ -79,6 +79,13 @@ pub struct AnnotationBatch {
     pub untrusted: Vec<String>,
 }
 
+/// A Send waiting for its screenshot: the batch, the page shot's path and the recipient.
+struct Attach {
+    batch: AnnotationBatch,
+    page: std::path::PathBuf,
+    to: Option<Recipient>,
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RegionInfo {
     pub anchor: Option<String>,
@@ -541,6 +548,9 @@ fn target(msg: &HostToApp) -> Option<&BrowserId> {
         | H::FileChooser { id, .. }
         | H::Dialog { id, .. }
         | H::Permission { id, .. }
+        | H::PopupClosed { id, .. }
+        | H::PopupBlocked { id, .. }
+        | H::PopupOpened { opener: id, .. }
         | H::ImeCaret { id, .. }
         | H::FindResult { id, .. }
         | H::Console { id, .. }
@@ -610,6 +620,17 @@ pub struct BrowserView {
     pub state: BrowserState,
     /// The host or the page died; the block shows a reload card until clicked.
     crashed: Option<String>,
+    /// Real popups this page opened (window.open), shown as cards over it; and ones the host
+    /// announced that the next render makes (a view needs the window): (id, url, w, h).
+    popups: Vec<(Entity<BrowserView>, (f32, f32))>,
+    popups_due: Vec<(BrowserId, String, f32, f32)>,
+    /// A popup the page asked for without a click (refused): its url, for "Open as tab".
+    blocked_popup: Option<String>,
+    /// This view is a popup: its opener, and whether it closed (window.close or the host).
+    opener: Option<BrowserId>,
+    popup_closed: bool,
+    /// Made by the host already (a popup): the first layout resizes it instead of creating it.
+    adopted: bool,
     /// Site permission requests waiting on the person, oldest first (req, origin, kinds); the bar
     /// shows the first. The host denies any left after 60 s, on close and when the page changes.
     prompts: std::collections::VecDeque<(u64, String, Vec<String>)>,
@@ -635,8 +656,6 @@ pub struct BrowserView {
     _events: Task<()>,
     /// S27: the recipient popover and the last addressed send.
     send_to: send_to::SendTo,
-    /// The agent the Send in flight goes to (taken by finish_attach).
-    send_target: Option<Recipient>,
     /// Re-checks the Send chip once a second while the batch is unread.
     chip_poll: Option<Task<()>>,
     _focus: [Subscription; 2],
@@ -689,7 +708,7 @@ pub struct BrowserView {
     /// Regions anchored to the document (for the attach picture), with the anchor selector if any.
     region_docs: Vec<(region::Region, Option<String>)>,
     /// Sends waiting for their screenshot: the batch and the page picture's path.
-    attaching: HashMap<u64, (AnnotationBatch, std::path::PathBuf)>,
+    attaching: HashMap<u64, Attach>,
     style_panel: Option<Entity<StylePanelView>>,
     style_results: Vec<(u64, bool, Vec<herdr_browser_protocol::StyleRow>)>,
     /// JS dialogs, the file chooser and download notices (dialogs.rs, fork-host's).
@@ -880,6 +899,12 @@ impl BrowserView {
             link,
             state,
             crashed: None,
+            popups: Vec::new(),
+            popups_due: Vec::new(),
+            blocked_popup: None,
+            opener: None,
+            popup_closed: false,
+            adopted: false,
             prompts: Default::default(),
             prompt_remember: false,
             load_error: None,
@@ -895,7 +920,6 @@ impl BrowserView {
             states,
             _events: events,
             send_to: send_to::SendTo::default(),
-            send_target: None,
             chip_poll: None,
             _focus: [on, off],
             _address: typed,
@@ -978,9 +1002,20 @@ impl BrowserView {
     }
 
     /// The layout changed the block (another url typed into the document): follow it.
+    /// The block's profile, fixed when the view was made.
+    pub fn profile(&self) -> &str {
+        &self.block.profile
+    }
+
     pub fn set_block(&mut self, mut block: BrowserBlock, cx: &mut Context<Self>) {
         // The launch url is the view's, used once: the document's copy never brings it back.
         block.launch_url = self.block.launch_url.clone();
+        // A live block's profile is fixed at creation (its cookies, its grants policy): a layout
+        // update can't move it to another profile or turn the person's block into an agent's.
+        if block.profile != self.block.profile {
+            tracing::warn!("browser {}: layout asked to change its profile; ignored (close and reopen the block instead)", self.id);
+            block.profile = self.block.profile.clone();
+        }
         if block == self.block {
             return;
         }
@@ -1171,6 +1206,17 @@ impl BrowserView {
                 })
                 .detach();
             }
+            // The host minted `id`; only this page's own popups, and never an id already in use.
+            H::PopupOpened { opener, id, url, w, h } if opener == self.id => {
+                if self.states.lock().unwrap().contains_key(&id) || self.popups_due.iter().any(|(p, ..)| *p == id) {
+                    // Never Close it: that id is a live block's.
+                    tracing::warn!("browser {}: popup id {id} is already in use; ignored", self.id);
+                } else {
+                    self.popups_due.push((id, url, w.unwrap_or(500.0), h.unwrap_or(600.0)));
+                }
+            }
+            H::PopupBlocked { url, .. } => self.blocked_popup = Some(url),
+            H::PopupClosed { .. } if self.opener.is_some() => self.popup_closed = true,
             H::Error { message, .. } => tracing::warn!("browser {}: {message}", self.id),
             _ => return,
         }
@@ -1184,6 +1230,9 @@ impl BrowserView {
             return;
         }
         match self.sized {
+            None if self.adopted => {
+                self.link.send(AppToHost::Resize { id: self.id.clone(), size, scale });
+            }
             None => {
                 // A launch url (with a one-time token) is used once and never kept.
                 let url = self.block.launch_url.take().or_else(|| Some(self.block.url.clone())).filter(|u| !u.is_empty());
@@ -1220,6 +1269,127 @@ impl BrowserView {
     pub fn set_prompt_remember(&mut self, on: bool, cx: &mut Context<Self>) {
         self.prompt_remember = on && self.block.profile == super::agent::PERSON_PROFILE;
         cx.notify();
+    }
+
+    /// Makes the popups the host announced (needs the window) and drops closed ones.
+    fn sync_popups(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.popups.retain(|(p, _)| !p.read(cx).popup_closed);
+        for (id, url, w, h) in std::mem::take(&mut self.popups_due) {
+            // Same profile as its opener (CEF made it in the opener's context).
+            let block = BrowserBlock { url: url.clone(), profile: self.block.profile.clone(), ..Default::default() };
+            let (link, states, opener) = (self.link.clone(), self.states.clone(), self.id.clone());
+            let agent = self.agent.clone();
+            let popup = cx.new(|cx| {
+                let mut v = BrowserView::new(&id, block, link, states, window, cx);
+                v.opener = Some(opener.clone());
+                v.adopted = true;
+                v.state.url = url;
+                v.state.opener = Some(opener);
+                v.agent = agent;
+                v.states.lock().unwrap().insert(id.clone(), v.state.clone());
+                v
+            });
+            cx.observe(&popup, |_, _, cx| cx.notify()).detach();
+            let f = popup.read(cx).focus.clone();
+            window.focus(&f, cx);
+            self.popups.push((popup, (w, h)));
+        }
+    }
+
+    /// The ids of this page's open popups.
+    pub fn popup_ids(&self, cx: &App) -> Vec<BrowserId> {
+        self.popups.iter().map(|(p, _)| p.read(cx).id.clone()).collect()
+    }
+
+    /// This page's open popup views.
+    pub fn popup_views(&self) -> Vec<Entity<BrowserView>> {
+        self.popups.iter().map(|(p, _)| p.clone()).collect()
+    }
+
+    /// The url of a popup the page asked for without a click (refused), while its chip shows.
+    pub fn blocked_popup(&self) -> Option<&str> {
+        self.blocked_popup.as_deref()
+    }
+
+    /// The page size the host was last told (None: not laid out yet).
+    pub fn page_size(&self) -> Option<Dips> {
+        self.sized.map(|(s, _)| s)
+    }
+
+    /// This view's opener when it is a popup.
+    pub fn opener(&self) -> Option<&str> {
+        self.opener.as_deref()
+    }
+
+    /// A popup's own bar: where it is NOW (its current top-level origin, never the url it opened
+    /// with: the anti-phishing line) and a close button.
+    fn popup_bar(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id("popup-bar")
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap_2()
+            .h(px(28.))
+            .px_2()
+            .text_xs()
+            .bg(rgb(0x2b2b2b))
+            .text_color(rgb(0xf0f0f0))
+            .child(div().flex_1().overflow_hidden().whitespace_nowrap().child(popup_origin(&self.state.url)))
+            .child(div().id("popup-close").px_1().cursor_pointer().child("×").on_click(cx.listener(|v, _, _, cx| {
+                v.link.send(AppToHost::Close { id: v.id.clone() });
+                v.popup_closed = true;
+                cx.notify();
+            })))
+            .into_any_element()
+    }
+
+    /// The opener's cards for its popups, centred over the page, and the blocked-popup chip.
+    fn popup_layer(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let mut out: Vec<AnyElement> = self
+            .popups
+            .iter()
+            .map(|(p, (w, h))| {
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(hsla(0., 0., 0., 0.25))
+                    .child(div().w(px(*w)).h(px(*h + 28.)).max_w_full().max_h_full().rounded_md().overflow_hidden().border_1().border_color(rgb(0x555555)).child(p.clone()))
+                    .into_any_element()
+            })
+            .collect();
+        if let Some(url) = self.blocked_popup.clone() {
+            out.push(
+                div()
+                    .id("popup-blocked")
+                    .absolute()
+                    .top(px(6.))
+                    .right(px(8.))
+                    .flex()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .text_xs()
+                    .bg(rgb(0x2b2b2b))
+                    .text_color(rgb(0xf0f0f0))
+                    .child("Pop-up blocked")
+                    .child(div().id("popup-open").cursor_pointer().underline().child("Open as tab").on_click(cx.listener(move |v, _, _, cx| {
+                        v.blocked_popup = None;
+                        cx.emit(BrowserEvent::NewWindow(url.clone()));
+                        cx.notify();
+                    })))
+                    .child(div().id("popup-dismiss").cursor_pointer().child("×").on_click(cx.listener(|v, _, _, cx| {
+                        v.blocked_popup = None;
+                        cx.notify();
+                    })))
+                    .into_any_element(),
+            );
+        }
+        out
     }
 
     /// The person answers the first waiting permission request (agents have no way to).
@@ -1764,6 +1934,12 @@ impl BrowserView {
     /// into it, crops it to the newest region, and emits the batch with the picture. A failed
     /// screenshot still sends the batch, without a picture.
     pub fn send_annotations(&mut self, cx: &mut Context<Self>) {
+        self.send_annotations_to(None, cx);
+    }
+
+    /// Send bound to one request: the recipient (None: the legacy pull path), the batch and the
+    /// page it was taken from travel with the screenshot request, so two sends never mix.
+    fn send_annotations_to(&mut self, to: Option<Recipient>, cx: &mut Context<Self>) {
         let annotations = self.annotations.send();
         if annotations.is_empty() {
             cx.notify();
@@ -1799,26 +1975,42 @@ impl BrowserView {
             scale: 1.0,
             untrusted: ["url", "title", "annotations.target.label", "annotations.target.selector", "annotations.target.rect", "region.anchor", "css_was"].iter().map(|s| s.to_string()).collect(),
         };
-        self.attaching.insert(req, (batch, page.clone()));
+        self.attaching.insert(req, Attach { batch, page: page.clone(), to });
         self.link.send(AppToHost::Screenshot { id: self.id.clone(), req, path: page.to_string_lossy().into_owned() });
         cx.notify();
     }
 
     /// The host wrote the page screenshot for a Send: finish the picture and emit the batch.
     fn finish_attach(&mut self, req: u64, ok: bool, cx: &mut Context<Self>) {
-        let Some((mut batch, page)) = self.attaching.remove(&req) else { return };
+        let Some(Attach { mut batch, page, to }) = self.attaching.remove(&req) else { return };
         let width = self.geometry().size.x.max(1.0);
-        let made = ok
-            .then(|| image::open(&page).ok())
-            .flatten()
-            .map(|img| {
+        // The picture must show what was sent: the same document, and the region if there is one.
+        let mut picture_note = None;
+        let made = if !ok {
+            picture_note = Some("the screenshot failed".to_owned());
+            None
+        } else if self.state.url != batch.url {
+            picture_note = Some("the page changed before the picture was taken".to_owned());
+            None
+        } else {
+            image::open(&page).ok().and_then(|img| {
                 let img = img.to_rgba8();
                 let scale = img.width() as f32 / width;
                 let burned = self.markup.read(cx).burn(&img, scale);
                 let rect = batch.region.as_ref().filter(|r| !r.detached).map(|r| region::Rect { x: r.rect.0, y: r.rect.1, w: r.rect.2, h: r.rect.3 });
-                let pic = rect.and_then(|r| region::crop(&burned, r, scale)).unwrap_or(burned);
-                (pic, scale)
-            });
+                match rect {
+                    // A region that cannot be cut is left out, never widened to the whole viewport.
+                    Some(r) => match region::crop(&burned, r, scale) {
+                        Some(pic) => Some((pic, scale)),
+                        None => {
+                            picture_note = Some("the region was off screen".to_owned());
+                            None
+                        }
+                    },
+                    None => Some((burned, scale)),
+                }
+            })
+        };
         let _ = std::fs::remove_file(&page);
         if let Some((pic, scale)) = made {
             let out = page.with_file_name(format!("{}-{}.png", self.id, batch.id));
@@ -1827,12 +2019,19 @@ impl BrowserView {
                 batch.scale = scale;
             }
         }
-        if let Some(to) = self.send_target.take() {
-            let r = send_to::deliver(&self.link.config().dir, &batch, &to, now_ms()).map(|_| (to, batch.id));
-            self.send_to.delivered(r, now_ms());
-            self.poll_chip(cx);
+        match to {
+            // Addressed: that agent's inbox only, never the global pull path.
+            Some(to) => {
+                let r = send_to::deliver(&self.link.config().dir, &batch, &to, now_ms()).map(|_| (to, batch.id));
+                if r.is_err() {
+                    let ns: Vec<u32> = batch.annotations.iter().map(|a| a.n).collect();
+                    self.annotations.restore(&ns);
+                }
+                self.send_to.delivered(r, now_ms(), picture_note);
+                self.poll_chip(cx);
+            }
+            None => cx.emit(BrowserEvent::Annotations(batch)),
         }
-        cx.emit(BrowserEvent::Annotations(batch));
         cx.notify();
     }
 
@@ -1845,8 +2044,7 @@ impl BrowserView {
     /// S27: the person picked `terminal` in the popover (the consent): Send goes to its inbox.
     pub fn choose_recipient(&mut self, terminal: &str, cx: &mut Context<Self>) {
         if let Some(to) = self.send_to.choose(terminal) {
-            self.send_target = Some(to);
-            self.send_annotations(cx);
+            self.send_annotations_to(Some(to), cx);
         }
         cx.notify();
     }
@@ -2017,7 +2215,7 @@ impl BrowserView {
         let state = design_bar::StripState { owner, tool: self.markup.read(cx).tool, styles_on: self.styles_on_pick, comment_on: self.comment_on_pick, count };
         let strip = design_bar::strip(&state, FIND_HEIGHT, cx, |v, a, _, cx| v.design_action(a, cx))?;
         // S27: the Send chip beside the badge, and the recipient list under it.
-        let chip = self.send_to.chip(&send_to_root(&self.link.config().dir), now_ms()).map(|c| c.text());
+        let chip = self.send_to.chip_line(&send_to_root(&self.link.config().dir), now_ms());
         let popover = send_to::popover(&self.send_to, count, cx, |v, choice, _, cx| {
             match choice {
                 Some(t) => v.choose_recipient(&t, cx),
@@ -2404,6 +2602,7 @@ impl Drop for BrowserView {
 
 impl Render for BrowserView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_popups(window, cx);
         if self.address_stale && !self.address.read(cx).focus_handle(cx).is_focused(window) {
             self.address_stale = false;
             let url = self.state.url.clone();
@@ -2610,10 +2809,10 @@ impl Render for BrowserView {
                     a.select_all(window, cx);
                 });
             }))
-            .child(self.chrome(cx))
-            .children(self.find_bar(cx))
-            .children(strip)
+            .relative()
+            .map(|d| if self.opener.is_some() { d.child(self.popup_bar(cx)) } else { d.child(self.chrome(cx)).children(self.find_bar(cx)).children(strip) })
             .child(page)
+            .children(self.popup_layer(cx))
     }
 }
 
@@ -2647,8 +2846,14 @@ fn bind_keys(cx: &mut App) {
 /// and event, so a revoked grant or a closed block takes effect at once.
 pub fn broker_authorizer(agent: Arc<Mutex<Agent>>, states: Arc<Mutex<HashMap<BrowserId, BrowserState>>>) -> super::broker::Authorize {
     Arc::new(move |block: &str, method: &str| {
-        let profile = states.lock().unwrap().get(block).map(|s| s.profile.clone());
-        agent.lock().unwrap().broker_allowed(&block.to_string(), method, profile.as_deref())
+        // A popup answers to its opener's grants and profile.
+        let (grants_of, profile) = {
+            let st = states.lock().unwrap();
+            let owner = st.get(block).and_then(|s| s.opener.clone()).unwrap_or_else(|| block.to_string());
+            let profile = st.get(&owner).filter(|_| st.contains_key(block)).map(|s| s.profile.clone());
+            (owner, profile)
+        };
+        agent.lock().unwrap().broker_allowed(&grants_of, method, profile.as_deref())
     })
 }
 
@@ -2688,6 +2893,7 @@ impl Browsers {
         if self.link.is_none() {
             let link = HostClient::new(HostConfig::from_env());
             let agent = Arc::new(Mutex::new(Agent::new(link.config().dir.clone())));
+            agent.lock().unwrap().states = Some(self.states.clone());
             let a = agent.clone();
             link.set_tap(Arc::new(move |msg| a.lock().unwrap().on_host(msg)));
             // HERDR: part 5. CDP on the app's pipe: agents reach it only through the broker (agent.sock + token).
@@ -2706,9 +2912,11 @@ impl Browsers {
     /// For tests: browsers over a given link (its agent is made here too).
     pub fn with_link(link: Arc<HostClient>) -> Self {
         let agent = Arc::new(Mutex::new(Agent::new(link.config().dir.clone())));
+        let states: Arc<Mutex<HashMap<BrowserId, BrowserState>>> = Default::default();
+        agent.lock().unwrap().states = Some(states.clone());
         let a = agent.clone();
         link.set_tap(Arc::new(move |msg| a.lock().unwrap().on_host(msg)));
-        Self { link: Some(link), agent: Some(agent), ..Default::default() }
+        Self { link: Some(link), agent: Some(agent), states, ..Default::default() }
     }
 
     /// `herdr-app do browser.<name>`: answered through `reply` (now, or when the host answers).
@@ -2725,6 +2933,20 @@ impl Browsers {
         }
         let focus = Focus { focused: self.focused.clone().filter(|f| self.views.contains_key(f)), block_of_pane };
         agent.lock().unwrap().run(name, args, self, &focus, reply)
+    }
+
+    /// HERDR: P2-18. Picks that waited past `PERSON_WAIT` are answered "timed out"; the blocks left with
+    /// nobody waiting come back so the window can end their pick mode.
+    pub fn expire_picks(&self) -> Vec<BrowserId> {
+        self.agent.as_ref().map(|a| a.lock().unwrap().expire_waiters(std::time::Instant::now())).unwrap_or_default()
+    }
+
+    /// HERDR: P2-18. Ends pick mode on a block whose pick timed out (a comment the person is writing stays).
+    pub fn end_pick(&self, id: &str, cx: &mut App) {
+        if let Some((view, _)) = self.views.get(id) {
+            let input = view.read(cx).input().clone();
+            input.update(cx, |i, _| i.end_pick());
+        }
     }
 
     // HERDR: browser block (part 5). The person picked an element: the agent captures it for `browser.pick`.
@@ -2826,6 +3048,21 @@ pub fn load_error_words(kind: &str, url: &str) -> (String, String) {
 /// The S27 inbox under the browser dir.
 fn send_to_root(dir: &Path) -> PathBuf {
     super::inbox::root(dir)
+}
+
+/// A popup's bar text: its scheme and host only (plain, capped), from the url it shows now.
+pub fn popup_origin(url: &str) -> String {
+    let clean: String = url.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+    let origin = match clean.split_once("://") {
+        Some((scheme, rest)) => {
+            let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+            // Userinfo is not where the page is: `https://google.com@evil.test` shows evil.test.
+            let host = host.rsplit_once('@').map_or(host, |(_, h)| h);
+            format!("{scheme}://{host}")
+        }
+        None => clean,
+    };
+    capped(&origin, 80)
 }
 
 /// At most `n` characters, with an ellipsis when cut.

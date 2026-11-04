@@ -5,6 +5,7 @@ import { v_flex } from "gpui-base";
 import { theme, spaces, panes, knownAgents, run, openOverlay, closeOverlay, props, window } from "herdr";
 import { icon, groupLabel, menuRow, toolIcon, openInTab, openRegistry, keepSelection, registryNotice } from "../look.js";
 import { toolsFor } from "../registry.js";
+import { openInSide } from "./side-strip.js";
 import { scroller } from "../scroll.js";
 
 export default class Plus {
@@ -30,10 +31,15 @@ export default class Plus {
     const folder = panes().find((p) => p.focused)?.cwd;
     const installed = this.agents.filter((a) => a.installed);
     const choices = [...installed, ...this.agents.filter((a) => !a.installed).slice(0, 2)];
-    const ic = (path) => svg(path).size(16);
-    const tools = toolsFor(this.reg.tools, "tab").map((tool) =>
-      [`tool-${tool.id}`, toolIcon(tool), tool.name, () => openInTab(tool, space?.id), tool.shortcut ? `${mod}${tool.shortcut.toUpperCase()}` : "", true]);
-    const agents = choices.map((a, i) => [`agent-${a.key}`, a.tint ? svg(a.icon).size(16).text_color(t.foreground) : image(a.icon).size(16), a.name,
+    const ic = (path) => svg(path).size(15);
+    // Tools that open as a tab, then side-panel tools (Files, Changes), which open in the side panel.
+    const tabTools = toolsFor(this.reg.tools, "tab");
+    const sideOnly = toolsFor(this.reg.tools, "side").filter((x) => !tabTools.includes(x));
+    const tools = [
+      ...tabTools.map((tool) => [`tool-${tool.id}`, toolIcon(tool), tool.name, () => openInTab(tool, space?.id), tool.shortcut ? `${mod}${tool.shortcut.toUpperCase()}` : "", true]),
+      ...sideOnly.map((tool) => [`tool-${tool.id}`, toolIcon(tool), tool.name, () => openInSide(tool.id, "temporary"), "", true]),
+    ];
+    const agents = choices.map((a, i) => [`agent-${a.key}`, a.tint ? svg(a.icon).size(15).text_color(t.foreground) : image(a.icon).size(15), a.name,
       () => run("tab.new", { name: a.name, space: space?.id, argv: a.run }), a.installed ? (i < 9 ? `${mod}${i + 1}` : "") : "not installed", a.installed]);
     const work = [
       ["space", ic(icon("plus")), "New Space", () => run("space.new"), `${mod}N`, true],

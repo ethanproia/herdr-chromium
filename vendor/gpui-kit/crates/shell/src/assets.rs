@@ -81,6 +81,19 @@ impl AppAssets {
         let dir = Dir::open_ambient_dir(&self.root, ambient_authority()).ok()?;
         Some((dir, resolved))
     }
+
+    /// HERDR: for a host that must hand a player a real path (`video`): the file `image` would read
+    /// for `path`, checked the same way (inside the root, no `..`, opened through the root's handle so
+    /// a link out is refused), as an absolute path. Errors say why, like a missing asset does.
+    pub fn checked_path(&self, path: &str) -> anyhow::Result<PathBuf> {
+        let Some((dir, resolved)) = self.resolve(path) else {
+            anyhow::bail!("`{path}` is outside the application directory");
+        };
+        let meta = dir.open(&resolved).and_then(|f| f.metadata()).map_err(|e| anyhow::anyhow!("`{path}`: {e}"))?;
+        anyhow::ensure!(meta.is_file(), "`{path}` is not a file");
+        anyhow::ensure!(!dir.symlink_metadata(&resolved)?.is_symlink(), "`{path}` is a link");
+        Ok(self.root.join(resolved))
+    }
 }
 
 impl AssetSource for AppAssets {

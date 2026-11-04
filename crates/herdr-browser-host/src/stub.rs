@@ -37,6 +37,8 @@ struct Browser<S> {
 pub(crate) struct StubHost<A: SurfaceAlloc> {
     alloc: A,
     browsers: HashMap<BrowserId, Browser<A::Surface>>,
+    /// Popups: popup id -> opener id.
+    popups: HashMap<BrowserId, BrowserId>,
 }
 
 fn pixels(size: Size, scale: f32) -> PixelSize {
@@ -45,7 +47,7 @@ fn pixels(size: Size, scale: f32) -> PixelSize {
 
 impl<A: SurfaceAlloc> StubHost<A> {
     pub(crate) fn new(alloc: A) -> Self {
-        Self { alloc, browsers: HashMap::new() }
+        Self { alloc, browsers: HashMap::new(), popups: HashMap::new() }
     }
 
     /// Serve one connection. Returns true after `Shutdown`.
@@ -99,6 +101,13 @@ impl<A: SurfaceAlloc> StubHost<A> {
                 if self.browsers.remove(&id).is_none() {
                     out.push(unknown(&id));
                 }
+                // An opener takes its popups; a popup closed by the app is gone too.
+                let gone: Vec<BrowserId> = self.popups.iter().filter(|(p, o)| **o == id || **p == id).map(|(p, _)| p.clone()).collect();
+                for p in gone {
+                    self.popups.remove(&p);
+                    self.browsers.remove(&p);
+                    out.push(HostToApp::PopupClosed { id: p });
+                }
             }
             M::Shutdown => {}
             // No pages to recolour: say so, so tests see the message was handled, not dropped.
@@ -143,6 +152,27 @@ impl<A: SurfaceAlloc> StubHost<A> {
                     static REQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                     let req = REQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                     out.push(HostToApp::Permission { id: id.clone(), req, origin, kinds: kinds.split(',').map(str::to_owned).collect() });
+                }
+                // `?popup=<url>` opens a real popup (as after a click), `?popup_blocked=<url>` one
+                // without a click; a popup that loads `?close=1` closes itself (window.close).
+                let param = |k: &str| url_now.split_once(&format!("{k}=")).map(|(_, v)| v.split(['&', '#']).next().unwrap_or("").to_string());
+                if let Some(target) = param("popup_blocked") {
+                    out.push(HostToApp::PopupBlocked { id: id.clone(), url: target });
+                } else if let Some(target) = param("popup") {
+                    static POP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    let pid = format!("{id}-pop{}", POP.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1);
+                    let scale = self.browsers.get(&id).map_or(1.0, |b| b.scale);
+                    let size = Size { w: 480.0, h: 560.0 };
+                    let b = Browser { px: pixels(size, scale), scale, seq: 0, in_flight: None, pending: false, history: vec![target.clone()], pos: 0 };
+                    self.browsers.insert(pid.clone(), b);
+                    self.popups.insert(pid.clone(), id.clone());
+                    out.push(HostToApp::PopupOpened { opener: id.clone(), id: pid.clone(), url: target, w: Some(480.0), h: Some(560.0) });
+                    self.loaded(&pid, out);
+                    self.frame(&pid, out);
+                }
+                if param("close").as_deref() == Some("1") && self.popups.remove(&id).is_some() {
+                    self.browsers.remove(&id);
+                    out.push(HostToApp::PopupClosed { id: id.clone() });
                 }
             }
             M::Back { .. } | M::Forward { .. } => {

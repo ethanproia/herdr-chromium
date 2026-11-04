@@ -105,6 +105,52 @@ export default class extends View {
     assert_eq!(*paths.borrow(), vec![json!(["/var/tmp/screenshot.png", "/var/tmp/a file.jpg"])]);
 }
 
+// HERDR: a mod's drop target can light up while files are dragged over it (the board's empty state).
+#[gpui::test]
+fn external_file_drags_enter_and_leave_mod_elements(cx: &mut TestAppContext) {
+    use gpui::{ExternalPaths, FileDropEvent, InputEvent};
+    cx.update(gpui_shell::init);
+    let fixture = Fixture::new(r#"
+import { View, div } from "gpui-kit";
+import { note } from "fixture";
+export default class extends View {
+  render() {
+    return div().w(100).h(100)
+      .on_drag_enter((event, cx) => note(`enter ${event.count}`))
+      .on_drag_leave((event, cx) => note("leave"))
+      .on_drop((event, cx) => note(`drop ${event.paths.length}`));
+  }
+}"#);
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let calls = seen.clone();
+    gpui_shell::policy::set_default(Policy::new().with_host_module(
+        HostModule::new("fixture").function("note", move |a| {
+            calls.borrow_mut().push(from_host(a.value(0)?).as_str().unwrap_or_default().to_owned());
+            Ok(HostValue::Null)
+        })
+    ).unwrap());
+    let runtime = ShellRuntime::new_isolated().unwrap();
+    let window = cx.add_window(|window, cx| Mounted(runtime.try_load(&fixture.0, window, cx).unwrap()));
+    let mut visual = VisualTestContext::from_window(*window.deref(), cx);
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    visual.run_until_parked();
+    let (inside, outside) = (gpui::point(gpui::px(20.), gpui::px(20.)), gpui::point(gpui::px(300.), gpui::px(300.)));
+    let drag = |visual: &mut VisualTestContext, e: FileDropEvent| {
+        visual.update(|window, cx| {
+            window.dispatch_event(e.to_platform_input(), cx);
+            window.draw(cx).clear(cx);
+        });
+        visual.run_until_parked();
+    };
+    let files = ExternalPaths([PathBuf::from("/var/tmp/a.png"), PathBuf::from("/var/tmp/b.png")].into_iter().collect());
+    drag(&mut visual, FileDropEvent::Entered { position: inside, paths: files });
+    drag(&mut visual, FileDropEvent::Pending { position: gpui::point(gpui::px(30.), gpui::px(30.)) });
+    drag(&mut visual, FileDropEvent::Pending { position: outside });
+    drag(&mut visual, FileDropEvent::Pending { position: inside });
+    drag(&mut visual, FileDropEvent::Submit { position: inside });
+    assert_eq!(*seen.borrow(), ["enter 2", "leave", "enter 2", "drop 2", "leave"], "one enter per entry, a leave on exit and after the drop");
+}
+
 #[gpui::test]
 fn mod_run_rejects_unknown_arguments_before_queueing_a_command(cx: &mut TestAppContext) {
     cx.update(gpui_shell::init);
@@ -136,6 +182,46 @@ export default class extends View {
     assert_eq!(seen.len(), 2);
     assert!(seen[0].contains("space.close: unknown argument(s): space; valid arguments: id, confirmed"), "{}", seen[0]);
     assert!(seen[1].contains("terminal.kill: unknown argument(s): id; valid arguments: terminal"), "{}", seen[1]);
+}
+
+// HERDR: the bell panel feature-detects these on stock Herdr with a namespace import; a mod
+// without `"permissions": { "notifications": "all" }` sees only its own items and can't mute.
+#[gpui::test]
+fn notifications_are_namespace_exports_and_a_plain_mod_sees_only_its_own(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    crate::mods::publish_notifications(json!({
+        "unread": 2,
+        "items": [
+            { "id": "n_2", "source": "mods", "from": "test", "title": "mine", "read": false },
+            { "id": "n_1", "source": "agents", "from": "Claude Code", "title": "t7 needs you", "read": false },
+        ],
+        "settings": { "dnd": false, "muted_sources": [] },
+    }));
+    let fixture = Fixture::new(r#"
+import { View, div } from "gpui-kit";
+import * as herdr from "herdr";
+import { note } from "fixture";
+export default class extends View {
+  init() {
+    note(["notifications", "markRead", "clearNotifications", "setNotificationMute", "notify"].map((f) => typeof herdr[f]).join(","));
+    const n = herdr.notifications();
+    note(`${n.unread} ${n.items.map((i) => i.title).join("|")} ${n.settings === undefined}`);
+    try { herdr.setNotificationMute({ dnd: true }); note("muted"); } catch (e) { note("refused"); }
+  }
+  render() { return div(); }
+}"#);
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let calls = seen.clone();
+    gpui_shell::policy::set_default(Policy::new()
+        .with_host_module(module(Instance { name: "test".into(), props: Value::Null }, 0)).unwrap()
+        .with_host_module(HostModule::new("fixture").function("note", move |a| {
+            calls.borrow_mut().push(a.string(0)?.to_owned());
+            Ok(HostValue::Null)
+        })).unwrap());
+    let runtime = ShellRuntime::new_isolated().unwrap();
+    let window = cx.add_window(|_, _| Empty);
+    let _root = window.update(cx, |_, window, cx| runtime.try_load(&fixture.0, window, cx).unwrap()).unwrap();
+    assert_eq!(*seen.borrow(), ["function,function,function,function,function", "1 mine true", "refused"]);
 }
 
 #[gpui::test]

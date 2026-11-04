@@ -98,6 +98,8 @@ pub(crate) mod theme_tokens;
 mod typings;
 pub(crate) mod value;
 pub mod view;
+// HERDR: the `video` element's spec and the host's renderer for it.
+pub mod video;
 pub(crate) mod watch;
 
 pub use anyhow;

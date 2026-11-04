@@ -13,6 +13,8 @@ mod layout;
 mod layout_sync;
 mod links;
 mod model;
+// HERDR: the notification history behind the bell.
+mod notifications;
 mod mirror;
 mod mirror_sync;
 mod place;
@@ -37,6 +39,7 @@ mod frame_stats;
 mod terminal;
 mod update;
 mod update_notes;
+mod video;
 mod vt;
 mod win32_keys;
 mod window;
@@ -152,6 +155,7 @@ fn main() {
     telemetry::start(settings::telemetry_setting(&person));
     bench::start();
     frame_stats::start(); // HERDR: off unless HERDR_APP_FRAME_STATS=1 or 2
+    video::install(); // HERDR: mods' video(path) element
     if let Err(e) = mods::write_workspace() {
         eprintln!("herdr-app: cannot write {}: {e}", mods::app_dir().display());
     }
