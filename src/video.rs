@@ -136,7 +136,9 @@ impl<B: Backend> Clips<B> {
         if clip.player.is_some() {
             return Ok(());
         }
-        let (spec, at) = (clip.spec.clone(), clip.time);
+        // Played again after the end: from the start.
+        let at = if clip.duration.is_some_and(|d| clip.time >= d - 0.05) { 0.0 } else { clip.time };
+        let spec = clip.spec.clone();
         let path = self.path(&spec)?;
         // The cap: the clip playing longest makes room.
         while self.clips.values().filter(|c| c.player.is_some()).count() >= MAX_PLAYING {

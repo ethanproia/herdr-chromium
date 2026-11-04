@@ -174,6 +174,20 @@ fn paths_follow_the_image_rule() {
 }
 
 #[test]
+fn play_after_the_end_starts_over() {
+    let (_d, _fake, mut c) = setup();
+    let now = Instant::now();
+    c.painted("v", &spec(0), true, now);
+    c.play("v", now).unwrap();
+    c.seek("v", 10.0).unwrap();
+    c.clips.get_mut("v").unwrap().player.as_mut().unwrap().ended = true;
+    c.painted("v", &spec(0), true, now);
+    assert!(drain(&mut c, "v").contains(&"ended".into()));
+    c.play("v", now).unwrap();
+    assert_eq!(c.clips["v"].player.as_ref().unwrap().time, 0.0, "from the start, not the end");
+}
+
+#[test]
 fn the_controls_bar_maps_time_and_clicks() {
     assert_eq!((clock(0.0), clock(3.4), clock(75.0), clock(3725.0)), ("0:00".into(), "0:03".into(), "1:15".into(), "1:02:05".into()));
     assert_eq!((fraction(2.5, 10.0), fraction(12.0, 10.0), fraction(1.0, 0.0)), (0.25, 1.0, 0.0));
