@@ -105,6 +105,52 @@ export default class extends View {
     assert_eq!(*paths.borrow(), vec![json!(["/var/tmp/screenshot.png", "/var/tmp/a file.jpg"])]);
 }
 
+// HERDR: a mod's drop target can light up while files are dragged over it (the board's empty state).
+#[gpui::test]
+fn external_file_drags_enter_and_leave_mod_elements(cx: &mut TestAppContext) {
+    use gpui::{ExternalPaths, FileDropEvent, InputEvent};
+    cx.update(gpui_shell::init);
+    let fixture = Fixture::new(r#"
+import { View, div } from "gpui-kit";
+import { note } from "fixture";
+export default class extends View {
+  render() {
+    return div().w(100).h(100)
+      .on_drag_enter((event, cx) => note(`enter ${event.count}`))
+      .on_drag_leave((event, cx) => note("leave"))
+      .on_drop((event, cx) => note(`drop ${event.paths.length}`));
+  }
+}"#);
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let calls = seen.clone();
+    gpui_shell::policy::set_default(Policy::new().with_host_module(
+        HostModule::new("fixture").function("note", move |a| {
+            calls.borrow_mut().push(from_host(a.value(0)?).as_str().unwrap_or_default().to_owned());
+            Ok(HostValue::Null)
+        })
+    ).unwrap());
+    let runtime = ShellRuntime::new_isolated().unwrap();
+    let window = cx.add_window(|window, cx| Mounted(runtime.try_load(&fixture.0, window, cx).unwrap()));
+    let mut visual = VisualTestContext::from_window(*window.deref(), cx);
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    visual.run_until_parked();
+    let (inside, outside) = (gpui::point(gpui::px(20.), gpui::px(20.)), gpui::point(gpui::px(300.), gpui::px(300.)));
+    let drag = |visual: &mut VisualTestContext, e: FileDropEvent| {
+        visual.update(|window, cx| {
+            window.dispatch_event(e.to_platform_input(), cx);
+            window.draw(cx).clear(cx);
+        });
+        visual.run_until_parked();
+    };
+    let files = ExternalPaths([PathBuf::from("/var/tmp/a.png"), PathBuf::from("/var/tmp/b.png")].into_iter().collect());
+    drag(&mut visual, FileDropEvent::Entered { position: inside, paths: files });
+    drag(&mut visual, FileDropEvent::Pending { position: gpui::point(gpui::px(30.), gpui::px(30.)) });
+    drag(&mut visual, FileDropEvent::Pending { position: outside });
+    drag(&mut visual, FileDropEvent::Pending { position: inside });
+    drag(&mut visual, FileDropEvent::Submit { position: inside });
+    assert_eq!(*seen.borrow(), ["enter 2", "leave", "enter 2", "drop 2", "leave"], "one enter per entry, a leave on exit and after the drop");
+}
+
 #[gpui::test]
 fn mod_run_rejects_unknown_arguments_before_queueing_a_command(cx: &mut TestAppContext) {
     cx.update(gpui_shell::init);

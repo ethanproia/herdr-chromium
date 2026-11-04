@@ -915,7 +915,11 @@ Chained builders with GPUI's snake_case names: `div()`, `h_flex()`,
 `.hover((s) => s.bg(c))`, `.on_scroll_wheel(...)`; keyboard: `this.h = cx.focus_handle()`
 in init, `.track_focus(this.h).on_key_down((e, cx) => …)`, `this.h.focus()`.
 `.on_drop((event, cx) => …)` on a plain layout element receives external files as
-`event.paths` (absolute paths). The feedback form accepts dropped images with
+`event.paths` (absolute paths). Beside it, `.on_drag_enter((event, cx) => …)`
+(`event.count` files, `event.x`/`event.y` in the window) and
+`.on_drag_leave((event, cx) => …)` let a drop target light up while files
+are dragged over it; leave also comes when the drag ends or is dropped.
+The feedback form accepts dropped images with
 the same limits, previews and removal as picked images.
 `.on_hover((hovered, cx) => …)` reports pointer entry and exit on buttons
 and other interactive controls too.
