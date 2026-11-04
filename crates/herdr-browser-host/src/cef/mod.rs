@@ -1029,6 +1029,7 @@ fn handle(m: AppToHost) {
         | M::Input { .. }
         | M::Edit { .. }
         | M::SetVisible { .. }
+        | M::SetDevice { .. }
         | M::Find { .. }
         | M::StopFind { .. }
         | M::DevTools { .. }
@@ -1072,7 +1073,7 @@ fn browser_msg(m: AppToHost) {
     let id = match &m {
         M::Navigate { id, .. } | M::Back { id } | M::Forward { id } | M::Reload { id, .. } | M::Stop { id } | M::Resize { id, .. }
         | M::Focus { id, .. } | M::SetZoom { id, .. } | M::Input { id, .. } | M::Edit { id, .. } | M::Find { id, .. } | M::StopFind { id, .. }
-        | M::DevTools { id, .. } | M::Eval { id, .. } | M::Overlay { id, .. } | M::PickInfo { id, .. } | M::PickRelative { id, .. } | M::TextEdit { id, .. } | M::Styles { id, .. } | M::SetStyle { id, .. } | M::RevertStyle { id, .. } | M::SetVisible { id, .. } => id.clone(),
+        | M::DevTools { id, .. } | M::Eval { id, .. } | M::Overlay { id, .. } | M::PickInfo { id, .. } | M::PickRelative { id, .. } | M::TextEdit { id, .. } | M::Styles { id, .. } | M::SetStyle { id, .. } | M::RevertStyle { id, .. } | M::SetVisible { id, .. } | M::SetDevice { id, .. } => id.clone(),
         _ => {
             debug(format_args!("not a browser message, dropped"));
             return;
@@ -1121,6 +1122,13 @@ fn browser_msg(m: AppToHost) {
             host.was_resized();
         }
         M::Focus { focused, .. } => host.set_focus(focused as i32),
+        // Mobile UA, touch from the mouse and a coarse pointer, through the page's own DevTools
+        // channel (never the agents' broker); off clears every override back to the desktop.
+        M::SetDevice { device, .. } => {
+            for call in handlers::device_messages(device.as_ref()) {
+                host.send_dev_tools_message(Some(&call));
+            }
+        }
         M::SetVisible { visible, .. } => {
             let changed = with_host(|h| {
                 h.browsers.get_mut(&id).filter(|e| e.hidden == visible).map(|e| {

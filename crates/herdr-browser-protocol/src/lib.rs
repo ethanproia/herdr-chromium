@@ -182,6 +182,14 @@ pub enum OverlayQuery {
     Selection,
 }
 
+/// What a device mode changes besides size and scale (`AppToHost::SetDevice`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Device {
+    pub mobile: bool,
+    pub touch: bool,
+    pub user_agent: Option<String>,
+}
+
 /// App to host.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -241,6 +249,9 @@ pub enum AppToHost {
     /// (`true`). Hidden: the host stops painting and drops pending frames; shown: it sends a fresh
     /// full frame. `Screenshot` still works while hidden.
     SetVisible { id: BrowserId, visible: bool },
+    /// Device mode for a block: mobile user agent, touch from the mouse, coarse pointer; None turns it off.
+    /// (Its size and scale come with the usual Resize.)
+    SetDevice { id: BrowserId, device: Option<Device> },
     /// The chosen command for menu `req`, or None if dismissed. The host runs it via CEF's
     /// RunContextMenuCallback (Back, Forward, Reload, Copy, Cut, Paste, Select All, Inspect ...).
     MenuResult { id: BrowserId, req: u64, command: Option<i32> },
@@ -378,6 +389,8 @@ mod tests {
         let mods = Modifiers { platform: true, ..Default::default() };
         roundtrip_app(AppToHost::Hello { version: PROTOCOL_VERSION, profile_dir: "/tmp/p".into(), cdp_port: Some(9222), cdp_pipe: true });
         roundtrip_app(AppToHost::Create { id: "b1".into(), url: Some("https://example.com".into()), size: Size { w: 800.0, h: 600.0 }, scale: 2.0, profile: None });
+        roundtrip_app(AppToHost::SetDevice { id: "b1".into(), device: Some(Device { mobile: true, touch: true, user_agent: Some("Mozilla/5.0 (iPhone)".into()) }) });
+        roundtrip_app(AppToHost::SetDevice { id: "b1".into(), device: None });
         roundtrip_app(AppToHost::PermissionResult { id: "b1".into(), req: 3, allow: false });
         roundtrip_app(AppToHost::Resize { id: "b1".into(), size: Size { w: 400.0, h: 300.0 }, scale: 2.0 });
         roundtrip_app(AppToHost::FrameAck { id: "b1".into(), seq: 7 });
