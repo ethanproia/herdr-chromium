@@ -40,7 +40,7 @@ pub enum StripAction {
 
 /// Whether design mode is on (the strip shows).
 pub fn design_on(owner: Owner) -> bool {
-    matches!(owner, Owner::Pick | Owner::Markup | Owner::Comment)
+    matches!(owner, Owner::Pick | Owner::Markup | Owner::Comment | Owner::TextEdit)
 }
 
 /// The controls the strip shows, in order, for a state (ids double as test handles).
