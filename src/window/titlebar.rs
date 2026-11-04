@@ -226,6 +226,8 @@ impl AppWindow {
                 window.remove_window();
             }
             "window.minimize" => window.minimize_window(),
+            // HERDR: the standard macOS full screen (green button, View > Enter Full Screen).
+            "window.fullscreen" => window.toggle_fullscreen(),
             #[cfg(windows)]
             "window.maximize" => win::toggle_maximize(window),
             #[cfg(not(windows))]
