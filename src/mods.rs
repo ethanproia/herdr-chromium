@@ -415,6 +415,9 @@ pub enum Request {
     OpenOverlay { id: String, spec: Value },
     CloseOverlay { id: String },
     Refresh,
+    /// HERDR: a mod's notification call (`post`, `read`, `clear`, `mute`). `owner`: the mod's
+    /// folder when it lacks `"permissions": { "notifications": "all" }` (its own items only).
+    Notes { op: &'static str, arg: Value, folder: String, owner: Option<String> },
     /// From `herdr-app do` / `herdr-app status` (control.rs); answer on `reply`.
     Control { cmd: Value, reply: std::sync::mpsc::Sender<Value> },
 }
@@ -593,12 +596,14 @@ pub struct Snapshot {
     pub floats: Value,
     /// { platform, titlebar, buttons, maximized, fullscreen, active }.
     pub window: Value,
+    /// HERDR: the bell's history, `{ unread, items, settings }` (src/notifications.rs `view`).
+    pub notifications: Value,
 }
 
 impl Default for Snapshot {
     /// Lists start empty, never null, so mods can map over them right away.
     fn default() -> Self {
-        Snapshot { layout: Value::Null, spaces: json!([]), machines: json!([]), agents: json!([]), panes: json!([]), terminals: json!([]), focused: Value::Null, floats: json!({}), window: Value::Null }
+        Snapshot { layout: Value::Null, spaces: json!([]), machines: json!([]), agents: json!([]), panes: json!([]), terminals: json!([]), focused: Value::Null, floats: json!({}), window: Value::Null, notifications: json!({ "unread": 0, "items": [], "settings": null }) }
     }
 }
 
@@ -646,6 +651,9 @@ pub fn publish_floats(v: Value) -> bool {
 }
 pub fn publish_window(v: Value) -> bool {
     publish("window", |s| (std::mem::replace(&mut s.window, v.clone()), v))
+}
+pub fn publish_notifications(v: Value) -> bool {
+    publish("notifications", |s| (std::mem::replace(&mut s.notifications, v.clone()), v))
 }
 pub fn publish_focused(v: Value) -> bool {
     publish("focused", |s| (std::mem::replace(&mut s.focused, v.clone()), v))
@@ -903,6 +911,18 @@ fn exec_future(command: String, args: Vec<String>, cwd: Option<String>, on: Opti
     }
 }
 
+/// HERDR: `"permissions": { "notifications": "all" }` in the mod's own mod.json.
+fn notes_all(name: &str) -> bool {
+    let dir = match name.strip_prefix("frame-") {
+        Some(f) => frame_dir().join(f),
+        None => mods_dir().join(name),
+    };
+    std::fs::read_to_string(dir.join("mod.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .is_some_and(|m| m["permissions"]["notifications"] == "all")
+}
+
 fn module(inst: Instance, copy: u64) -> HostModule {
     let reads = Rc::new(RefCell::new(LiveReads::default()));
     LIVE_READS.with_borrow_mut(|copies| {
@@ -913,6 +933,9 @@ fn module(inst: Instance, copy: u64) -> HostModule {
     let feedback_frame = inst.name == "frame-feedback";
     let feedback_from = inst.props.get("from").and_then(Value::as_str).unwrap_or("person").to_owned();
     let feedback_layout = inst.props.get("layout").and_then(Value::as_str).unwrap_or("other").to_owned();
+    // HERDR: only a mod whose mod.json says `"permissions": { "notifications": "all" }` (the bell
+    // panel) sees and changes every notification; any other sees only its own.
+    let note_owner = (!notes_all(&inst.name)).then(|| inst.name.clone());
     let (cmd_tx, commands) = async_channel::unbounded::<String>();
     COMMANDS.with(|c| c.borrow_mut().push((copy, inst.name.clone(), cmd_tx)));
     HostModule::new("herdr")
@@ -1084,11 +1107,49 @@ fn module(inst: Instance, copy: u64) -> HostModule {
             request(Request::CloseOverlay { id: a.string(0)?.to_owned() });
             Ok(HostValue::Null)
         })
-        .function("notify", |a| {
-            let id = new_overlay_id();
-            let n = from_host(a.value(0)?);
-            request(Request::OpenOverlay { id: id.clone(), spec: json!({ "kind": "toast", "notification": n }) });
-            Ok(id.into())
+        // HERDR: notify posts through the bell's history (the window decides on the toast);
+        // a mod always posts as source "mods", from its own folder.
+        .function("notify", {
+            let folder = inst.name.clone();
+            move |a| {
+                let id = new_overlay_id();
+                let mut n = from_host(a.value(0)?);
+                n["toast_id"] = json!(id);
+                request(Request::Notes { op: "post", arg: n, folder: folder.clone(), owner: None });
+                Ok(id.into())
+            }
+        })
+        .function("notifications", {
+            let reads = reads.clone();
+            let owner = note_owner.clone();
+            move |_| {
+                REVISIONS.with_borrow(|r| reads.borrow_mut().record("notifications", r));
+                Ok(SNAPSHOT.with(|s| to_host(&crate::notifications::scope(&s.borrow().notifications, owner.as_deref()))))
+            }
+        })
+        .function("markRead", {
+            let (folder, owner) = (inst.name.clone(), note_owner.clone());
+            move |a| {
+                request(Request::Notes { op: "read", arg: from_host(a.value(0)?), folder: folder.clone(), owner: owner.clone() });
+                Ok(HostValue::Null)
+            }
+        })
+        .function("clearNotifications", {
+            let (folder, owner) = (inst.name.clone(), note_owner.clone());
+            move |a| {
+                request(Request::Notes { op: "clear", arg: from_host(a.value(0)?), folder: folder.clone(), owner: owner.clone() });
+                Ok(HostValue::Null)
+            }
+        })
+        .function("setNotificationMute", {
+            let (folder, owner) = (inst.name.clone(), note_owner.clone());
+            move |a| {
+                if owner.is_some() {
+                    return Err(HostError::new("setNotificationMute needs \"permissions\": { \"notifications\": \"all\" } in mod.json"));
+                }
+                request(Request::Notes { op: "mute", arg: from_host(a.value(0)?), folder: folder.clone(), owner: None });
+                Ok(HostValue::Null)
+            }
         })
         .function("placement", {
             let float = props.get("float").and_then(Value::as_str).map(str::to_owned);

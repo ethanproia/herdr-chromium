@@ -13,6 +13,8 @@ mod layout;
 mod layout_sync;
 mod links;
 mod model;
+// HERDR: the notification history behind the bell.
+mod notifications;
 mod mirror;
 mod mirror_sync;
 mod place;

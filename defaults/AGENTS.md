@@ -596,7 +596,7 @@ The main ones:
   `browser.find {text?, forward?, match_case?, next?}`, `browser.devtools {open?}`, `browser.close`, `browser.pick` (the person clicks an element; you get its selector, HTML, box, styles and a cropped picture), `browser.annotations {wait?}` (what the person sent you from the page: comments, markup, a picture), `browser.lock {agent?, on?}` (hold the page while you drive it; unlock when done), `browser.remote {machine?}` (the person's + menu only: a remote desktop page with raw chords), `browser.new` (the person's own browser from the + menu and cmd-shift-b; you use browser.open). On a browser the person opened, every command but `browser.pick` (their click) and `browser.annotations` needs their Control grant, which only they turn on in the block's shield (🛡 in its bar); screenshots of a page they marked sensitive need Capture too. `browser.open` never takes their profile ("default"): ask them to open one. For page work
   (snapshot, click, type, fill) use `scripts/herdr-browser` (CLI and MCP, Cursor's `browser_*` tool names)
   on the CDP port in `browser/cdp.json`.
-- App: `mod.clone {name, as?}` (duplicate; default `<name>-copy`), `mod.open {name}` (again: closes it), `overlay.close {id?}`, `app.help`, `app.palette` (again: closes it), `app.settings {section?}`
+- App: `mod.clone {name, as?}` (duplicate; default `<name>-copy`), `mod.open {name}` (again: closes it), `overlay.close {id?}`, `app.help`, `app.palette` (again: closes it), `app.settings {section?}`, `notifications.read_all`, `notifications.clear_all`, `notifications.toggle_dnd` (the bell: mark everything read, delete the history, Do Not Disturb)
   (sections: `look`, `machines`, `alerts`, `updates`, `privacy`; Machines lists, updates, renames and removes ssh machines; settings edit the same files you do).
   `app.check_updates` (only a successful check reports Up to date; a failed check clears the checked time and can be retried), `app.update_core` (a newer herdr-core of this generation, terminals kept;
   never one a package manager owns), `app.welcome`, `app.whats_new`, `app.feedback {message?, from?}` (from `"person"` or `"agent"`; opens a review window, where the person can paste up to 3 screenshots; never sends until the person clicks Send), `app.reset`,
@@ -705,6 +705,13 @@ What's about the user, never a look:
   background; this is a threshold, not a guaranteed resulting ratio.
   Box/block, Powerline and sprite glyph colors are never adjusted.
   Changes apply immediately, including text already on screen.
+- `notifications`: `{ "history": true, "dnd": false, "muted_sources": [] }`.
+  Every notice is also kept in the bell's history (`data/notifications/`,
+  private to you; 200 items, 30 days) unless `history` is `false`. `dnd`
+  (Do Not Disturb) stops toasts and sounds, errors included; the history
+  and the bell's count go on. `muted_sources` does the same for some of
+  `agents`, `machines`, `browser`, `updates`, `mods`, `app`, and leaves
+  them out of the count.
 - `toast_corner`: where notices stack, `"top-right"` (default) or
   `"bottom-right"`. Top right starts below the layout's top bar (and the
   side panel's strip while it is open), so toasts never cover those controls.
@@ -960,7 +967,13 @@ All of it is in `herdr.d.ts`. In short:
   returns an id; the mod gets `props().overlay` and closes itself with
   `closeOverlay(id)`; Esc closes the top dialog or popup. `frame: "none"`
   drops Herdr's border, corners and shadow so the mod draws its own.
-  `notify({ title, body, level, icon, timeout })` posts a notification, drawn by the `toast` mod.
+  `notify({ title, body, level, icon, timeout, action, key, keep, private })` posts a notification,
+  drawn by the `toast` mod and kept in the bell's history (`key`: a repeat bumps one item;
+  `keep: false` or `private: true`: toast only). `notifications()` reads the history
+  (re-renders on change); `markRead(id | "all" | {source})` and
+  `clearNotifications(...)` change it. A mod sees and changes only its own items unless its
+  mod.json has `"permissions": { "notifications": "all" }` (the bell panel), which also gets
+  `settings` and `setNotificationMute({ dnd?, source?, muted? })`.
 - Windows (`kind: "window"`): stay open until closed, over the layout and
   under dialogs; a press the mod doesn't stop drags it (stop it on your
   controls, like a title bar's buttons), it stays where dropped, and the one
