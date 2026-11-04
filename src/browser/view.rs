@@ -1292,6 +1292,9 @@ impl BrowserView {
         }
         self.device = mode;
         self.device_menu = false;
+        let off = self.device.is_some();
+        self.input.update(cx, |i, _| i.set_annotate_off(off));
+        self.drain_overlay(cx);
         self.link.send(AppToHost::SetDevice { id: self.id.clone(), device: self.device.as_ref().map(|d| d.device()) });
         if let Some((size, scale)) = self.measured {
             self.laid_out(size, scale);
@@ -2619,7 +2622,12 @@ impl BrowserView {
             .child(div().flex_1().min_w_0().overflow_hidden().child(Input::new(&self.address)))
             .when(self.state.loading, |d| d.child("loading"))
             // A1: one Design button; the strip under the bar holds every design control.
-            .child(button("Design", true).on_click(cx.listener(|v, _, _, cx| v.toggle_mode(Owner::Pick, cx))))
+            .child(if self.device.is_some() {
+                // Pick and markup overlays assume an unscaled page: off while a device is previewed.
+                button("Design", false).tooltip(|_, cx| cx.new(|_| Hint("Turn off device mode to annotate")).into())
+            } else {
+                button("Design", true).on_click(cx.listener(|v, _, _, cx| v.toggle_mode(Owner::Pick, cx)))
+            })
             // The zoom label shows only off 100 %; a click resets it.
             .when(self.zoom_level.abs() > 1e-6, |d| {
                 d.child(div().id("zoom-label").px_1().rounded_sm().cursor_pointer().bg(hsla(0., 0., 0.5, 0.15)).child(zoom::percent(self.zoom_level)).on_click(cx.listener(|v, _, _, cx| v.set_zoom(0.0, cx))))
@@ -2969,6 +2977,15 @@ pub fn broker_authorizer(agent: Arc<Mutex<Agent>>, states: Arc<Mutex<HashMap<Bro
         };
         agent.lock().unwrap().broker_allowed(&grants_of, method, profile.as_deref())
     })
+}
+
+/// A small tooltip.
+struct Hint(&'static str);
+
+impl Render for Hint {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().px_2().py_1().rounded_sm().text_xs().bg(rgb(0x1f1f1f)).text_color(rgb(0xf2f2f2)).child(self.0)
+    }
 }
 
 /// Set while `herdr-app shot` renders the window: blocks marked sensitive draw a cover instead of the page.

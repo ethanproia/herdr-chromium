@@ -142,6 +142,8 @@ pub struct BrowserInput {
     origin: Point<Pixels>,
     /// Responsive mode: the page is drawn at this fraction of its size (pointer positions are divided by it).
     fit: f32,
+    /// Responsive mode is on: pick, markup and comments stay off (their overlays assume an unscaled page).
+    annotate_off: bool,
     focused: bool,
     caps_lock: bool,
     /// Keys sent down and not yet up, by DOM code, so blur can release them.
@@ -163,7 +165,7 @@ pub struct BrowserInput {
 
 impl BrowserInput {
     pub fn new(id: BrowserId, link: Arc<dyn HostLink>) -> Self {
-        Self { id, link, raw_chords: false, origin: Point::default(), fit: 1.0, focused: false, caps_lock: false, held_keys: Vec::new(), held_buttons: Vec::new(), last_pos: (0.0, 0.0), marked: None, caret: None, owners: vec![Owner::Browse], lease: None, space_held: false, comment: CommentField::default(), overlay: Vec::new() }
+        Self { id, link, raw_chords: false, origin: Point::default(), fit: 1.0, annotate_off: false, focused: false, caps_lock: false, held_keys: Vec::new(), held_buttons: Vec::new(), last_pos: (0.0, 0.0), marked: None, caret: None, owners: vec![Owner::Browse], lease: None, space_held: false, comment: CommentField::default(), overlay: Vec::new() }
     }
 
     /// HERDR: raw chords for this block (a remote-desktop page): Cmd+A/Z go to the page as keys.
@@ -177,6 +179,14 @@ impl BrowserInput {
 
     fn local(&self, p: Point<Pixels>) -> (f32, f32) {
         (f32::from(p.x - self.origin.x) / self.fit, f32::from(p.y - self.origin.y) / self.fit)
+    }
+
+    /// Responsive mode on or off: on closes pick, markup and comments and keeps them closed.
+    pub fn set_annotate_off(&mut self, off: bool) {
+        self.annotate_off = off;
+        if off {
+            while matches!(self.owner(), Owner::Pick | Owner::Markup | Owner::Comment | Owner::TextEdit) && self.escape() {}
+        }
     }
 
     /// Responsive mode: the page is drawn scaled by `fit` (1 when off).
@@ -229,6 +239,9 @@ impl BrowserInput {
     /// Opens a mode on top of the current one. Allowed: Browse -> Pick or Markup; Pick or
     /// Markup -> Comment; Pick <-> Markup. Refused while an agent holds the lease.
     pub fn enter(&mut self, owner: Owner) -> bool {
+        if self.annotate_off && owner != Owner::Browse && owner != Owner::Agent {
+            return false;
+        }
         let from = self.owner();
         let ok = match (from, owner) {
             (Owner::Agent, _) => {
@@ -1089,6 +1102,18 @@ mod tests {
     fn with<R>(cx: &mut gpui::VisualTestContext, block: &Entity<Block>, f: impl FnOnce(&mut BrowserInput) -> R) -> R {
         let input = block.read_with(cx, |b, _| b.input.clone());
         cx.update(|_, cx| input.update(cx, |i, _| f(i)))
+    }
+
+    #[test]
+    fn device_mode_keeps_annotation_modes_off() {
+        let mut i = BrowserInput::new("b1".into(), Arc::new(Recording::default()));
+        assert!(i.enter(Owner::Pick));
+        i.set_annotate_off(true);
+        assert_eq!(i.owner(), Owner::Browse, "turning a device on closes pick");
+        assert!(!i.enter(Owner::Pick) && !i.enter(Owner::Markup) && !i.toggle(Owner::Pick));
+        assert_eq!(i.owner(), Owner::Browse);
+        i.set_annotate_off(false);
+        assert!(i.enter(Owner::Markup), "off again: annotating works");
     }
 
     #[test]
