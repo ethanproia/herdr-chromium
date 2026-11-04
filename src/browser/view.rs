@@ -194,6 +194,8 @@ struct Open {
     profile: Option<String>,
     size: Dips,
     scale: f32,
+    /// Responsive mode's UA and touch, replayed after a host restart with the page.
+    device: Option<protocol::Device>,
 }
 
 type Subscriber = async_channel::Sender<HostToApp>;
@@ -286,7 +288,7 @@ impl HostLink for HostClient {
             let mut s = self.shared.lock().unwrap();
             match &msg {
                 AppToHost::Create { id, url, size, scale, profile } => {
-                    s.open.insert(id.clone(), Open { url: url.clone(), profile: profile.clone(), size: *size, scale: *scale });
+                    s.open.insert(id.clone(), Open { url: url.clone(), profile: profile.clone(), size: *size, scale: *scale, device: None });
                 }
                 AppToHost::Resize { id, size, scale } => {
                     if let Some(o) = s.open.get_mut(id) {
@@ -300,6 +302,11 @@ impl HostLink for HostClient {
                 }
                 AppToHost::Close { id } => {
                     s.open.remove(id);
+                }
+                AppToHost::SetDevice { id, device } => {
+                    if let Some(o) = s.open.get_mut(id) {
+                        o.device = device.clone();
+                    }
                 }
                 _ => {}
             }
@@ -352,7 +359,10 @@ impl Writer {
                         open.sort_by(|a, b| a.0.cmp(&b.0));
                         self.replayed = open.iter().map(|(id, _)| id.clone()).collect();
                         for (id, o) in open {
-                            self.write(&AppToHost::Create { id, url: o.url, size: o.size, scale: o.scale, profile: o.profile });
+                            self.write(&AppToHost::Create { id: id.clone(), url: o.url, size: o.size, scale: o.scale, profile: o.profile });
+                            if o.device.is_some() {
+                                self.write(&AppToHost::SetDevice { id, device: o.device });
+                            }
                         }
                     }
                     Err(e) => {
@@ -1294,6 +1304,11 @@ impl BrowserView {
     /// Responsive mode on (a device) or off: the page is resized to the device (or back to the
     /// block) and told the device's UA and touch (or that every override is gone).
     pub fn set_device(&mut self, mode: Option<super::devices::Mode>, cx: &mut Context<Self>) {
+        // Any choice closes the menu, even one that changes nothing.
+        if self.device_menu {
+            self.device_menu = false;
+            cx.notify();
+        }
         if mode == self.device {
             return;
         }
@@ -1314,12 +1329,24 @@ impl BrowserView {
         self.device.as_ref()
     }
 
+    /// Whether the device menu is open.
+    pub fn device_menu_open(&self) -> bool {
+        self.device_menu
+    }
+
+    /// The 📱 button: opens or closes the device menu.
+    pub fn toggle_device_menu(&mut self, cx: &mut Context<Self>) {
+        self.device_menu = !self.device_menu;
+        cx.notify();
+    }
+
     fn device_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         if !self.device_menu {
             return None;
         }
         let item = |id: &'static str, label: String| div().id(id).px_2().py_1().rounded_sm().cursor_pointer().hover(|s| s.bg(hsla(0., 0., 1., 0.1))).child(label);
-        let mut menu = div().id("device-menu").absolute().top(px(2.)).right(px(8.)).flex().flex_col().p_1().rounded_md().text_xs().bg(rgb(0x1f1f1f)).text_color(rgb(0xf2f2f2));
+        // Occluded: a click on the menu never falls through to the page under it.
+        let mut menu = div().id("device-menu").absolute().top(px(2.)).right(px(8.)).occlude().flex().flex_col().p_1().rounded_md().text_xs().bg(rgb(0x1f1f1f)).text_color(rgb(0xf2f2f2));
         menu = menu.child(item("device-off", "Responsive off".into()).on_click(cx.listener(|v, _, _, cx| v.set_device(None, cx))));
         for (i, p) in super::devices::PRESETS.iter().enumerate() {
             let name = p.name;
@@ -3056,7 +3083,7 @@ pub fn device_mode(a: &serde_json::Value) -> Result<Option<super::devices::Mode>
     }
     let num = |k: &str| a.get(k).and_then(serde_json::Value::as_f64).map(|v| v as f32);
     match (num("w"), num("h")) {
-        (Some(w), Some(h)) => Ok(Some(super::devices::Mode::custom(w, h, num("scale")))),
+        (Some(w), Some(h)) => super::devices::Mode::custom(w, h, num("scale")).map(Some),
         _ => Err("browser.device needs name, or w and h, or off: true".into()),
     }
 }
@@ -3538,6 +3565,10 @@ mod tests {
         recv(&a, |m| matches!(m, HostToApp::Url { url, .. } if url == "https://example.com"));
         let frame = recv(&a, |m| matches!(m, HostToApp::Frame { .. }));
         assert!(matches!(frame, HostToApp::Frame { size: PixelSize { w: 800, h: 600 }, .. }), "{frame:?}");
+        // Responsive mode on: after a restart the new host hears it again with the page.
+        let device = protocol::Device { mobile: true, touch: true, user_agent: Some("UA-phone".into()) };
+        link.send(AppToHost::SetDevice { id: "a".into(), device: Some(device) });
+        recv(&a, |m| matches!(m, HostToApp::Console { message, .. } if message == "device mobile=true touch=true ua=true"));
         // Kill the host: the view hears a crash, the next send starts a new one and makes the page again.
         let pid = String::from_utf8(Command::new("pgrep").args(["-f", &format!("{}", socket_of(&dir).display())]).output().unwrap().stdout).unwrap();
         let pid = pid.lines().next().expect("stub host running").trim().to_owned();
@@ -3545,6 +3576,7 @@ mod tests {
         recv(&a, |m| matches!(m, HostToApp::Crashed { .. }));
         link.send(AppToHost::Reload { id: "a".into(), ignore_cache: false });
         recv(&a, |m| matches!(m, HostToApp::Url { url, .. } if url == "https://example.com"));
+        recv(&a, |m| matches!(m, HostToApp::Console { message, .. } if message == "device mobile=true touch=true ua=true"));
         drop(link);
         std::thread::sleep(Duration::from_millis(700));
         let left = Command::new("pgrep").args(["-f", &format!("{}", socket_of(&dir).display())]).output().unwrap();

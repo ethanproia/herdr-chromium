@@ -188,7 +188,8 @@ impl BrowserInput {
     pub fn set_annotate_off(&mut self, off: bool) {
         self.annotate_off = off;
         if off {
-            while matches!(self.owner(), Owner::Pick | Owner::Markup | Owner::Comment | Owner::TextEdit) && self.escape() {}
+            // The whole stack, not just its top: under an agent's lease a pick can sit below.
+            self.close_annotation();
         }
     }
 
@@ -281,6 +282,19 @@ impl BrowserInput {
             }
             (Owner::Comment | Owner::TextEdit, _) => false,
             _ => self.enter(mode),
+        }
+    }
+
+    /// Closes every annotation layer (pick, markup, comment, text edit) wherever it sits in the
+    /// stack; browse and an agent's lease stay.
+    pub fn close_annotation(&mut self) {
+        let before = self.owners.len();
+        self.owners.retain(|o| !matches!(o, Owner::Pick | Owner::Markup | Owner::Comment | Owner::TextEdit));
+        if self.owners.is_empty() {
+            self.owners.push(Owner::Browse);
+        }
+        if self.owners.len() != before {
+            self.overlay.push(OverlayEvent::Owner(self.owner()));
         }
     }
 
@@ -1121,6 +1135,14 @@ mod tests {
         assert_eq!(i.owner(), Owner::Browse);
         i.set_annotate_off(false);
         assert!(i.enter(Owner::Markup), "off again: annotating works");
+        // Under an agent's lease: the pick below it is stripped, the lease stays on top.
+        let mut j = BrowserInput::new("b1".into(), Arc::new(Recording::default()));
+        assert!(j.enter(Owner::Pick));
+        j.grant_lease("agent-7");
+        j.set_annotate_off(true);
+        assert_eq!(j.owner(), Owner::Agent);
+        j.end_lease();
+        assert_eq!(j.owner(), Owner::Browse, "no pick left under the lease");
     }
 
     #[test]
