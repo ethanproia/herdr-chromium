@@ -202,6 +202,15 @@ fn the_controls_bar_maps_time_and_clicks() {
     assert_eq!(c.status("v"), Some((true, 1.0, Some(10.0))), "what the bar shows while playing");
 }
 
+#[test]
+fn a_scrub_belongs_to_one_clip_until_the_release() {
+    assert!(!scrubbing("a"));
+    start_scrub("a");
+    assert!(scrubbing("a") && !scrubbing("b"), "only the clip under the press");
+    end_scrub();
+    assert!(!scrubbing("a"));
+}
+
 /// A throwaway directory, removed on drop.
 mod tempfile_dir {
     pub struct Dir(pub std::path::PathBuf);

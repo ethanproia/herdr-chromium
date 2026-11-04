@@ -339,13 +339,15 @@ fn controls(id: &str) -> AnyElement {
     use gpui::{MouseButton, Pixels, hsla, px, relative};
     let Some((playing, time, duration)) = with_clips(|c| c.status(id)) else { return div().into_any_element() };
     let track = std::rc::Rc::new(std::cell::Cell::new(gpui::Bounds::<Pixels>::default()));
-    let (toggle, down, drag) = (id.to_owned(), id.to_owned(), id.to_owned());
-    let seek_at = move |id: &str, x: Pixels, bounds: gpui::Bounds<Pixels>| {
+    let (toggle, down) = (id.to_owned(), id.to_owned());
+    let seek_at = std::rc::Rc::new(move |id: &str, x: Pixels, bounds: gpui::Bounds<Pixels>| {
         if let Some(d) = duration {
             let _ = with_clips(|c| c.seek(id, fraction_at(f32::from(x), f32::from(bounds.origin.x), f32::from(bounds.size.width)) * d));
         }
-    };
+    });
+    let (seek_down, seek_drag) = (seek_at.clone(), seek_at);
     let (track_down, track_drag, track_probe) = (track.clone(), track.clone(), track);
+    let scrub_id = id.to_owned();
     let white = hsla(0.0, 0.0, 1.0, 1.0);
     div()
         .absolute()
@@ -385,21 +387,62 @@ fn controls(id: &str) -> AnyElement {
                         div().absolute().left_0().top_0().bottom_0().rounded(px(2.0)).bg(white).w(relative(duration.map_or(0.0, |d| fraction(time, d)))),
                     ),
                 )
-                .child(canvas(move |bounds, _, _| track_probe.set(bounds), |_, _, _, _| {}).absolute().size_full())
+                .child(
+                    canvas(
+                        move |bounds, _, _| track_probe.set(bounds),
+                        // While this clip is being scrubbed, the whole window's moves and the release
+                        // are the bar's: caught in the capture phase, so the mod under it never sees them.
+                        move |_, _, window, _| {
+                            if !scrubbing(&scrub_id) {
+                                return;
+                            }
+                            let (id, seek, track) = (scrub_id.clone(), seek_drag.clone(), track_drag.clone());
+                            window.on_mouse_event(move |e: &gpui::MouseMoveEvent, phase, window, cx| {
+                                if phase == gpui::DispatchPhase::Capture && scrubbing(&id) {
+                                    cx.stop_propagation();
+                                    seek(&id, e.position.x, track.get());
+                                    window.refresh();
+                                }
+                            });
+                            let id = scrub_id.clone();
+                            window.on_mouse_event(move |_: &gpui::MouseUpEvent, phase, window, cx| {
+                                if phase == gpui::DispatchPhase::Capture && scrubbing(&id) {
+                                    cx.stop_propagation();
+                                    end_scrub();
+                                    window.refresh();
+                                }
+                            });
+                        },
+                    )
+                    .absolute()
+                    .size_full(),
+                )
                 .on_mouse_down(MouseButton::Left, move |e, window, cx| {
                     cx.stop_propagation();
-                    seek_at(&down, e.position.x, track_down.get());
+                    start_scrub(&down);
+                    seek_down(&down, e.position.x, track_down.get());
                     window.refresh();
-                })
-                .on_mouse_move(move |e, window, _| {
-                    if e.pressed_button == Some(MouseButton::Left) && track_drag.get().contains(&e.position) {
-                        seek_at(&drag, e.position.x, track_drag.get());
-                        window.refresh();
-                    }
                 }),
         )
         .child(format!("{} / {}", clock(time), duration.map_or("--:--".into(), clock)))
         .into_any_element()
+}
+
+thread_local! {
+    /// The clip whose track the mouse is dragging (mouse down on it, not yet up).
+    static SCRUB: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+fn start_scrub(id: &str) {
+    SCRUB.with_borrow_mut(|s| *s = Some(id.to_owned()));
+}
+
+fn end_scrub() {
+    SCRUB.with_borrow_mut(|s| *s = None);
+}
+
+fn scrubbing(id: &str) -> bool {
+    SCRUB.with_borrow(|s| s.as_deref() == Some(id))
 }
 
 /// How far along `time` is, 0..1.
