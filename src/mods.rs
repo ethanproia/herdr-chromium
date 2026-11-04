@@ -852,11 +852,6 @@ pub fn run_here(command: &str, args: &[String]) -> Option<String> {
     run_blocking(command, args, None).ok().map(|(_, out, _)| out)
 }
 
-/// A program's output on another machine, if it ran.
-pub fn run_on(machine: &str, command: &str, args: &[String]) -> Option<String> {
-    run_remote(machine, command, args, None).ok().map(|(_, out, _)| String::from_utf8_lossy(&out).into_owned())
-}
-
 /// The agents a machine can start (`knownAgents()`), asked at most once a minute.
 fn known_agents(on: Option<String>, list: Vec<Value>) -> Value {
     type InstalledCache = std::collections::HashMap<Option<String>, (std::time::Instant, Vec<String>, Vec<String>)>;
@@ -891,7 +886,7 @@ fn read_remote(machine: &str, path: &str) -> Result<Option<String>, String> {
         return Ok(None);
     }
     if out.len() as u64 > crate::mod_files::LIMIT {
-        return Err("Text file exceeds 1 MiB".into());
+        return Err(format!("Text file exceeds {} MiB", crate::mod_files::LIMIT >> 20));
     }
     Ok(Some(String::from_utf8_lossy(&out).into_owned()))
 }
@@ -1045,8 +1040,15 @@ fn module(inst: Instance, copy: u64) -> HostModule {
             crate::sound::play(a.string(0)?);
             Ok(HostValue::Null)
         })
-        .function("run", |a| {
+        .function("run", {
+            // HERDR: the bell's global commands (read all, clear all, DND) are the person's, or the
+            // bell panel's (`"permissions": { "notifications": "all" }`), never any other mod's.
+            let notes_all = note_owner.is_none();
+            move |a| {
             let name = a.string(0)?.to_owned();
+            if name.starts_with("notifications.") && !notes_all {
+                return Err(HostError::new(format!("{name} needs \"permissions\": {{ \"notifications\": \"all\" }} in mod.json")));
+            }
             let args = a.get(1).map(from_host).unwrap_or(Value::Null);
             if let Some(command) = crate::commands::find(&name) {
                 crate::commands::validate_args(command, &args).map_err(HostError::new)?;
@@ -1060,6 +1062,7 @@ fn module(inst: Instance, copy: u64) -> HostModule {
                 request(Request::Run { name, args });
             }
             Ok(HostValue::Null)
+            }
         })
         .function("spaces", reader(reads.clone(), "spaces", |s| &s.spaces))
         .function("machines", reader(reads.clone(), "machines", |s| &s.machines))
@@ -1115,7 +1118,9 @@ fn module(inst: Instance, copy: u64) -> HostModule {
             move |a| {
                 let id = new_overlay_id();
                 let mut n = from_host(a.value(0)?);
-                n["toast_id"] = json!(id);
+                // HERDR: an object or nothing (indexing a string or list would panic).
+                let Some(fields) = n.as_object_mut() else { return Err(HostError::new("notify needs an object: { title, body, ... }")) };
+                fields.insert("toast_id".into(), json!(id));
                 request(Request::Notes { op: "post", arg: n, folder: folder.clone(), owner: None });
                 Ok(id.into())
             }

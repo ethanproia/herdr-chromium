@@ -194,6 +194,8 @@ struct Open {
     profile: Option<String>,
     size: Dips,
     scale: f32,
+    /// Responsive mode's UA and touch, replayed after a host restart with the page.
+    device: Option<protocol::Device>,
 }
 
 type Subscriber = async_channel::Sender<HostToApp>;
@@ -286,7 +288,7 @@ impl HostLink for HostClient {
             let mut s = self.shared.lock().unwrap();
             match &msg {
                 AppToHost::Create { id, url, size, scale, profile } => {
-                    s.open.insert(id.clone(), Open { url: url.clone(), profile: profile.clone(), size: *size, scale: *scale });
+                    s.open.insert(id.clone(), Open { url: url.clone(), profile: profile.clone(), size: *size, scale: *scale, device: None });
                 }
                 AppToHost::Resize { id, size, scale } => {
                     if let Some(o) = s.open.get_mut(id) {
@@ -300,6 +302,11 @@ impl HostLink for HostClient {
                 }
                 AppToHost::Close { id } => {
                     s.open.remove(id);
+                }
+                AppToHost::SetDevice { id, device } => {
+                    if let Some(o) = s.open.get_mut(id) {
+                        o.device = device.clone();
+                    }
                 }
                 _ => {}
             }
@@ -352,7 +359,10 @@ impl Writer {
                         open.sort_by(|a, b| a.0.cmp(&b.0));
                         self.replayed = open.iter().map(|(id, _)| id.clone()).collect();
                         for (id, o) in open {
-                            self.write(&AppToHost::Create { id, url: o.url, size: o.size, scale: o.scale, profile: o.profile });
+                            self.write(&AppToHost::Create { id: id.clone(), url: o.url, size: o.size, scale: o.scale, profile: o.profile });
+                            if o.device.is_some() {
+                                self.write(&AppToHost::SetDevice { id, device: o.device });
+                            }
                         }
                     }
                     Err(e) => {
@@ -1225,7 +1235,7 @@ impl BrowserView {
             }
             // The host minted `id`; only this page's own popups, and never an id already in use.
             H::PopupOpened { opener, id, url, w, h } if opener == self.id => {
-                if self.states.lock().unwrap().contains_key(&id) || self.popups_due.iter().any(|(p, ..)| *p == id) {
+                if !herdr_browser_protocol::is_popup_id(&id) || self.states.lock().unwrap().contains_key(&id) || self.popups_due.iter().any(|(p, ..)| *p == id) {
                     // Never Close it: that id is a live block's.
                     tracing::warn!("browser {}: popup id {id} is already in use; ignored", self.id);
                 } else {
@@ -1294,14 +1304,22 @@ impl BrowserView {
     /// Responsive mode on (a device) or off: the page is resized to the device (or back to the
     /// block) and told the device's UA and touch (or that every override is gone).
     pub fn set_device(&mut self, mode: Option<super::devices::Mode>, cx: &mut Context<Self>) {
+        // Any choice closes the menu, even one that changes nothing.
+        if self.device_menu {
+            self.device_menu = false;
+            cx.notify();
+        }
         if mode == self.device {
             return;
         }
         self.device = mode;
+        // A new viewport: pick, markup, comments and text edit (for the old one) close, wherever
+        // they sit in the stack; an agent's lease stays. They can be opened again on the device.
+        if self.device.is_some() {
+            self.input.update(cx, |i, _| i.close_annotation());
+            self.drain_overlay(cx);
+        }
         self.device_menu = false;
-        let off = self.device.is_some();
-        self.input.update(cx, |i, _| i.set_annotate_off(off));
-        self.drain_overlay(cx);
         self.link.send(AppToHost::SetDevice { id: self.id.clone(), device: self.device.as_ref().map(|d| d.device()) });
         if let Some((size, scale)) = self.measured {
             self.laid_out(size, scale);
@@ -1314,12 +1332,24 @@ impl BrowserView {
         self.device.as_ref()
     }
 
+    /// Whether the device menu is open.
+    pub fn device_menu_open(&self) -> bool {
+        self.device_menu
+    }
+
+    /// The 📱 button: opens or closes the device menu.
+    pub fn toggle_device_menu(&mut self, cx: &mut Context<Self>) {
+        self.device_menu = !self.device_menu;
+        cx.notify();
+    }
+
     fn device_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         if !self.device_menu {
             return None;
         }
         let item = |id: &'static str, label: String| div().id(id).px_2().py_1().rounded_sm().cursor_pointer().hover(|s| s.bg(hsla(0., 0., 1., 0.1))).child(label);
-        let mut menu = div().id("device-menu").absolute().top(px(2.)).right(px(8.)).flex().flex_col().p_1().rounded_md().text_xs().bg(rgb(0x1f1f1f)).text_color(rgb(0xf2f2f2));
+        // Occluded: a click on the menu never falls through to the page under it.
+        let mut menu = div().id("device-menu").absolute().top(px(2.)).right(px(8.)).occlude().flex().flex_col().p_1().rounded_md().text_xs().bg(rgb(0x1f1f1f)).text_color(rgb(0xf2f2f2));
         menu = menu.child(item("device-off", "Responsive off".into()).on_click(cx.listener(|v, _, _, cx| v.set_device(None, cx))));
         for (i, p) in super::devices::PRESETS.iter().enumerate() {
             let name = p.name;
@@ -1618,6 +1648,12 @@ impl BrowserView {
     }
 
     /// S29: a grant (or the sensitive mark) as the person set it in the shield; never an agent's.
+    /// Marked sensitive by the person: a popup is as sensitive as its opener.
+    pub fn sensitive(&self) -> bool {
+        let id = self.opener.clone().unwrap_or_else(|| self.id.clone());
+        self.agent.as_ref().is_some_and(|a| a.lock().unwrap().grants.get(&id, Grant::Sensitive))
+    }
+
     pub fn grant(&self, g: Grant) -> bool {
         self.agent.as_ref().is_some_and(|a| a.lock().unwrap().grants.get(&self.id, g))
     }
@@ -2215,12 +2251,25 @@ impl BrowserView {
         }));
     }
 
+    /// Responsive mode: how much the page is scaled to fit its block (1 when off).
+    pub fn fit(&self) -> f32 {
+        match (&self.device, self.measured) {
+            (Some(d), Some((area, _))) => d.fit(area.w, area.h),
+            _ => 1.0,
+        }
+    }
+
+    /// A page-DIP rect where overlays draw it (`geometry::to_drawn` at this block's fit).
+    fn drawn(&self, r: (f32, f32, f32, f32)) -> (f32, f32, f32, f32) {
+        super::geometry::to_drawn(r, self.fit())
+    }
+
     fn annotation_layer(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut out: Vec<AnyElement> = self
             .annotations
             .visible()
             .map(|a| {
-                let (x, y, _, _) = self.pin_rect(a);
+                let (x, y, _, _) = self.drawn(self.pin_rect(a));
                 let n = a.n;
                 div()
                     .id(("pin", n as usize))
@@ -2248,7 +2297,7 @@ impl BrowserView {
             .collect();
         // A9: the open pin's popover beside it.
         if let Some(pin) = self.open_pin.and_then(|n| self.annotations.visible().find(|p| p.n == n).cloned()) {
-            let (x, y, _, _) = self.pin_rect(&pin);
+            let (x, y, _, _) = self.drawn(self.pin_rect(&pin));
             let popover = design_bar::pin_popover(pin.n, &pin.comment, cx, |v, a, _, cx| v.pin_action(a, cx));
             out.push(
                 div()
@@ -2269,6 +2318,8 @@ impl BrowserView {
         if let Some((size, _)) = self.sized {
             let pins: Vec<(u32, (f32, f32, f32, f32))> = self.annotations.visible().map(|a| (a.n, self.pin_rect(a))).collect();
             let o = design_bar::offscreen(&pins, (size.w, size.h));
+            let (_, _, dw, dh) = self.drawn((0.0, 0.0, size.w, size.h));
+            let size = Dips { w: dw, h: dh };
             for (id, text) in design_bar::offscreen_labels(&o) {
                 let m = div().id(id).absolute().px_1().rounded_full().text_xs().bg(rgb(0xff3b30)).text_color(rgb(0xffffff)).child(text);
                 let m = match id {
@@ -2281,12 +2332,14 @@ impl BrowserView {
             }
         }
         if let Some(r) = self.rubber {
+            let (x, y, w, h) = self.drawn((r.x, r.y, r.w, r.h));
+            let r = Rect { x, y, w, h };
             out.push(div().absolute().left(px(r.x)).top(px(r.y)).w(px(r.w)).h(px(r.h)).border_1().border_color(rgb(0x3b82f6)).bg(hsla(0.6, 0.9, 0.6, 0.12)).into_any_element());
         }
         if let Some(t) = &self.comment_target {
             let input = self.input.read(cx);
             let typed = input.comment().text.clone() + input.comment().marked.as_deref().unwrap_or("");
-            let (x, y, _, h) = t.rect;
+            let (x, y, _, h) = self.drawn(t.rect);
             out.push(
                 div()
                     .id("comment-field")
@@ -2719,12 +2772,7 @@ impl BrowserView {
             .child(div().flex_1().min_w_0().overflow_hidden().child(Input::new(&self.address)))
             .when(self.state.loading, |d| d.child("loading"))
             // A1: one Design button; the strip under the bar holds every design control.
-            .child(if self.device.is_some() {
-                // Pick and markup overlays assume an unscaled page: off while a device is previewed.
-                button("Design", false).tooltip(|_, cx| cx.new(|_| Hint("Turn off device mode to annotate")).into())
-            } else {
-                button("Design", true).on_click(cx.listener(|v, _, _, cx| v.toggle_mode(Owner::Pick, cx)))
-            })
+            .child(button("Design", true).on_click(cx.listener(|v, _, _, cx| v.toggle_mode(Owner::Pick, cx))))
             // The zoom label shows only off 100 %; a click resets it.
             .when(self.zoom_level.abs() > 1e-6, |d| {
                 d.child(div().id("zoom-label").px_1().rounded_sm().cursor_pointer().bg(hsla(0., 0., 0.5, 0.15)).child(zoom::percent(self.zoom_level)).on_click(cx.listener(|v, _, _, cx| v.set_zoom(0.0, cx))))
@@ -2839,8 +2887,37 @@ impl Render for BrowserView {
             });
         }
         // A window shot covers a page the person marked sensitive (its pixels never reach the file).
-        let masked = SHOT_MASK.load(std::sync::atomic::Ordering::SeqCst) && self.grant(Grant::Sensitive);
+        let masked = SHOT_MASK.load(std::sync::atomic::Ordering::SeqCst) && self.sensitive();
         let frame = if masked { None } else { frame };
+        // Current overlay rects (stale ones are already gone), outlined over the frame.
+        // A3: a stepped pick draws its own box (the pointer's hit test is not it).
+        let stepped = self.hovered.as_ref().filter(|_| self.stepped).map(|t| Rect { x: t.rect.0, y: t.rect.1, w: t.rect.2, h: t.rect.3 });
+        let boxes: Vec<Rect> = match stepped {
+            Some(r) => vec![r],
+            None => self.overlay.shown().to_vec(),
+        };
+        let boxes: Vec<Rect> = boxes.iter().map(|r| { let (x, y, w, h) = self.drawn((r.x, r.y, r.w, r.h)); Rect { x, y, w, h } }).collect();
+        // Every overlay goes in `over`: drawn over the frame, inside the letterboxed box in
+        // responsive mode (positions already through `drawn`).
+        let mut over: Vec<AnyElement> = Vec::new();
+        over.extend(boxes.iter().map(|r| {
+            div().absolute().left(px(r.x)).top(px(r.y)).w(px(r.w)).h(px(r.h)).border_2().border_color(rgb(0x3b82f6)).bg(hsla(0.6, 0.9, 0.6, 0.15)).into_any_element()
+        }));
+        // A2: the label chip on the hover box while picking ("element · W×H" until the label comes).
+        let chip = (self.owner(cx) == Owner::Pick).then(|| boxes.first().copied()).flatten().map(|r| {
+            let label = self.hovered.as_ref().map(|t| t.label.as_str()).unwrap_or("");
+            let (x, y) = design_bar::chip_origin((r.x, r.y, r.w, r.h));
+            div().absolute().left(px(x)).top(px(y)).child(design_bar::chip(design_bar::chip_text(label, r.w, r.h)))
+        });
+        over.extend(chip.map(IntoElement::into_any_element));
+        // S6/S7: pins, the rubber band and the comment field over the frame.
+        over.extend(self.annotation_layer(cx));
+        // Markup above the frame and the highlights, while marking up or when shapes exist.
+        let marking = self.owner(cx) == Owner::Markup || !self.markup.read(cx).shapes().is_empty();
+        if marking {
+            over.push(markup::element(self.markup.clone(), self.fit()).into_any_element());
+        }
+        let mut over_slot = Some(over);
         let page = match (&self.crashed, frame) {
             _ if masked => page.child(
                 div().absolute().size_full().flex().items_center().justify_center().bg(rgb(0x202020)).text_color(rgb(0x909090)).text_sm().child("Hidden in screenshots: marked sensitive"),
@@ -2864,7 +2941,8 @@ impl Render for BrowserView {
                                 .h(px(d.h * fit))
                                 .bg(rgb(0xffffff))
                                 .child(div().absolute().size_full().child(frame))
-                                .child(canvas(|_, _, _| (), move |bounds, _, window, cx| input::paint(&box_input, &box_focus, bounds, window, cx)).absolute().size_full()),
+                                .child(canvas(|_, _, _| (), move |bounds, _, window, cx| input::paint(&box_input, &box_focus, bounds, window, cx)).absolute().size_full())
+                                .children(over_slot.take().into_iter().flatten()),
                         ),
                 )
                 .children(self.load_error_card(cx))
@@ -2901,29 +2979,8 @@ impl Render for BrowserView {
                     ),
             ),
         };
-        // Current overlay rects (stale ones are already gone), outlined over the frame.
-        // A3: a stepped pick draws its own box (the pointer's hit test is not it).
-        let stepped = self.hovered.as_ref().filter(|_| self.stepped).map(|t| Rect { x: t.rect.0, y: t.rect.1, w: t.rect.2, h: t.rect.3 });
-        let boxes: Vec<Rect> = match stepped {
-            Some(r) => vec![r],
-            None => self.overlay.shown().to_vec(),
-        };
-        let page = page.children(boxes.iter().map(|r| {
-            div().absolute().left(px(r.x)).top(px(r.y)).w(px(r.w)).h(px(r.h)).border_2().border_color(rgb(0x3b82f6)).bg(hsla(0.6, 0.9, 0.6, 0.15))
-        }));
-        // A2: the label chip on the hover box while picking ("element · W×H" until the label comes).
-        let chip = (self.owner(cx) == Owner::Pick).then(|| boxes.first().copied()).flatten().map(|r| {
-            let label = self.hovered.as_ref().map(|t| t.label.as_str()).unwrap_or("");
-            let (x, y) = design_bar::chip_origin((r.x, r.y, r.w, r.h));
-            div().absolute().left(px(x)).top(px(y)).child(design_bar::chip(design_bar::chip_text(label, r.w, r.h)))
-        });
-        let page = page.children(chip);
-        // S6/S7: pins, the rubber band and the comment field over the frame.
-        let layer = self.annotation_layer(cx);
-        let page = page.children(layer);
-        // Markup above the frame and the highlights, while marking up or when shapes exist.
-        let marking = self.owner(cx) == Owner::Markup || !self.markup.read(cx).shapes().is_empty();
-        let page = page.when(marking, |p| p.child(markup::element(self.markup.clone())));
+        // In responsive mode the device's box took the overlays; otherwise they go over the page.
+        let page = page.children(over_slot.take().into_iter().flatten());
         // The context menu over everything in the page; it takes the mouse first (occlude).
         let menu = self.menu_element(cx);
         let page = page.children(menu);
@@ -3056,7 +3113,7 @@ pub fn device_mode(a: &serde_json::Value) -> Result<Option<super::devices::Mode>
     }
     let num = |k: &str| a.get(k).and_then(serde_json::Value::as_f64).map(|v| v as f32);
     match (num("w"), num("h")) {
-        (Some(w), Some(h)) => Ok(Some(super::devices::Mode::custom(w, h, num("scale")))),
+        (Some(w), Some(h)) => super::devices::Mode::custom(w, h, num("scale")).map(Some),
         _ => Err("browser.device needs name, or w and h, or off: true".into()),
     }
 }
@@ -3074,15 +3131,6 @@ pub fn broker_authorizer(agent: Arc<Mutex<Agent>>, states: Arc<Mutex<HashMap<Bro
         };
         agent.lock().unwrap().broker_allowed(&grants_of, method, profile.as_deref())
     })
-}
-
-/// A small tooltip.
-struct Hint(&'static str);
-
-impl Render for Hint {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div().px_2().py_1().rounded_sm().text_xs().bg(rgb(0x1f1f1f)).text_color(rgb(0xf2f2f2)).child(self.0)
-    }
 }
 
 /// Set while `herdr-app shot` renders the window: blocks marked sensitive draw a cover instead of the page.
@@ -3538,6 +3586,10 @@ mod tests {
         recv(&a, |m| matches!(m, HostToApp::Url { url, .. } if url == "https://example.com"));
         let frame = recv(&a, |m| matches!(m, HostToApp::Frame { .. }));
         assert!(matches!(frame, HostToApp::Frame { size: PixelSize { w: 800, h: 600 }, .. }), "{frame:?}");
+        // Responsive mode on: after a restart the new host hears it again with the page.
+        let device = protocol::Device { mobile: true, touch: true, user_agent: Some("UA-phone".into()) };
+        link.send(AppToHost::SetDevice { id: "a".into(), device: Some(device) });
+        recv(&a, |m| matches!(m, HostToApp::Console { message, .. } if message == "device mobile=true touch=true ua=true"));
         // Kill the host: the view hears a crash, the next send starts a new one and makes the page again.
         let pid = String::from_utf8(Command::new("pgrep").args(["-f", &format!("{}", socket_of(&dir).display())]).output().unwrap().stdout).unwrap();
         let pid = pid.lines().next().expect("stub host running").trim().to_owned();
@@ -3545,6 +3597,7 @@ mod tests {
         recv(&a, |m| matches!(m, HostToApp::Crashed { .. }));
         link.send(AppToHost::Reload { id: "a".into(), ignore_cache: false });
         recv(&a, |m| matches!(m, HostToApp::Url { url, .. } if url == "https://example.com"));
+        recv(&a, |m| matches!(m, HostToApp::Console { message, .. } if message == "device mobile=true touch=true ua=true"));
         drop(link);
         std::thread::sleep(Duration::from_millis(700));
         let left = Command::new("pgrep").args(["-f", &format!("{}", socket_of(&dir).display())]).output().unwrap();

@@ -45,6 +45,8 @@ pub(crate) struct Entry {
     queued: Vec<InputEvent>,
     loaded: bool,
     input_ready: bool,
+    /// The person's last click or key here (app `Input`, never agents' CDP): a popup needs one just before.
+    person_input: Option<std::time::Instant>,
     /// Counts main-page loads, so a readiness answer from an older load is ignored.
     load_gen: u64,
     /// While the readiness probe waits: when the last nudge (a mouse move) went out, and where
@@ -66,7 +68,7 @@ pub(crate) struct Entry {
 
 impl Entry {
     fn new(size: Size, scale: f32) -> Entry {
-        Entry { browser: None, size, scale, pool: FramePool::new(), last: None, hidden: false, shots: Vec::new(), resized: None, _devtools: None, queued: Vec::new(), loaded: false, input_ready: false, load_gen: 0, nudged: None, pointer: (0.0, 0.0), view: None, popup: None, popup_shown: false, popup_rect: None, starting: Vec::new(), scroll: None, viewport: None }
+        Entry { browser: None, size, scale, pool: FramePool::new(), last: None, hidden: false, shots: Vec::new(), resized: None, _devtools: None, queued: Vec::new(), loaded: false, input_ready: false, person_input: None, load_gen: 0, nudged: None, pointer: (0.0, 0.0), view: None, popup: None, popup_shown: false, popup_rect: None, starting: Vec::new(), scroll: None, viewport: None }
     }
 }
 
@@ -78,14 +80,33 @@ const POPUP_DEFAULT: (f32, f32) = (500.0, 600.0);
 pub(crate) fn adopt_popup(opener: &str, w: Option<f32>, h: Option<f32>) -> Option<String> {
     with_host(|h_| {
         let scale = h_.browsers.get(opener)?.scale;
-        h_.next_popup += 1;
-        let id = format!("{opener}-pop{}", h_.next_popup);
+        // A reserved namespace, and only a vacant entry: a live block is never replaced.
+        let id = mint_popup_id(opener, &mut h_.next_popup, |id| h_.browsers.contains_key(id));
         let size = Size { w: w.unwrap_or(POPUP_DEFAULT.0).clamp(200.0, 1600.0), h: h.unwrap_or(POPUP_DEFAULT.1).clamp(200.0, 1200.0) };
         h_.browsers.insert(id.clone(), Entry::new(size, scale));
         h_.popups.insert(id.clone(), opener.to_string());
         Some(id)
     })
     .flatten()
+}
+
+/// The next free popup id for `opener` (reserved namespace, never a taken id).
+fn mint_popup_id(opener: &str, next: &mut u64, taken: impl Fn(&str) -> bool) -> String {
+    loop {
+        *next += 1;
+        let id = format!("{opener}{}{}", herdr_browser_protocol::POPUP_MARK, *next);
+        if !taken(&id) {
+            return id;
+        }
+    }
+}
+
+/// How recent the person's own click or key on an opener must be for its popup to open.
+const POPUP_ACTIVATION: Duration = Duration::from_secs(5);
+
+/// Whether the person clicked or typed in `id` just now (agents' CDP input never counts).
+pub(crate) fn person_active(id: &str) -> bool {
+    with_host(|h| h.browsers.get(id).and_then(|e| e.person_input).is_some_and(|t| t.elapsed() < POPUP_ACTIVATION)).unwrap_or(false)
 }
 
 /// A browser is closing: if it is a popup, forget it and tell the app.
@@ -910,7 +931,7 @@ fn handle(m: AppToHost) {
         }
         M::Create { id, url, size, scale, profile } => {
             let exists = with_host(|h| h.browsers.contains_key(&id)).unwrap_or(false);
-            if exists {
+            if exists || herdr_browser_protocol::is_popup_id(&id) {
                 send(HostToApp::Error { id: Some(id.clone()), message: format!("browser {id} exists") });
                 return;
             }
@@ -1156,6 +1177,9 @@ fn browser_msg(m: AppToHost) {
         }
         M::SetZoom { level, .. } => host.set_zoom_level(level),
         M::Input { event, .. } => {
+            if matches!(event, InputEvent::Mouse { kind: MouseKind::Down, .. } | InputEvent::Key { .. }) {
+                with_host(|h| h.browsers.get_mut(&id).map(|e| e.person_input = Some(std::time::Instant::now())));
+            }
             let queued = with_host(|h| {
                 h.browsers
                     .get_mut(&id)
@@ -1437,6 +1461,15 @@ mod chooser_tests {
         assert_eq!(take_owned(&mut m, 8, "b1"), None);
         assert_eq!(take_owned(&mut m, 7, "b1"), Some("cb"));
         assert_eq!(take_owned(&mut m, 7, "b1"), None, "answered once");
+    }
+
+    #[test]
+    fn popup_ids_are_reserved_and_never_taken() {
+        let mut next = 0;
+        let taken = ["me~pop1".to_string(), "me~pop2".to_string()];
+        let id = mint_popup_id("me", &mut next, |i| taken.iter().any(|t| t == i));
+        assert_eq!(id, "me~pop3", "an occupied id is skipped, never replaced");
+        assert!(herdr_browser_protocol::is_popup_id(&id));
     }
 
     #[test]

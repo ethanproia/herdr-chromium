@@ -51,7 +51,12 @@ unsafe extern "C" {
 }
 
 #[link(name = "AVFoundation", kind = "framework")]
-unsafe extern "C" {}
+unsafe extern "C" {
+    static AVURLAssetReferenceRestrictionsKey: Id;
+}
+
+/// `AVAssetReferenceRestrictionForbidAll`: an asset may not follow references to other media.
+const REFERENCE_FORBID_ALL: usize = 0xFFFF;
 #[link(name = "Foundation", kind = "framework")]
 unsafe extern "C" {}
 
@@ -126,7 +131,10 @@ fn asset(path: &std::path::Path) -> Result<Id, String> {
     let p = ns_string(&path.to_string_lossy())?;
     unsafe {
         let url: Id = send!(class(c"NSURL"), c"fileURLWithPath:", p => Id; Id);
-        let asset: Id = send!(class(c"AVURLAsset"), c"URLAssetWithURL:options:", url => Id, std::ptr::null_mut() => Id; Id);
+        // No reference movies: a clip inside the app directory may not pull media from elsewhere.
+        let forbid: Id = send!(class(c"NSNumber"), c"numberWithUnsignedInteger:", REFERENCE_FORBID_ALL => usize; Id);
+        let options: Id = send!(class(c"NSDictionary"), c"dictionaryWithObject:forKey:", forbid => Id, AVURLAssetReferenceRestrictionsKey => Id; Id);
+        let asset: Id = send!(class(c"AVURLAsset"), c"URLAssetWithURL:options:", url => Id, options => Id; Id);
         if asset.is_null() { Err(format!("cannot open {}", path.display())) } else { Ok(asset) }
     }
 }

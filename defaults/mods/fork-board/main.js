@@ -26,6 +26,8 @@ globalThis.Path2D ??= class Path2D { constructor(d) { this.d = d; } };
 
 // src/main.js
 import { View, div as div2, PathBuilder as PathBuilder2, image, svg } from "gpui-kit";
+import * as gpuiKit from "gpui-kit";
+import * as herdrApi from "herdr";
 import { TextareaState, Textarea } from "gpui-base";
 import { props, settings, theme, readTextFile, writeTextFile as writeTextFile2, watchFolder, notify, home as home2, appHome, run, focused, panes, closeOverlay, exec } from "herdr";
 import { Buffer } from "buffer";
@@ -4518,6 +4520,100 @@ function absAsset(boardFile, rel) {
   if (parts.length !== 2 || parts[0] !== basename(assetsDirFor(boardFile)) || !parts[1] || parts.some((x3) => x3 === ".." || x3 === "." || x3 === "")) return null;
   return `${dirname(boardFile)}/${rel}`;
 }
+var ASSET_WRITE = '[ -L "$2" ] && exit 90; mkdir -p "$2" || exit; [ -L "$2" ] && exit 90; a=$(cd "$2" && pwd -P) || exit; p=$(cd "$(dirname "$2")" && pwd -P) || exit; [ "$a" = "$p/$(basename "$2")" ] || exit 90; [ -e "$1" ] && exit 90; [ -L "$1" ] && exit 90; shift 2; exec "$@"';
+var ASSET_REFUSED = 90;
+function assetWrite(boardFile, name, build) {
+  if (typeof name !== "string" || !/^[A-Za-z0-9_-]+\.[a-z0-9]+$/.test(name)) throw new Error("bad asset name");
+  return writeInto(assetsDirFor(boardFile), name, build);
+}
+function writeInto(dir, name, build) {
+  const dest = `${dir}/${name}`;
+  const [cmd, args] = build(dest);
+  return ["sh", ["-c", ASSET_WRITE, "sh", dest, dir, cmd, ...args]];
+}
+function cacheWrite(dir, name, build) {
+  if (typeof name !== "string" || !/^[A-Za-z0-9_][A-Za-z0-9_.-]*$/.test(name) || name.includes("..")) throw new Error("bad cache name");
+  return writeInto(dir, name, build);
+}
+var importArgv = (boardFile, name, src) => assetWrite(boardFile, name, (dest) => ["cp", ["--", src, dest]]);
+var deriveArgv = (boardFile, name, how, src, grayProfile) => assetWrite(boardFile, name, (dest) => ["sips", [...how === "flip" ? ["-f", "horizontal"] : ["-m", grayProfile], "-s", "format", "png", src, "--out", dest]]);
+function parsePathList(stdout) {
+  let v3;
+  try {
+    v3 = JSON.parse(String(stdout ?? "").trim() || "[]");
+  } catch {
+    return [];
+  }
+  return Array.isArray(v3) ? v3.filter((p3) => typeof p3 === "string" && p3.startsWith("/") && !p3.includes("\0")) : [];
+}
+var DEMUXERS = { mp4: "mov", mov: "mov", m4v: "mov", webm: "matroska", mkv: "matroska", gif: "gif" };
+function demuxerFor(path) {
+  const f3 = DEMUXERS[extOf(path)];
+  if (!f3) throw new Error("not a video or GIF the board can read");
+  return f3;
+}
+var ffInputArgs = (src) => ["-protocol_whitelist", "file", "-f", demuxerFor(src)];
+var ffprobeArgs = (src) => ["-v", "error", ...ffInputArgs(src), "-show_entries", "format=duration", "-of", "csv=p=0", src];
+var RECOVERY_CONFLICTS = 8;
+var RECOVERY_KEEP_MS = 14 * 24 * 60 * 60 * 1e3;
+var recoverySafe = (boardFile) => basename(boardFile).replace(/[^A-Za-z0-9._-]/g, "_");
+function recoveryBoardKey(boardFile) {
+  let h3 = 5381;
+  for (const c3 of boardFile) h3 = (h3 * 33 ^ c3.charCodeAt(0)) >>> 0;
+  return `${h3.toString(36)}-${recoverySafe(boardFile)}`;
+}
+var recoveryDir = (appHome2) => `${appHome2}/data/herdr-board/recovery`;
+function recoveryPath(appHome2, boardFile, tag) {
+  return `${recoveryDir(appHome2)}/${recoveryBoardKey(boardFile)}.${tag}.board`;
+}
+var RECOVERY_NAME = /^(.*)\.(unsaved|conflict-(\d+))\.board$/;
+var RECOVERY_MTIME_SH = [
+  'm=$(stat -c %Y "$1" 2>/dev/null) || m=$(stat -f %m "$1" 2>/dev/null) || exit 1',
+  'case "$m" in ""|*[!0-9]*) exit 1;; esac',
+  `printf '%s\\n' "$m"`
+].join("; ");
+function recoveryMtimeMs(stdout, code = 0) {
+  if (code !== 0) return null;
+  const text = String(stdout ?? "").trim();
+  if (!/^\d+$/.test(text)) return null;
+  const sec = Number(text);
+  return Number.isSafeInteger(sec) ? sec * 1e3 : null;
+}
+function parseRecoveryName(name) {
+  const m2 = RECOVERY_NAME.exec(name);
+  if (!m2) return null;
+  const conflict = m2[2].startsWith("conflict-");
+  return { key: m2[1], tag: conflict ? "conflict" : "unsaved", at: conflict ? Number(m2[3]) : null };
+}
+function recoveryFilesToDrop(entries, { now, keep = RECOVERY_CONFLICTS, maxAgeMs = RECOVERY_KEEP_MS, current = null, protectName = null } = {}) {
+  const groups = /* @__PURE__ */ new Map();
+  for (const e5 of entries) {
+    const p3 = parseRecoveryName(e5.name);
+    if (!p3) continue;
+    let list = groups.get(p3.key);
+    if (!list) {
+      list = [];
+      groups.set(p3.key, list);
+    }
+    list.push({ ...e5, ...p3 });
+  }
+  const drop = [];
+  for (const [key, files] of groups) {
+    const unsaved = files.find((f3) => f3.tag === "unsaved");
+    if (unsaved) {
+      const expired = unsaved.mtimeMs != null && now - unsaved.mtimeMs > maxAgeMs;
+      const info = current && current.key === key ? current : null;
+      const same = !!(info && !info.unsavedUnreadable && info.unsavedText != null && info.diskText != null && info.unsavedText === info.diskText);
+      const live = unsaved.name === protectName;
+      if (same || expired && !live) drop.push(unsaved.name);
+    }
+    const conflicts = files.filter((f3) => f3.tag === "conflict").sort((a2, b2) => b2.at - a2.at);
+    conflicts.forEach((c3, i2) => {
+      if (i2 >= keep || now - c3.at > maxAgeMs) drop.push(c3.name);
+    });
+  }
+  return drop;
+}
 var Generation = class {
   constructor() {
     this.n = 0;
@@ -4579,8 +4675,8 @@ function animAttempt(out, stamp) {
   return { tmp, fail, clear: [`${out}.fail`, `${out}.part.gif`, fail, tmp] };
 }
 function ffmpegAnimArgs(bin, src, vf, tmp, out, fail) {
-  const script = '( "$1" -v error -y -t 60 -i "$2" -an -vf "$3" -loop 0 "$4" && mv "$4" "$5" || { rm -f "$4"; touch "$6"; } ) >/dev/null 2>&1 &';
-  return ["sh", ["-c", script, "sh", bin, src, vf, tmp, out, fail]];
+  const script = '( "$1" -v error -y -protocol_whitelist file -f "$7" -t 60 -i "$2" -an -vf "$3" -loop 0 "$4" && mv "$4" "$5" || { rm -f "$4"; touch "$6"; } ) >/dev/null 2>&1 &';
+  return ["sh", ["-c", script, "sh", bin, src, vf, tmp, out, fail, demuxerFor(src)]];
 }
 function applyDerivedFiles(scene, history, pending) {
   const ready = [];
@@ -4629,14 +4725,18 @@ function wrapText(text, maxWidth, size = STICKY_FONT) {
         out.push(line.trimEnd());
         line = "";
       }
-      let rest = word;
-      while (lineWidth(rest.trimEnd(), size) > maxWidth && rest.length > 1) {
-        let n2 = rest.length - 1;
-        while (n2 > 1 && lineWidth(rest.slice(0, n2), size) > maxWidth) n2--;
-        out.push(rest.slice(0, n2));
-        rest = rest.slice(n2);
+      let piece2 = "", w4 = 0;
+      for (const ch2 of word) {
+        const cw = lineWidth(ch2, size);
+        if (piece2 && w4 + cw > maxWidth && ch2 !== " ") {
+          out.push(piece2);
+          piece2 = "";
+          w4 = 0;
+        }
+        piece2 += ch2;
+        w4 += cw;
       }
-      line = rest;
+      line = piece2;
     }
     out.push(line.trimEnd());
   }
@@ -5403,7 +5503,10 @@ function normalizeElement(el) {
     base.autoResize ??= true;
   }
   if (base.type === "arrow" || base.type === "line" || base.type === "freedraw") {
-    base.points ??= [[0, 0]];
+    const pts = Array.isArray(base.points) ? base.points.filter((p3) => Array.isArray(p3) && Number.isFinite(p3[0]) && Number.isFinite(p3[1])).map((p3) => [p3[0], p3[1]]) : [];
+    const dropped = !Array.isArray(base.points) || pts.length !== base.points.length;
+    base.points = pts.length ? pts : [[0, 0]];
+    if (base.type === "freedraw" && (dropped || !Array.isArray(base.pressures))) base.pressures = [];
   }
   if (base.type === "arrow" || base.type === "line") {
     base.startBinding ??= null;
@@ -5615,6 +5718,491 @@ function wireDrop(el, target, importPaths) {
   return el.on_drag_enter((_e2, cx) => set(true, cx)).on_drag_leave((_e2, cx) => set(false, cx));
 }
 
+// src/mod.js
+var MOD = "fork-board";
+
+// src/video.js
+var NATIVE_EXTS = ["mp4", "mov", "m4v"];
+var clipId = (token, elId) => `${MOD}-clip-${token}-${elId}`;
+var clipFile = (key, path) => `${key}.clip.${extOf(path)}`;
+var clipKey = (rel) => /(?:^|\/)([^/]+?)\.clip\.[a-z0-9]+$/.exec(String(rel ?? ""))?.[1] ?? null;
+function nativeVideo(kit, herdr) {
+  const ok = typeof kit?.video === "function" && ["videoPlay", "videoPause", "videoSeek", "nextVideoEvent"].every((k3) => typeof herdr?.[k3] === "function");
+  if (!ok) return null;
+  return { video: kit.video, play: herdr.videoPlay, pause: herdr.videoPause, seek: herdr.videoSeek, next: herdr.nextVideoEvent };
+}
+async function linkClip(src, dir, name, { exec: exec2, exists: exists3 }) {
+  if (await exists3(`${dir}/${name}`)) return "exists";
+  const r2 = await exec2(...cacheWrite(dir, name, (dest) => ["ln", ["--", src, dest]])).catch(() => ({ code: 1 }));
+  return r2?.code === 0 ? "link" : null;
+}
+async function copyClip(src, dir, name, { exec: exec2, exists: exists3, tmpName }) {
+  if (await exists3(`${dir}/${name}`)) return "exists";
+  const tmp = tmpName(name);
+  const cp = await exec2(...cacheWrite(dir, tmp, (dest) => ["cp", ["--", src, dest]])).catch(() => ({ code: 1 }));
+  if (cp?.code === 0) {
+    const mv = await exec2(...cacheWrite(dir, name, (dest) => ["mv", ["--", `${dir}/${tmp}`, dest]])).catch(() => ({ code: 1 }));
+    if (mv?.code === 0) return "copy";
+  }
+  await exec2("rm", ["-f", "--", `${dir}/${tmp}`]).catch(() => {
+  });
+  throw new Error("could not copy the clip into the cache");
+}
+async function stampClip(dir, name, { exec: exec2 }) {
+  const r2 = await exec2(...cacheWrite(dir, clipStamp(name), (dest) => ["touch", [dest]])).catch(() => ({ code: 1 }));
+  return r2?.code === 0;
+}
+function clipsToPrune(names, prefix, liveKeys) {
+  const out = [];
+  for (const n2 of names) {
+    const key = clipNameKey(n2);
+    if (!key || !key.startsWith(`${prefix}_`) || liveKeys.has(key)) continue;
+    out.push(n2);
+  }
+  return out;
+}
+var CLIP_GRACE_MS = 2 * 60 * 1e3;
+var clipStamp = (name) => `${name}.stamp`;
+function clipKeyParts(key) {
+  const parts = String(key ?? "").split("_");
+  if (parts.length < 4) return null;
+  const mtime = parts.pop();
+  const size = parts.pop();
+  const prefix = parts.shift();
+  const fileId = parts.join("_");
+  if (!/^\d+$/.test(size) || !/^\d+$/.test(mtime) || !prefix || !fileId) return null;
+  return { prefix, fileId, size, mtime };
+}
+function clipStagedAt(name, mtimes) {
+  if (!mtimes) return null;
+  if (mtimes.has(clipStamp(name))) return mtimes.get(clipStamp(name)) ?? null;
+  if (mtimes.has(name)) return mtimes.get(name) ?? null;
+  return null;
+}
+function clipReferences({ files, pics, shown, extra, trustPics = false } = {}) {
+  const referenced = /* @__PURE__ */ new Set();
+  for (const k3 of extra ?? []) if (k3) referenced.add(k3);
+  const unresolved = /* @__PURE__ */ new Set();
+  const visible = (id) => shown == null || shown.has(id);
+  if (trustPics) {
+    for (const [id, pic] of pics ?? []) if (pic?.key && visible(id)) referenced.add(pic.key);
+  }
+  for (const id of files && typeof files === "object" ? Object.keys(files) : []) {
+    if (!visible(id)) continue;
+    const key = pics?.get(id)?.key;
+    if (key) referenced.add(key);
+    else unresolved.add(id);
+  }
+  return { referenced, unresolved };
+}
+function asSet(value) {
+  return value instanceof Set ? value : new Set(value ?? []);
+}
+function ageCandidateKey(name, prefix, referenced, unresolved) {
+  const key = clipNameKey(name);
+  if (!key || !key.startsWith(`${prefix}_`) || referenced.has(key)) return null;
+  const parts = clipKeyParts(key);
+  if (!parts || unresolved.has(parts.fileId)) return null;
+  return key;
+}
+function staleClipNames(names, { prefix, referenced, unresolved, ageOf, now, graceMs }) {
+  const ref = asSet(referenced);
+  const pending = asSet(unresolved);
+  const out = [];
+  for (const n2 of names) {
+    if (!ageCandidateKey(n2, prefix, ref, pending)) continue;
+    const age = ageOf(n2);
+    if (age == null || !(now - age > graceMs)) continue;
+    out.push(n2);
+  }
+  return out;
+}
+function clipMtimeNames(names, { prefix, referenced, unresolved, retired } = {}) {
+  const ref = asSet(referenced);
+  const pending = asSet(unresolved);
+  const gone = asSet(retired);
+  const have = new Set(names);
+  const out = [];
+  for (const n2 of names) {
+    const key = ageCandidateKey(n2, prefix, ref, pending);
+    if (!key || gone.has(key)) continue;
+    const stamp = clipStamp(n2);
+    out.push(have.has(stamp) ? stamp : n2);
+  }
+  return out;
+}
+function clipNamesToDrop(names, { prefix, retired, referenced, unresolved, ageOf, now, graceMs }) {
+  const live = pruneLiveKeys(names, retired, referenced);
+  const drop = new Set(clipsToPrune(names, prefix, live));
+  for (const n2 of staleClipNames(names, { prefix, referenced, unresolved, ageOf, now, graceMs })) drop.add(n2);
+  return [...drop];
+}
+function clipNameKey(name) {
+  return /^(.+?)\.clip\.[a-z0-9]+(?:\.[A-Za-z0-9_-]+\.tmp)?$/.exec(String(name ?? ""))?.[1] ?? null;
+}
+function pruneLiveKeys(names, retired, keep = []) {
+  const drop = retired instanceof Set ? retired : new Set(retired);
+  const live = new Set(keep);
+  for (const n2 of names) {
+    const key = clipNameKey(n2);
+    if (key && !drop.has(key)) live.add(key);
+  }
+  return live;
+}
+var DROP_MS = 3e3;
+var BACKOFF_FIRST = 2e3;
+var BACKOFF_MAX = 3e4;
+var Clips = class {
+  constructor(api, { token = "0", onFallback = () => {
+  }, now = () => Date.now() } = {}) {
+    this.api = api;
+    this.token = token;
+    this.onFallback = onFallback;
+    this.now = now;
+    this.closed = false;
+    this.files = /* @__PURE__ */ new Map();
+    this.failed = /* @__PURE__ */ new Set();
+    this.linkFailed = /* @__PURE__ */ new Map();
+    this.copying = /* @__PURE__ */ new Set();
+    this.recs = /* @__PURE__ */ new Map();
+    this.held = /* @__PURE__ */ new Map();
+    this.owned = /* @__PURE__ */ new Set();
+  }
+  /**
+   * Keys this instance created and has since replaced, which nothing here still plays.
+   * A key it found already in the cache is not here: another pane may be using it,
+   * so that file is left to the stale-age pass.
+   */
+  retiredKeys() {
+    const live = this.stagedKeys();
+    const out = [];
+    for (const k3 of this.owned) if (!live.has(k3)) out.push(k3);
+    return out;
+  }
+  id(elId) {
+    return clipId(this.token, elId);
+  }
+  /** The record of element `e` (created on first use: ready when its file is staged, else idle). */
+  rec(elId, fileId) {
+    let r2 = this.recs.get(elId);
+    if (!r2) {
+      r2 = { phase: fileId && this.files.has(fileId) && !this.failed.has(fileId) ? "ready" : "idle", fileId: fileId ?? null, intent: false, drawn: false, away: null, time: 0, duration: null, ended: false, backoff: null, listening: false };
+      this.recs.set(elId, r2);
+    } else if (fileId) {
+      r2.fileId = fileId;
+      if (r2.phase === "idle" && this.files.has(fileId) && !this.failed.has(fileId)) r2.phase = "ready";
+    }
+    return r2;
+  }
+  phase(elId) {
+    return this.recs.get(elId)?.phase ?? null;
+  }
+  /** Moves a record to `phase`; leaving staging or a play request drops the intent. */
+  to(r2, phase) {
+    r2.phase = phase;
+    if (phase === "playing" || phase === "idle" || phase === "dropped") r2.intent = false;
+    return r2;
+  }
+  /**
+   * Point `fileId` at `rel`. `created` is set only when this call's link or copy made the
+   * file. A path that was already there was staged by another pane or an earlier session,
+   * so it is not owned: when the key is replaced, that file waits out the stale-age window
+   * instead of being deleted at once. A key this instance created stays owned, including
+   * the one `rel` replaces (it was marked when it was written).
+   * When `rel` replaces a different staged clip, the old key stays (see stagedKeys) until
+   * the file is drawn again: prune runs before that paint.
+   */
+  useFile(fileId, rel, { created = false } = {}) {
+    const prev = clipKey(this.files.get(fileId));
+    const next = clipKey(rel);
+    this.files.set(fileId, rel);
+    if (created && next) this.owned.add(next);
+    for (const r2 of this.recs.values()) if (r2.fileId === fileId && r2.phase === "idle") this.to(r2, "ready");
+    if (!prev || !next || prev === next) return;
+    let keys = this.held.get(fileId);
+    if (!keys) this.held.set(fileId, keys = /* @__PURE__ */ new Set());
+    keys.add(prev);
+  }
+  /** Keys of clips staged now or still playing from a key a newer stage replaced. */
+  stagedKeys() {
+    const keys = new Set([...this.files.values()].map(clipKey).filter(Boolean));
+    for (const held of this.held.values()) for (const k3 of held) keys.add(k3);
+    return keys;
+  }
+  /** Replaced keys of files no element shows any more: nothing can be playing them (cleared without a render). */
+  releaseHeld(fileIdsShown) {
+    for (const f3 of [...this.held.keys()]) if (!fileIdsShown.has(f3)) this.held.delete(f3);
+  }
+  /** One pass of imageDivs. A replaced key is dropped only when every element of that file was drawn. */
+  beginPaint() {
+    this.paintOn = /* @__PURE__ */ new Set();
+    this.paintOff = /* @__PURE__ */ new Set();
+  }
+  endPaint() {
+    if (!this.paintOn) return;
+    for (const id of this.paintOn) if (!this.paintOff.has(id)) this.held.delete(id);
+    this.paintOn = this.paintOff = null;
+  }
+  /** A video that plays natively once copied: its link failed this load, and the host has not failed it. */
+  needsCopy(e5) {
+    return !!this.api && !this.closed && e5?.customData?.kind === "video" && this.linkFailed.has(e5.fileId) && !this.files.has(e5.fileId) && !this.failed.has(e5.fileId);
+  }
+  /** True when element `e` (a video) draws and plays through the host. */
+  native(e5) {
+    return !!this.api && !this.closed && e5?.customData?.kind === "video" && this.files.has(e5.fileId) && !this.failed.has(e5.fileId);
+  }
+  /**
+   * The video element for `e`: paused, sound on, styled by the caller like an image. `bar` turns on the
+   * host's controls (play/pause, scrub track, m:ss / m:ss); builds before that draw nothing for it.
+   */
+  element(e5, bar = false) {
+    return this.api.video(this.files.get(e5.fileId), { autoplay: false, loop: false, muted: false, controls: !!bar }).id(this.id(e5.id));
+  }
+  /** The host's bar shows while a clip is selected or playing; the board's own button and line then stay off. */
+  bar(elId, selected) {
+    return !!selected || this.playing(elId);
+  }
+  playing(elId) {
+    return this.phase(elId) === "playing";
+  }
+  anyPlaying() {
+    for (const r2 of this.recs.values()) if (r2.phase === "playing") return true;
+    return false;
+  }
+  staging(elId) {
+    return this.phase(elId) === "staging";
+  }
+  /** Progress 0..1 for the line under a clip, or null when there is nothing to show. */
+  progress(elId) {
+    const r2 = this.recs.get(elId);
+    if (!r2 || r2.phase === "idle" || r2.phase === "staging" || r2.phase === "dropped" || !(r2.duration > 0) || !(r2.time > 0)) return null;
+    return Math.max(0, Math.min(1, r2.time / r2.duration));
+  }
+  /** Seconds the host reported for this clip, or null before that. A reported 0 is kept. */
+  duration(elId) {
+    return this.recs.get(elId)?.duration ?? null;
+  }
+  // ---- transitions ------------------------------------------------------------------------
+  /**
+   * The board drew `elId` (seen) or culled it. Culling cancels a pending first play (panning away is not a
+   * click). Coming back after DROP_MS is a new host element: back to ready at its first frame, backoff gone.
+   */
+  painted(elId, seen, fileId) {
+    if (fileId) (seen ? this.paintOn : this.paintOff)?.add(fileId);
+    const r2 = this.rec(elId, fileId);
+    if (!seen) {
+      if (r2.away == null) r2.away = this.now();
+      r2.intent = false;
+      return;
+    }
+    r2.drawn = true;
+    if (r2.away == null) return;
+    const gone = this.now() - r2.away >= DROP_MS;
+    r2.away = null;
+    if (gone || r2.phase === "dropped") {
+      r2.backoff = null;
+      if (r2.phase !== "idle" && r2.phase !== "staging") {
+        this.to(r2, "ready");
+        r2.time = 0;
+        r2.ended = false;
+      }
+    }
+  }
+  /** First play of a clip whose link failed: staging with the intent to play. True when the caller starts the copy. */
+  requestCopy(e5) {
+    const r2 = this.rec(e5.id, e5.fileId);
+    this.to(r2, "staging");
+    r2.intent = true;
+    if (this.copying.has(e5.fileId)) return false;
+    this.copying.add(e5.fileId);
+    return true;
+  }
+  /** The copy landed: staging elements of that file are ready; one still meant to play starts once drawn (due).
+   * `created` is true only when this copy wrote the file (`copyClip` returned "copy", not "exists"). */
+  copied(fileId, rel, { created = false } = {}) {
+    this.copying.delete(fileId);
+    if (this.closed) return;
+    for (const r2 of this.recs.values()) if (r2.fileId === fileId && r2.phase === "staging") {
+      r2.drawn = false;
+      this.to(r2, "ready");
+    }
+    this.useFile(fileId, rel, { created });
+  }
+  /** The copy failed: the file goes to the GIF path. Returns the elements that were waiting to play (they play the GIF copy). */
+  copyFailed(fileId) {
+    this.copying.delete(fileId);
+    this.failed.add(fileId);
+    const waiting = [];
+    for (const [id, r2] of this.recs) if (r2.fileId === fileId && r2.phase === "staging") {
+      if (r2.intent) waiting.push(id);
+      this.to(r2, "idle");
+    }
+    return waiting;
+  }
+  /** A first play stands only while its element stays selected: a moved selection cancels it. */
+  keepIntent(selected) {
+    for (const [id, r2] of this.recs) if (r2.intent && (!selected.has(id) || this.failed.has(r2.fileId))) r2.intent = false;
+  }
+  /** Elements to play now: ready, still meant to play, and drawn as a video since their copy landed. Each is handed out once. */
+  due() {
+    const out = [];
+    for (const [id, r2] of this.recs) if (r2.phase === "ready" && r2.intent && r2.drawn && r2.away == null) {
+      r2.intent = false;
+      out.push(id);
+    }
+    return out;
+  }
+  /** Listens to a clip whose bar shows, so a play or scrub from the bar reaches the board. */
+  watch(e5, listen) {
+    if (this.closed) return;
+    const r2 = this.rec(e5.id, e5.fileId);
+    if (r2.listening || r2.away != null || r2.phase === "idle" || r2.phase === "staging") return;
+    if (r2.phase === "dropped" && this.now() < (r2.backoff?.until ?? 0)) return;
+    r2.listening = true;
+    listen?.(e5.id, e5.fileId);
+  }
+  /**
+   * Play or pause `e`. Starting one pauses any other (as the GIF path: one at a time). Returns false when
+   * nothing played, and then nothing else is paused either: a culled clip, a dropped one, and one not
+   * drawn yet (retried once it is) must not stop a clip that is already playing. Only a refusal for an
+   * element this board has drawn, which the host has not dropped, means the file will not play (the GIF fallback).
+   */
+  toggle(e5, listen) {
+    if (this.closed) return false;
+    const id = e5.id;
+    if (this.playing(id)) {
+      this.pause(id);
+      return true;
+    }
+    const r2 = this.rec(id, e5.fileId);
+    if (r2.away != null) return false;
+    try {
+      if (r2.ended) {
+        this.api.seek(this.id(id), 0);
+        r2.time = 0;
+        r2.ended = false;
+      }
+      this.api.play(this.id(id));
+    } catch (err) {
+      if (r2.drawn && r2.phase !== "dropped") this.fail(id, e5.fileId, String(err?.message ?? err), true);
+      else if (!r2.drawn) r2.intent = true;
+      return false;
+    }
+    for (const [other, o2] of this.recs) if (other !== id && o2.phase === "playing") this.pause(other);
+    r2.backoff = null;
+    this.to(r2, "playing");
+    if (!r2.listening) {
+      r2.listening = true;
+      listen?.(id, e5.fileId);
+    }
+    return true;
+  }
+  pause(elId) {
+    const r2 = this.recs.get(elId);
+    if (r2?.phase === "playing") this.to(r2, "ready");
+    try {
+      this.api.pause(this.id(elId));
+    } catch {
+    }
+  }
+  /** Pauses every clip playing (another clip or a GIF copy starts). */
+  pauseAll() {
+    for (const [id, r2] of this.recs) if (r2.phase === "playing") this.pause(id);
+  }
+  /** The element is gone from the board: pause it and drop its record. */
+  forget(elId) {
+    const r2 = this.recs.get(elId);
+    if (!r2) return;
+    if (r2.phase === "playing") this.pause(elId);
+    this.recs.delete(elId);
+  }
+  /** The board is left (another opened, the picker shown): pause everything, end every listener, keep nothing. */
+  close() {
+    if (this.closed) return;
+    this.pauseAll();
+    this.closed = true;
+    this.recs.clear();
+    this.copying.clear();
+    this.held.clear();
+  }
+  /** The host dropped the element: dropped, back at its first frame when drawn, listened to after a backoff (2 s, doubling to 30 s). */
+  drop(elId) {
+    const r2 = this.rec(elId);
+    const prev = r2.backoff?.delay ?? 0;
+    const delay = prev ? Math.min(prev * 2, BACKOFF_MAX) : BACKOFF_FIRST;
+    r2.backoff = { until: this.now() + delay, delay };
+    this.to(r2, "dropped");
+    r2.time = 0;
+    r2.ended = false;
+  }
+  /** Applies one host event. Returns true when the listener should stop (an error). */
+  onEvent(elId, fileId, ev) {
+    const r2 = this.rec(elId, fileId);
+    if (ev?.type === "error") {
+      this.fail(elId, fileId, ev.error ?? "the player failed", r2.phase === "playing");
+      return true;
+    }
+    r2.backoff = null;
+    if (r2.phase === "dropped" || r2.phase === "idle") this.to(r2, "ready");
+    if (typeof ev?.time === "number") r2.time = ev.time;
+    if (typeof ev?.duration === "number") r2.duration = ev.duration;
+    if (ev?.type === "time") {
+      this.to(r2, "playing");
+      r2.ended = false;
+    } else if (ev?.type === "paused") this.to(r2, "ready");
+    else if (ev?.type === "ended") {
+      this.to(r2, "ready");
+      r2.ended = true;
+      if (r2.duration) r2.time = r2.duration;
+    }
+    return false;
+  }
+  /** The host's events for one clip until an error, a drop (the call rejects), close() or `alive()` turns false. */
+  async listen(elId, fileId, alive, notify2) {
+    const live = () => !this.closed && alive();
+    const tell = () => {
+      try {
+        notify2();
+      } catch (err) {
+        console.log(`board: clip ${elId}: ${err?.message ?? err}`);
+      }
+    };
+    try {
+      for (; ; ) {
+        let ev;
+        try {
+          ev = await this.api.next(this.id(elId));
+        } catch {
+          if (live()) {
+            this.drop(elId);
+            tell();
+          }
+          return;
+        }
+        if (!live()) return;
+        let stop = false;
+        try {
+          stop = this.onEvent(elId, fileId, ev);
+        } catch (err) {
+          console.log(`board: clip ${elId}: ${err?.message ?? err}`);
+        }
+        tell();
+        if (stop) return;
+      }
+    } finally {
+      const r2 = this.recs.get(elId);
+      if (r2) r2.listening = false;
+    }
+  }
+  /** The host cannot play this file: every element showing it goes back to the poster image and the GIF copy. */
+  fail(elId, fileId, reason, wasPlaying) {
+    this.failed.add(fileId);
+    for (const r2 of this.recs.values()) if (r2.fileId === fileId) this.to(r2, "idle");
+    console.log(`board: clip ${elId}: ${reason}; using the GIF copy`);
+    if (wasPlaying) this.onFallback(elId, fileId, reason);
+  }
+};
+
 // src/save-gate.js
 function createSaveGate() {
   let depth = 0;
@@ -5685,7 +6273,6 @@ async function readWhenSaveSettled(gate, read) {
 
 // src/main.js
 Rx({ getLineWidth: (text, font) => lineWidth(text, parseFloat(font) || 20) });
-var MOD = "fork-board";
 var boundsOf = (el, map) => el.type === "freedraw" ? freedrawBounds(el) : he2(el, map);
 var commonOf = (els, map) => {
   const bs2 = els.map((e5) => boundsOf(e5, map));
@@ -5741,7 +6328,7 @@ var TOOL_KEYS = {
 var INK = [null, "#e03131", "#f1ac4b", "#4465e9"];
 var CLIP_JS = `ObjC.import('AppKit');
 function run(a){
-  var mode=a[0], arg=a[1], pb=$.NSPasteboard.generalPasteboard;
+  var mode=a[0], arg=a[1], pb=a[2]?$.NSPasteboard.pasteboardWithName(a[2]):$.NSPasteboard.generalPasteboard;
   if(mode==='get'){
     var d=pb.dataForType('public.png');
     if(!d||!d.length){var t=pb.dataForType('public.tiff');if(!t||!t.length)return '';d=$.NSBitmapImageRep.imageRepWithData(t).representationUsingTypeProperties($.NSBitmapImageFileTypePNG,$({}));}
@@ -5749,14 +6336,14 @@ function run(a){
   }
   if(mode==='files'){
     var u=pb.readObjectsForClassesOptions($([$.NSURL]),$({NSPasteboardURLReadingFileURLsOnlyKey:true}));
-    var o=[];if(u&&u.count)for(var i=0;i<u.count;i++)o.push(ObjC.unwrap(u.objectAtIndex(i).path));return o.join('\\n');
+    var o=[];if(u&&u.count)for(var i=0;i<u.count;i++)o.push(ObjC.unwrap(u.objectAtIndex(i).path));return JSON.stringify(o);
   }
   if(mode==='text'){var s=pb.stringForType('public.utf8-plain-text');return s?ObjC.unwrap(s):'';}
   pb.clearContents;
   if(mode==='put'){pb.writeObjects($([$.NSImage.alloc.initWithContentsOfFile(arg)]));return 'ok';}
-  if(mode==='putfile'){var l=arg.split('\\n').map(function(p){return $.NSURL.fileURLWithPath(p);});pb.writeObjects($(l));return 'ok';}
+  if(mode==='putfile'){var l=JSON.parse(arg).map(function(p){return $.NSURL.fileURLWithPath(p);});pb.writeObjects($(l));return 'ok';}
 }`;
-var CHOOSE_FILES = 'set fs to choose file with prompt "Add to the board" with multiple selections allowed\nset o to ""\nrepeat with f in fs\nset o to o & POSIX path of f & linefeed\nend repeat\nreturn o';
+var CHOOSE_FILES = 'var app=Application.currentApplication();app.includeStandardAdditions=true;var f=app.chooseFile({withPrompt:"Add to the board",multipleSelectionsAllowed:true});JSON.stringify([].concat(f).map(function(p){return p.toString();}))';
 var GRAY_PROFILE = "/System/Library/ColorSync/Profiles/Generic Gray Profile.icc";
 var HANDLE = 5;
 var ROTATE_RADIUS = 32;
@@ -5828,6 +6415,9 @@ var Board = class extends View {
     this.groupIdx = null;
     this.playing = /* @__PURE__ */ new Set();
     this.anim = /* @__PURE__ */ new Map();
+    this.videoApi = nativeVideo(gpuiKit, herdrApi);
+    this.clips = this.newClips();
+    this.fallbacks = [];
     this.hoverId = null;
     this.menu = null;
     this.shapeKind = "rectangle";
@@ -5876,6 +6466,7 @@ var Board = class extends View {
   }
   // ---- choosing a drawing ------------------------------------------------------------
   openFile(file, cx) {
+    if (file !== this.file) this.unsavedKept = null;
     this.file = file;
     this.status = "loading";
     this.picker = null;
@@ -5892,6 +6483,7 @@ var Board = class extends View {
     this.saveError = null;
     this.lastText = null;
     this.boardGen.bump();
+    this.retireClips();
     this.imageFiles = /* @__PURE__ */ new Map();
     this.tries = /* @__PURE__ */ new Map();
     this.anim = /* @__PURE__ */ new Map();
@@ -5948,6 +6540,7 @@ var Board = class extends View {
     return f3?.cwd ?? panes().find((p3) => p3.tab === f3?.tab && p3.cwd)?.cwd ?? home2();
   }
   showPicker(cx) {
+    this.retireClips();
     this.status = "pick";
     this.picker = new Picker(this.startFolder());
     cx.spawn(async (cx2) => {
@@ -6066,6 +6659,7 @@ var Board = class extends View {
     this.status = "ready";
     this.rebuild(cx);
     this.prepareImages(cx);
+    this.queueRecoveryTidy(text ?? null);
     return true;
   }
   fail(cx, message) {
@@ -6082,10 +6676,11 @@ var Board = class extends View {
       try {
         changed = await watchFolder(dir);
       } catch {
-        return;
+        await cx.sleep(2e3);
+        changed = [this.file];
       }
       if (this.closed || gen !== this.watchGen) return;
-      if (!changed.some((p3) => samePath(p3, this.file))) continue;
+      if (!changed.some((p3) => samePath(p3, this.file) || samePath(p3, dir))) continue;
       const text = await readWhenSaveSettled(this.saves, () => readTextFile(this.file).catch(() => null));
       if (this.closed || gen !== this.watchGen) return;
       if (externalChange(text, this.lastText)) await this.applyExternal(text, cx);
@@ -6106,10 +6701,8 @@ var Board = class extends View {
       notify({ title: `${basename2(this.file)} changed on disk`, body: `Not loaded: ${e5.message}`, level: "warning" });
       return;
     }
-    if (this.dirty) {
-      notify({ title: `${basename2(this.file)} changed on disk`, body: "Loaded the file's version; undo brings back your unsaved changes.", level: "warning" });
-    }
     if (this.editing) this.endEdit(cx, {});
+    const recovery = this.dirty ? this.keepRecovery(`conflict-${Date.now()}`, null, { retireUnsaved: true }) : null;
     this.history.record(this.scene.getElementsIncludingDeleted());
     this.doc = { ...doc, files: mergeFiles(this.doc.files, doc.files) };
     this.lastText = text;
@@ -6123,6 +6716,11 @@ var Board = class extends View {
     this.active = /* @__PURE__ */ new Set();
     this.rebuild(cx);
     this.prepareImages(cx);
+    if (recovery) {
+      const kept = await recovery;
+      const where = kept ? `also kept in ${tildify2(kept)}` : "the recovery copy could not be written";
+      notify({ title: `${basename2(this.file)} changed on disk`, body: `Loaded the file's version; undo brings back your unsaved changes (${where}).`, level: "warning" });
+    }
   }
   // ---- image files -------------------------------------------------------------------
   /**
@@ -6140,7 +6738,11 @@ var Board = class extends View {
     const ticket = this.boardGen.n;
     cx.spawn(async (cx2) => {
       try {
-        for (let i2 = 0; this.needFit && i2 < 80; i2++) await cx2.sleep(50);
+        for (let i2 = 0; this.needFit && i2 < 80; i2++) {
+          await cx2.sleep(50);
+          if (!this.boardGen.current(ticket)) return;
+        }
+        if (!this.boardGen.current(ticket)) return;
         let built = 0, rebuiltAt = Date.now();
         do {
           this.prepareAgain = false;
@@ -6158,6 +6760,7 @@ var Board = class extends View {
           }
         } while (this.prepareAgain);
         if (built && this.boardGen.current(ticket)) this.rebuild(cx2);
+        if (this.videoApi && this.boardGen.current(ticket) && Object.keys(this.doc.files ?? {}).every((id) => this.imageFiles.has(id))) await this.pruneClips(ticket);
       } finally {
         if (this.boardGen.current(ticket)) this.preparing = false;
       }
@@ -6219,6 +6822,7 @@ var Board = class extends View {
       if (!live()) return;
       this.pics.set(id, { abs, key, kind: f3.kind, max, files: /* @__PURE__ */ new Map([[tier, cache]]) });
       this.imageFiles.set(id, cache);
+      if (f3.kind === "video" && this.videoApi && NATIVE_EXTS.includes(extOf(f3.path))) await this.linkClip(id, abs, key, f3.path, live);
       if (f3.kind === "video" && f3.duration == null) {
         this.probeDuration(abs).then((d2) => {
           if (d2 != null) f3.duration = d2;
@@ -6227,6 +6831,231 @@ var Board = class extends View {
       }
     } catch (e5) {
       console.log(`board: image ${id}: ${e5?.message ?? e5}`);
+    }
+  }
+  /** A board's clip state; a host error hands the clip to the GIF path (drained with a cx in drainFallbacks). */
+  newClips() {
+    return new Clips(this.videoApi, { token: makeId(), onFallback: (elId) => this.fallbacks.push(elId) });
+  }
+  /** Leaves the board's clips: pause them, end their listeners and pending plays, and start a new Clips. */
+  retireClips() {
+    this.clips?.close();
+    this.clips = this.newClips();
+    this.fallbacks = [];
+  }
+  /** What linkClip and copyClip need: exec, and the cache's existence checks and temp names. */
+  clipDeps() {
+    return { exec, exists: (p3) => fs2.exists(p3), tmpName: (name) => `${name}.${makeId()}.tmp` };
+  }
+  /**
+   * Hard-links a clip into the cache at load (cheap: it gives the poster). A failed link (another volume)
+   * is remembered for this board load and the clip draws its poster image; it is copied on first play.
+   */
+  async linkClip(id, abs, key, path, live) {
+    const clips = this.clips;
+    const name = clipFile(key, path);
+    if (clips.files.get(id) === `${CACHE}/${name}` || clips.linkFailed.get(id)?.key === key) return;
+    if (!this.clipLinkBusy) this.clipLinkBusy = /* @__PURE__ */ new Set();
+    if (this.clipLinkBusy.has(id)) return;
+    this.clipLinkBusy.add(id);
+    clips.linkFailed.delete(id);
+    try {
+      let ok = null;
+      try {
+        ok = await linkClip(abs, `${appHome()}/${CACHE}`, name, this.clipDeps());
+      } catch (e5) {
+        console.log(`board: clip ${id}: ${e5?.message ?? e5}`);
+      }
+      if (!live() || this.clips !== clips) return;
+      if (ok === "link") await stampClip(`${appHome()}/${CACHE}`, name, this.clipDeps()).catch(() => {
+      });
+      if (!live() || this.clips !== clips) return;
+      if (ok) clips.useFile(id, `${CACHE}/${name}`, { created: ok === "link" });
+      else clips.linkFailed.set(id, { abs, key, path });
+    } finally {
+      this.clipLinkBusy.delete(id);
+    }
+  }
+  /** First play of a clip whose link failed: copy it (off the picture batches), then play it once it is drawn as a video. */
+  copyThenPlay(el, cx) {
+    const clips = this.clips, fileId = el.fileId;
+    this.selected = /* @__PURE__ */ new Set([el.id]);
+    const start = clips.requestCopy(el);
+    cx.notify();
+    if (!start) return;
+    const { abs, key, path } = clips.linkFailed.get(fileId);
+    const name = clipFile(key, path);
+    const ticket = this.boardGen.n;
+    const live = () => this.boardGen.current(ticket) && this.clips === clips;
+    cx.spawn(async (cx2) => {
+      let waiting = [];
+      try {
+        const copied = await copyClip(abs, `${appHome()}/${CACHE}`, name, this.clipDeps());
+        if (copied === "copy") await stampClip(`${appHome()}/${CACHE}`, name, this.clipDeps()).catch(() => {
+        });
+        if (live()) clips.keepIntent(this.selected);
+        clips.copied(fileId, `${CACHE}/${name}`, { created: copied === "copy" });
+      } catch (e5) {
+        if (live()) clips.keepIntent(this.selected);
+        console.log(`board: clip ${fileId}: ${e5?.message ?? e5}; using the GIF copy`);
+        waiting = clips.copyFailed(fileId);
+      }
+      if (!live()) return;
+      for (const id of waiting) {
+        const w4 = this.scene.getElement(id);
+        if (w4 && !w4.isDeleted) this.togglePlay(w4, cx2);
+      }
+      cx2.notify();
+    });
+  }
+  /**
+   * Per tick: records of elements no longer on the board are paused and forgotten (nothing else would clear
+   * them); a first play stands only while its element stays selected; a clip whose copy landed plays once it
+   * has been drawn as a video (videoPlay needs it on screen).
+   */
+  drainClipPlays(cx) {
+    for (const id of [...this.clips.recs.keys()]) {
+      const el = this.scene.getElement(id);
+      if (!el || el.isDeleted) this.clips.forget(id);
+    }
+    if (this.clips.held.size) this.clips.releaseHeld(new Set(this.elements().filter((e5) => e5.type === "image").map((e5) => e5.fileId)));
+    this.clips.keepIntent(this.selected);
+    for (const id of this.clips.due()) {
+      const el = this.scene.getElement(id);
+      if (el && this.clips.native(el)) this.toggleClip(el, cx);
+    }
+    this.restageClips();
+  }
+  /**
+   * An element is showing and its native clip is not staged (pruned after every element of that
+   * file was deleted, then undone). Link it again. A host failure, a link that already failed,
+   * and a video the host does not play stay on the GIF path. No poster yet means cacheOne still
+   * owns the first link.
+   */
+  restageClips() {
+    if (!this.videoApi || !this.clips || this.clips.closed || !this.scene?.getNonDeletedElements) return;
+    for (const e5 of this.elements()) {
+      if (e5?.type !== "image" || e5.customData?.kind !== "video" || !e5.fileId) continue;
+      const id = e5.fileId;
+      const clips = this.clips;
+      if (clips.files.has(id) || clips.linkFailed.has(id) || clips.failed.has(id) || clips.copying.has(id)) continue;
+      if (this.clipLinkBusy?.has(id)) continue;
+      if (!this.imageFiles?.has(id)) continue;
+      const f3 = this.doc?.files?.[id];
+      const pic = this.pics?.get(id);
+      if (!f3?.path || !pic?.abs || !pic?.key || !NATIVE_EXTS.includes(extOf(f3.path))) continue;
+      const file = this.file;
+      const ticket = this.boardGen.n;
+      const live = () => this.boardGen.current(ticket) && this.file === file && this.clips === clips;
+      this.linkClip(id, pic.abs, pic.key, f3.path, live);
+    }
+  }
+  /** The board drew `e` or culled it: a native clip, or one waiting on its first-play copy (a cull cancels that play). */
+  noteClipVisibility(e5, onScreen) {
+    if (this.clips.native(e5) || this.clips.staging(e5.id)) this.clips.painted(e5.id, onScreen, e5.fileId);
+  }
+  /**
+   * File ids of elements still on the board, or null when this pane has no scene yet
+   * (a clip cannot be matched to an element, so picture keys are kept as before).
+   */
+  shownFileIds() {
+    if (!this.scene) return null;
+    const ids = /* @__PURE__ */ new Set();
+    for (const e5 of this.elements()) if (e5?.fileId) ids.add(e5.fileId);
+    return ids;
+  }
+  /**
+   * Keys this pane is staging or still playing. With an element list, a file no element shows
+   * does not count: deleting the asset must not leave its clip (or a replaced key held for it) in the cache.
+   */
+  clipExtraKeys(shown = this.shownFileIds()) {
+    const extra = /* @__PURE__ */ new Set();
+    const add = (fileId, key) => {
+      if (key && (shown == null || shown.has(fileId))) extra.add(key);
+    };
+    if (shown == null) {
+      for (const k3 of this.clips.stagedKeys()) extra.add(k3);
+      for (const f3 of this.clips.linkFailed.values()) if (f3.key) extra.add(f3.key);
+      return extra;
+    }
+    for (const [fileId, rel] of this.clips.files) add(fileId, clipKey(rel));
+    for (const [fileId, keys] of this.clips.held) for (const k3 of keys) add(fileId, k3);
+    for (const [fileId, f3] of this.clips.linkFailed) add(fileId, f3?.key);
+    return extra;
+  }
+  /** Staging time of one cache name: its stamp if present, else its own mtime. Null when stat cannot say. */
+  async clipMtime(dir, name) {
+    try {
+      const r2 = await exec("sh", ["-c", RECOVERY_MTIME_SH, "sh", `${dir}/${name}`]);
+      return recoveryMtimeMs(r2?.stdout, r2?.code ?? 1);
+    } catch {
+      return null;
+    }
+  }
+  /**
+   * Removes clips this board no longer needs.
+   * A key this pane replaced goes once nothing here still plays it. A key left by an earlier
+   * session (or a clip whose asset was deleted) goes when it carries this board's prefix, nothing
+   * in the document or the loaded pictures still needs it, and it is older than the grace window.
+   * A younger one stays, so a clip another pane just staged is left alone. Two panes share the prefix.
+   */
+  async pruneClips(ticket) {
+    const dir = `${appHome()}/${CACHE}`;
+    let listed;
+    try {
+      listed = await fs2.readdir(dir);
+    } catch {
+      return;
+    }
+    if (!this.boardGen.current(ticket)) return;
+    const names = listed.map((e5) => typeof e5 === "string" ? e5 : e5?.name).filter((n2) => typeof n2 === "string");
+    const shown = this.shownFileIds();
+    const files = this.doc?.files;
+    const { referenced, unresolved } = clipReferences({
+      files: files && typeof files === "object" ? files : {},
+      pics: this.pics,
+      shown,
+      extra: this.clipExtraKeys(shown),
+      trustPics: files == null
+    });
+    const retired = new Set(this.clips.retiredKeys());
+    const prefix = cacheKey(this.file, "x", 0, 0).split("_")[0];
+    const mtimes = /* @__PURE__ */ new Map();
+    for (const n2 of clipMtimeNames(names, { prefix, referenced, unresolved, retired })) {
+      mtimes.set(n2, await this.clipMtime(dir, n2));
+      if (!this.boardGen.current(ticket)) return;
+    }
+    const drop = clipNamesToDrop(names, {
+      prefix,
+      retired,
+      referenced,
+      unresolved,
+      now: Date.now(),
+      graceMs: CLIP_GRACE_MS,
+      ageOf: (n2) => clipStagedAt(n2, mtimes)
+    });
+    for (const n2 of drop) {
+      const key = clipNameKey(n2);
+      if (key && this.clipExtraKeys(shown).has(key)) continue;
+      const id = key ? clipKeyParts(key)?.fileId : null;
+      await fs2.unlink(`${dir}/${n2}`).catch(() => {
+      });
+      await fs2.unlink(`${dir}/${clipStamp(n2)}`).catch(() => {
+      });
+      if (shown && id && !shown.has(id)) {
+        if (clipKey(this.clips.files.get(id)) === key) this.clips.files.delete(id);
+        this.clips.held.delete(id);
+      }
+    }
+    const still = this.clips.stagedKeys();
+    for (const k3 of retired) if (!still.has(k3)) this.clips.owned.delete(k3);
+  }
+  /** Clips the host could not play start their GIF copy instead (the user had pressed play). */
+  drainFallbacks(cx) {
+    const ids = this.fallbacks.splice(0);
+    for (const id of ids) {
+      const el = this.scene.getElement(id);
+      if (el && !el.isDeleted && !this.playing.has(id)) this.togglePlay(el, cx);
     }
   }
   /**
@@ -6355,6 +7184,11 @@ var Board = class extends View {
       return;
     }
     if (!this.preparing && Object.keys(this.doc.files ?? {}).some((id) => !this.imageFiles.has(id) && (this.tries.get(id) ?? 0) < TIER_TRIES)) this.prepareImages(cx);
+    this.drainClipPlays(cx);
+    for (const id of this.selected) {
+      const el = this.scene.getElement(id);
+      if (el && this.clips.native(el)) this.clips.watch(el, this.clipListener(cx));
+    }
     if (!this.preparing) this.buildTiers(cx);
     if (this.swapUntil && Date.now() > this.swapUntil) {
       this.swapUntil = 0;
@@ -6391,6 +7225,7 @@ var Board = class extends View {
       this.lastText = text;
       if (this.saveAt === seq) this.dirty = false;
       this.saveError = null;
+      if (!this.dirty && this.unsavedKept) this.dropUnsaved();
       ok = saveCommitted({ dirty: this.dirty, adoptedExternal: false });
     } catch (e5) {
       const disk = await readTextFile(this.file).catch(() => null);
@@ -6402,8 +7237,10 @@ var Board = class extends View {
         adoptedExternal = !this.dirty;
       } else {
         const message = String(e5?.message ?? e5);
+        const kept = await this.keepRecovery("unsaved", text);
         if (this.saveError !== message) {
-          notify({ title: "Board: save failed", body: message, level: "error" });
+          const where = kept ? `Your edits are kept in ${tildify2(kept)}.` : "The recovery copy could not be written.";
+          notify({ title: "Board: save failed", body: `${message} ${where}`, level: "error" });
         }
         this.saveError = message;
       }
@@ -6420,7 +7257,103 @@ var Board = class extends View {
     this.closed = true;
     if (this.editing) this.endEdit(cx, {});
     this.endAbandonedGesture(cx);
-    if (this.dirty && this.status === "ready") await this.save(cx);
+    if (!(this.dirty && this.status === "ready")) return;
+    this.keepRecovery("unsaved");
+    const kept = this.recoveryWrite;
+    await Promise.all([this.save(cx), kept]);
+    await this.recoveryWrite;
+  }
+  /**
+   * Writes the board as it is now (or `text`) to recovery/ under the app home.
+   * Resolves to that path once the copy is on disk, or null when the write itself failed
+   * (the folder could not be created, or the file could not be written). A later prune of
+   * older conflict copies is not the write: the path is still returned when the copy landed.
+   * "unsaved" is one file per board, removed after a save that lands and when the disk version is
+   * adopted (`retireUnsaved`, only after this write succeeds). Conflict copies are capped.
+   */
+  keepRecovery(tag, text = null, { retireUnsaved = false } = {}) {
+    const path = recoveryPath(appHome(), this.file, tag);
+    const file = this.file;
+    const dir = dirname2(path);
+    const body = text ?? serializeDocument({ ...this.doc, elements: this.scene.getElementsIncludingDeleted() });
+    if (tag === "unsaved") this.unsavedKept = path;
+    const retire = retireUnsaved ? this.unsavedKept : null;
+    if (retire) this.unsavedKept = null;
+    const archive = tag.startsWith("conflict-");
+    this.recoveryWrite = Promise.resolve(this.recoveryWrite).then(async () => {
+      try {
+        await fs2.mkdir(dir, { recursive: true });
+        await fs2.writeFile(path, body);
+      } catch (e5) {
+        console.log(`board: recovery copy: ${e5?.message ?? e5}`);
+        return null;
+      }
+      if (retire) await fs2.unlink(retire).catch(() => {
+      });
+      if (archive) {
+        try {
+          await this.tidyRecovery(dir, file);
+        } catch (e5) {
+          console.log(`board: recovery copy: ${e5?.message ?? e5}`);
+        }
+      }
+      return path;
+    });
+    return this.recoveryWrite;
+  }
+  dropUnsaved() {
+    const path = this.unsavedKept;
+    if (!path) return;
+    this.unsavedKept = null;
+    this.recoveryWrite = Promise.resolve(this.recoveryWrite).then(() => fs2.unlink(path)).catch(() => {
+    });
+  }
+  /** Prune recovery/ for every board. `diskText` is this board's file (null when it has none); omit it to skip the content check. */
+  queueRecoveryTidy(diskText) {
+    const file = this.file;
+    const dir = recoveryDir(appHome());
+    this.recoveryWrite = Promise.resolve(this.recoveryWrite).then(() => this.tidyRecovery(dir, file, diskText)).catch((e5) => console.log(`board: recovery tidy: ${e5?.message ?? e5}`));
+  }
+  async tidyRecovery(dir, file, diskText) {
+    let listed;
+    try {
+      listed = await fs2.readdir(dir);
+    } catch {
+      return;
+    }
+    const names = listed.map((e5) => typeof e5 === "string" ? e5 : e5?.name).filter((n2) => typeof n2 === "string" && parseRecoveryName(n2));
+    const entries = [];
+    for (const name of names) {
+      let mtimeMs = null;
+      try {
+        const r2 = await exec("sh", ["-c", RECOVERY_MTIME_SH, "sh", `${dir}/${name}`]);
+        mtimeMs = recoveryMtimeMs(r2?.stdout, r2?.code ?? 1);
+      } catch {
+      }
+      entries.push({ name, mtimeMs });
+    }
+    const key = recoveryBoardKey(file);
+    let unsavedText = null;
+    let unsavedUnreadable = false;
+    if (diskText !== void 0) {
+      const unsavedName = `${key}.unsaved.board`;
+      if (names.includes(unsavedName)) {
+        try {
+          const raw = await fs2.readFile(`${dir}/${unsavedName}`, "utf8");
+          unsavedText = typeof raw === "string" ? raw : String(raw);
+        } catch {
+          unsavedUnreadable = true;
+        }
+      }
+    }
+    const protectName = this.unsavedKept === `${dir}/${key}.unsaved.board` ? `${key}.unsaved.board` : null;
+    const drop = recoveryFilesToDrop(entries, {
+      now: Date.now(),
+      current: diskText === void 0 ? null : { key, diskText, unsavedText, unsavedUnreadable },
+      protectName
+    });
+    for (const name of drop) await fs2.unlink(`${dir}/${name}`).catch(() => {
+    });
   }
   // ---- rendering ---------------------------------------------------------------------
   shapeOptions() {
@@ -6515,9 +7448,22 @@ var Board = class extends View {
     const vz = this.vz;
     const view = this.viewBox();
     const out = [];
+    this.clips.beginPaint();
     for (const e5 of this.elements()) {
       if (e5.type !== "image" || !this.imageFiles.has(e5.fileId)) continue;
-      if (e5.x > view[2] || e5.x + e5.width < view[0] || e5.y > view[3] || e5.y + e5.height < view[1]) continue;
+      const clip = this.clips.native(e5);
+      if (e5.x > view[2] || e5.x + e5.width < view[0] || e5.y > view[3] || e5.y + e5.height < view[1]) {
+        this.noteClipVisibility(e5, false);
+        continue;
+      }
+      if (!clip) this.noteClipVisibility(e5, true);
+      if (clip) {
+        this.noteClipVisibility(e5, true);
+        const bar = this.clips.bar(e5.id, this.selected.has(e5.id));
+        out.push(this.clips.element(e5, bar).absolute().left(e5.x * vz).top(e5.y * vz).w(e5.width * vz).h(e5.height * vz));
+        if (!bar) out.push(...this.clipControls(e5));
+        continue;
+      }
       const media = isMedia(e5);
       const anim = media && this.playing.has(e5.id) ? this.anim.get(e5.fileId) : null;
       const still = this.drawnFile(e5);
@@ -6526,6 +7472,7 @@ var Board = class extends View {
       out.push(image(file).absolute().left(e5.x * vz).top(e5.y * vz).w(e5.width * vz).h(e5.height * vz));
       if (media) out.push(...this.mediaControls(e5, anim));
     }
+    this.clips.endPaint();
     return out;
   }
   /** The play button's diameter in layout px: fixed on screen, smaller only on a tiny picture. */
@@ -6540,7 +7487,7 @@ var Board = class extends View {
     const vz = this.vz;
     const cx = (e5.x + e5.width / 2) * vz, cy = (e5.y + e5.height / 2) * vz;
     const playing = this.playing.has(e5.id);
-    if (playing && anim?.state === "building") {
+    if (playing && anim?.state === "building" || this.clips.staging(e5.id)) {
       return [div2().absolute().left(cx - 48).top(cy - 13).w(96).h(26).rounded(13).bg(bg).flex().items_center().justify_center().text_size(12).text_color(fg).child("preparing\u2026")];
     }
     const d2 = this.playSize(e5);
@@ -6551,12 +7498,38 @@ var Board = class extends View {
     const badge = div2().absolute().left((e5.x + e5.width) * vz - 8 - bw).top((e5.y + e5.height) * vz - 8 - 20).w(bw).h(20).rounded(5).bg(bg).flex().items_center().justify_center().text_size(11).text_color(fg).child(label);
     return [button("play"), badge];
   }
+  /** What sits on a clip the host plays when its bar is off (paused, not selected): play button, badge, and a progress line once it has run. */
+  clipControls(e5) {
+    const t2 = theme();
+    const bg = `${hex(t2.background, "#000000")}b3`;
+    const fg = hex(t2.foreground, "#ffffff");
+    const vz = this.vz;
+    const cx = (e5.x + e5.width / 2) * vz, cy = (e5.y + e5.height / 2) * vz;
+    const d2 = this.playSize(e5);
+    const button = (icon) => div2().absolute().left(cx - d2 / 2).top(cy - d2 / 2).w(d2).h(d2).rounded(d2 / 2).bg(bg).border(1.5).border_color(`${fg}8c`).flex().items_center().justify_center().child(svg(`${ICONS}/${icon}.svg`).size(Math.round(d2 * 0.45)).text_color(fg));
+    const out = [];
+    const p3 = this.clips.progress(e5.id);
+    if (p3 != null) {
+      const w4 = e5.width * vz, left = e5.x * vz, top = (e5.y + e5.height) * vz - 3;
+      out.push(div2().absolute().left(left).top(top).w(w4).h(3).bg(bg));
+      out.push(div2().absolute().left(left).top(top).w(w4 * p3).h(3).bg(sel()));
+    }
+    const label = mediaLabel(e5.customData?.kind, this.clips.duration(e5.id) ?? this.doc.files?.[e5.fileId]?.duration);
+    const bw = lineWidth(label, 11) + 14;
+    out.push(button("play"), div2().absolute().left((e5.x + e5.width) * vz - 8 - bw).top((e5.y + e5.height) * vz - 8 - 20).w(bw).h(20).rounded(5).bg(bg).flex().items_center().justify_center().text_size(11).text_color(fg).child(label));
+    return out;
+  }
+  /** True while `e` plays, natively or as its GIF copy. */
+  isPlaying(e5) {
+    return this.playing.has(e5.id) || this.clips.playing(e5.id);
+  }
   /** The media element whose play/stop button is under a pointer position (GPUI px), if it is showing. */
   playButtonAt(local) {
     const z3 = this.herdrZoom(), s2 = this.scale();
     for (const e5 of this.elements()) {
       if (!isMedia(e5) || !this.imageFiles.has(e5.fileId)) continue;
-      if (this.playing.has(e5.id) && !(this.hoverId === e5.id || this.selected.has(e5.id))) continue;
+      if (this.isPlaying(e5) && !(this.hoverId === e5.id || this.selected.has(e5.id))) continue;
+      if (this.clips.native(e5) && this.clips.bar(e5.id, this.selected.has(e5.id))) continue;
       const cx = (e5.x + e5.width / 2 + this.scrollX) * s2, cy = (e5.y + e5.height / 2 + this.scrollY) * s2;
       if (Math.hypot(local.x - cx, local.y - cy) <= this.playSize(e5) / 2 * z3 + 4) return e5;
     }
@@ -6565,12 +7538,15 @@ var Board = class extends View {
   // ---- play and stop -------------------------------------------------------------------
   /** Play or stop one picture. Starting one stops any other. Nothing plays unless the user starts it. */
   togglePlay(el, cx) {
+    if (this.clips.native(el)) return this.toggleClip(el, cx);
+    if (this.clips.needsCopy(el)) return this.copyThenPlay(el, cx);
     if (this.playing.has(el.id)) {
       this.playing.delete(el.id);
       this.playTickets.delete(el.id);
       cx.notify();
       return;
     }
+    this.clips.pauseAll();
     this.playing = /* @__PURE__ */ new Set([el.id]);
     const request = ++this.playSeq;
     this.playTickets = /* @__PURE__ */ new Map([[el.id, request]]);
@@ -6606,12 +7582,35 @@ var Board = class extends View {
       cx2.notify();
     });
   }
+  /** Starts the event loop of one clip (on the board that is current now). */
+  clipListener(cx) {
+    const clips = this.clips, ticket = this.boardGen.n;
+    const alive = () => this.boardGen.current(ticket) && this.clips === clips;
+    return (id, fileId) => cx.spawn(async (cx2) => clips.listen(id, fileId, alive, () => {
+      this.drainFallbacks(cx2);
+      cx2.notify();
+    }));
+  }
+  /**
+   * Play or pause a clip the host plays. Starting one stops any other, the GIF copies too.
+   * A play that does not start (culled, not drawn yet, or dropped) leaves the GIF and the selection as they are.
+   */
+  toggleClip(el, cx) {
+    const started = this.clips.toggle(el, this.clipListener(cx));
+    if (started && this.clips.playing(el.id)) {
+      this.playing = /* @__PURE__ */ new Set();
+      this.playTickets = /* @__PURE__ */ new Map();
+      this.selected = /* @__PURE__ */ new Set([el.id]);
+    }
+    this.drainFallbacks(cx);
+    cx.notify();
+  }
   /** Runs a command-line tool; Herdr's PATH may not have Homebrew's folders, so those are tried too. */
   async tool(name, args) {
     return exec(await this.toolPath(name), args);
   }
   async probeDuration(src) {
-    const r2 = await this.tool("ffprobe", ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", src]);
+    const r2 = await this.tool("ffprobe", ffprobeArgs(src));
     const d2 = parseFloat(r2.stdout);
     return d2 >= 0 ? d2 : null;
   }
@@ -6932,10 +7931,10 @@ var Board = class extends View {
         continue;
       }
       try {
-        await exec("mkdir", ["-p", dir]);
         const id = makeId();
         const name = `${id}.${extOf(src)}`;
-        const cp = await exec("cp", [src, `${dir}/${name}`]);
+        const cp = await exec(...importArgv(file, name, src));
+        if (cp.code === ASSET_REFUSED) throw new Error("the board's assets folder is not a plain folder beside the board");
         if (cp.code !== 0) throw new Error(cp.stderr.trim() || "cp failed");
         const entry = { path: relAssetFor(file, name), kind };
         await this.cacheOne(id, entry, ticket);
@@ -6977,7 +7976,7 @@ var Board = class extends View {
     const here = () => this.boardGen.current(bound.ticket) && this.file === bound.file;
     cx.spawn(async (cx2) => {
       try {
-        const files = (await this.clip("files")).stdout.split("\n").filter(Boolean);
+        const files = parsePathList((await this.clip("files")).stdout);
         if (!here()) return;
         if (files.length) return this.importAsync(files, cx2, bound);
         await fs2.mkdir(`${appHome()}/${CACHE}`, { recursive: true });
@@ -7027,7 +8026,7 @@ var Board = class extends View {
         }
       }
       if (!paths.length) return;
-      const r2 = asFile ? await this.clip("putfile", paths.join("\n")) : await this.clip("put", paths[0]);
+      const r2 = asFile ? await this.clip("putfile", JSON.stringify(paths)) : await this.clip("put", paths[0]);
       if (r2.code !== 0) this.say("Board: copy failed", r2.stderr.trim(), "error");
       else this.say("Board", asFile ? `Copied ${paths.length} file${paths.length > 1 ? "s" : ""}` : "Copied image");
     });
@@ -7074,8 +8073,8 @@ var Board = class extends View {
           if (!el || el.isDeleted) continue;
           const fileId = makeId();
           const name = `${fileId}.png`;
-          const args = how === "flip" ? ["-f", "horizontal"] : ["-m", GRAY_PROFILE];
-          const r2 = await exec("sips", [...args, "-s", "format", "png", src, "--out", `${assetsDirFor(file)}/${name}`]);
+          const r2 = await exec(...deriveArgv(file, name, how, src, GRAY_PROFILE));
+          if (r2.code === ASSET_REFUSED) throw new Error("the board's assets folder is not a plain folder beside the board");
           if (r2.code !== 0) throw new Error(r2.stderr.trim() || "sips failed");
           if (!this.boardGen.current(ticket)) return;
           el = this.scene.getElement(elementId);
@@ -7118,8 +8117,8 @@ var Board = class extends View {
   /** The image button: pick files in the system dialog. */
   pickImages(cx) {
     cx.spawn(async (cx2) => {
-      const r2 = await exec("osascript", ["-e", CHOOSE_FILES]).catch(() => null);
-      const paths = (r2?.stdout ?? "").split("\n").filter(Boolean);
+      const r2 = await exec("osascript", ["-l", "JavaScript", "-e", CHOOSE_FILES]).catch(() => null);
+      const paths = r2?.code === 0 ? parsePathList(r2.stdout) : [];
       if (paths.length) await this.importAsync(paths, cx2);
     });
   }
@@ -7700,9 +8699,9 @@ var Board = class extends View {
       return;
     }
     const ptr = this.pointer;
-    if (!ptr && this.playing.size && e5.local_position) {
+    if (!ptr && (this.playing.size || this.clips.anyPlaying()) && e5.local_position) {
       const over = this.hit(this.toScene(e5.local_position));
-      const id = over && this.playing.has(over.id) ? over.id : null;
+      const id = over && this.isPlaying(over) ? over.id : null;
       if (id !== this.hoverId) {
         this.hoverId = id;
         cx.notify();
@@ -8180,5 +9179,7 @@ var Board = class extends View {
   }
 };
 export {
+  CHOOSE_FILES,
+  CLIP_JS,
   Board as default
 };
