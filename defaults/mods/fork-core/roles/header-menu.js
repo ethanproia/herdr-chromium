@@ -5,8 +5,8 @@
 import { div, svg } from "gpui-kit";
 import { v_flex } from "gpui-base";
 import { theme, props, closeOverlay, shared, notify } from "herdr";
-import { menuRow, icon, runCopy, runPaneCopy, runHeaderAction } from "../look.js";
-import { menuHeight, headerMenuEntries, headerMenuElId, headerMenuChoose, COPY_FILE_STRIPPED } from "../pure.js";
+import { menuRow, icon, runPaneCopy, runHeaderAction } from "../look.js";
+import { menuHeight, headerMenuEntries, headerMenuElId, headerMenuChoose, beginHeaderMenuChoice } from "../pure.js";
 
 export default class HeaderMenu {
   init(_p, cx) {
@@ -23,27 +23,28 @@ export default class HeaderMenu {
 
   choose(entry, cx) {
     const p = props() ?? {};
-    const step = headerMenuChoose(entry, this.busy, COPY_FILE_STRIPPED);
-    // A note copy flushes the open note first, so this view stays up until that handshake finishes.
-    // busy blocks click and Enter for the whole handshake: a second flush would replace notepad.flushReq.
+    const step = headerMenuChoose(entry, this.busy);
+    // Every copy, not only the note flush, stays up until its promise settles. Closing first
+    // can tear this view down and drop the clipboard write. busy blocks click and Enter for
+    // that wait: a second note flush would replace notepad.flushReq.
     if (step === "ignore") return;
-    if (step === "hold") {
-      this.busy = true;
-      runPaneCopy(entry.copy[0], entry.copy[1], p.mod, cx).then((ok) => {
-        this.busy = false;
+    if (step === "hold") this.busy = true;
+    // Copies wait across awaits, so the whole choice runs in an AsyncContext from cx.spawn
+    // (a click's cx expires at its first await).
+    const go = (cx) => beginHeaderMenuChoice(step, {
+      copy: () => runPaneCopy(entry.copy?.[0], entry.copy?.[1], p.mod, cx).then((ok) => {
         if (ok) notify({ title: "Copied", timeout: 1500 });
-        closeOverlay(p.overlay);
-      }, () => {
+      }),
+      action: () => runHeaderAction(entry.action, { pane: p.pane, mod: p.mod }),
+      close: () => {
         this.busy = false;
-      });
-      return;
-    }
-    closeOverlay(p.overlay);
-    if (entry.kind === "copy") {
-      runCopy(entry.copy[0], entry.copy[1]).then((ok) => { if (ok) notify({ title: "Copied", timeout: 1500 }); });
-      return;
-    }
-    runHeaderAction(entry.action, { pane: p.pane, mod: p.mod });
+        closeOverlay(p.overlay);
+      },
+      sleep: cx ? (ms) => cx.sleep(ms) : undefined,
+    });
+    const settle = (pending) => { if (pending && typeof pending.catch === "function") pending.catch(() => { this.busy = false; }); };
+    if (cx?.spawn) cx.spawn(async (cx) => { try { await go(cx); } catch { this.busy = false; } });
+    else settle(go(undefined));
   }
 
   render() {
@@ -68,7 +69,7 @@ export default class HeaderMenu {
         if (e.key === "down") this.at = (this.at + 1) % list.length;
         else if (e.key === "up") this.at = (this.at + list.length - 1) % list.length;
         else if (e.key === "enter") {
-          if (headerMenuChoose(list[this.at], this.busy, COPY_FILE_STRIPPED) === "ignore") return;
+          if (headerMenuChoose(list[this.at], this.busy) === "ignore") return;
           this.choose(list[this.at], cx);
         }
         else return;

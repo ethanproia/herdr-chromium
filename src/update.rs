@@ -405,7 +405,12 @@ fn version_of(app: &Path) -> Option<String> {
     if !out.status.success() {
         return None;
     }
-    text.trim().strip_prefix("herdr-app ").map(str::to_owned)
+    let text = text.trim();
+    // HERDR: a fork build says "<brand> <version> (Herdr <base>, <sha>)".
+    text.strip_prefix("herdr-app ").map(str::to_owned).or_else(|| {
+        let rest = text.strip_prefix(crate::brand::NAME)?.strip_prefix(' ')?;
+        Some(rest.split_whitespace().next()?.to_owned())
+    })
 }
 
 /// `a` is a later version than `b` (semver; `0.2.0-rc.1` comes before `0.2.0`).

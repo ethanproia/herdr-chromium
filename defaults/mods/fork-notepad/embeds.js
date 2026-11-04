@@ -8,7 +8,7 @@
 import { div, image } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { exec, readTextFile, home, appHome, run } from "herdr";
-import { parseMeta, hashKey, extOf, isRemote, excerpt, lineOf, fit, cover, clampText, domainOf, cacheGet, cacheSet, FAIL_TTL, isSafeFetchUrl, CURL_SAFE, fetchHops } from "./embeds-core.js";
+import { parseMeta, hashKey, extOf, isRemote, excerpt, lineOf, fit, cover, clampText, domainOf, cacheGet, cacheSet, FAIL_TTL, isSafeFetchUrl, CURL_SAFE, CURL_BODY_SCRIPT, fetchHops, pinArgs, ipsFromDig, digArgs, RESOLVE_ERROR, loadFailure } from "./embeds-core.js";
 import { openableUrl } from "./rows.js";
 
 const FILE_RECHECK_MS = 2000;
@@ -18,6 +18,14 @@ const MAX_IMG_H = 520;
 
 const expand = (p) => (p.startsWith("~/") ? home() + p.slice(1) : p);
 const keyOf = (e) => e.kind + ":" + (e.src || e.url || e.path);
+
+// Every address the name resolves to (A and AAAA), for pinArgs.
+async function lookup(host) {
+  const out = await Promise.all(["A", "AAAA"].map((t) => exec("dig", digArgs(host, t)).catch(() => null)));
+  return out.flatMap((r) => (r && r.code === 0 ? ipsFromDig(r.stdout) : []));
+}
+const pin = (u) => pinArgs(u, lookup);
+const IMG_CAP = 20 * 1024 * 1024;   // a remote image larger than this is not downloaded
 
 async function dims(path) {
   try {
@@ -38,10 +46,11 @@ async function cached(url) {
     if (!d) {
       await exec("mkdir", ["-p", `${appHome()}/${CACHE_REL}`]);
       // Each redirect is checked before it is followed; -w prints the next hop (the body goes to the file).
-      const got = await fetchHops(url, async (u) => {
-        const r = await exec("curl", ["-s", ...CURL_SAFE, "-m", "10", "-o", abs, "-w", "%{redirect_url}", "--", u]);
+      const got = await fetchHops(url, async (u, extra) => {
+        const r = await exec("curl", ["-q", "-s", ...CURL_SAFE, ...extra, "-m", "10", "--max-filesize", String(IMG_CAP), "-o", abs, "-w", "%{redirect_url}", "--", u]);
         return { redirect: r?.stdout ?? "", result: r };
-      });
+      }, undefined, pin);
+      if (got?.error === RESOLVE_ERROR) { await exec("rm", ["-f", abs]); return { error: RESOLVE_ERROR }; }
       d = got ? await dims(abs) : null;
       if (!d) { await exec("rm", ["-f", abs]); return null; }   // not an image (html error page etc.)
     }
@@ -59,7 +68,8 @@ async function load(e, cx) {
   if (e.kind === "image") {
     if (isRemote(e.src)) {
       const c = await cached(e.src);
-      return c ? { ok: true, ...c } : { ok: false, why: "Could not load image" };
+      if (c?.error === RESOLVE_ERROR) return { ok: false, why: RESOLVE_ERROR };
+      return c?.path ? { ok: true, ...c } : { ok: false, why: "Could not load image" };
     }
     const path = expand(e.src);
     const d = await dims(path);
@@ -69,19 +79,27 @@ async function load(e, cx) {
     let meta = { title: "", description: "", image: "", favicon: "", domain: domainOf(e.url) };
     try {
       // curl, not fetch: fetch can't be aborted here and buffers the whole body. 5 s cap, refuse bodies declared
-      // over 5 MB, and stop reading at FETCH_CAP (head closes the pipe). The URL is an argument, never shell text.
+      // over 5 MB, and keep only the first FETCH_CAP bytes. The shell exits with curl's status, so a connect
+      // failure still tries the next pinned address. The URL is an argument, never shell text.
       // Only public http(s) pages (no file://, no localhost or LAN services), redirects included.
       // Redirects too: curl doesn't follow them; fetchHops checks each hop first (%{redirect_url} goes to stderr).
-      const got = await fetchHops(e.url, async (u) => {
-        const r = await withTimeout(exec("sh", ["-c", `curl -s ${CURL_SAFE.join(" ")} -m 5 --max-filesize 5242880 -w '%{stderr}%{redirect_url}' -- "$1" | head -c "$2"`, "sh", u, String(FETCH_CAP)]), FETCH_MS + 1000, cx);
+      const got = await fetchHops(e.url, async (u, extra) => {
+        // curl's arguments go through "$@" (CURL_SAFE has a "*" the shell must not expand).
+        const args = ["-q", "-s", ...CURL_SAFE, ...extra, "-m", "5", "--max-filesize", "5242880", "-w", "%{stderr}%{redirect_url}", "--", u];
+        const r = await withTimeout(exec("sh", ["-c", CURL_BODY_SCRIPT, "sh", String(FETCH_CAP), ...args]), FETCH_MS + 1000, cx);
         return { redirect: r?.stderr ?? "", result: r };
-      });
-      if (!got) throw new Error("not a public web address");
+      }, undefined, pin);
+      const why = loadFailure(got);
+      // A lookup with no address is its own failure, remembered briefly. A refused address still falls
+      // through to the card (the url stays visible) the way an offline fetch does.
+      if (why === RESOLVE_ERROR) return { ok: false, why };
+      if (why) throw new Error(why);
       const html = got.result && typeof got.result.stdout === "string" ? got.result.stdout : "";
       meta = parseMeta(html.slice(0, FETCH_CAP), got.url);
     } catch { /* offline or slow: the card still shows the url */ }
     const [thumb, icon] = await Promise.all([meta.image ? cached(meta.image) : null, meta.favicon ? cached(meta.favicon) : null]);
-    return { ok: true, ...meta, thumb, icon };
+    const shown = (img) => (img?.path ? img : null);
+    return { ok: true, ...meta, thumb: shown(thumb), icon: shown(icon) };
   }
   if (e.kind === "file") {
     const path = expand(e.path);

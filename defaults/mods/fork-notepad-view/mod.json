@@ -4,8 +4,8 @@
   "version": "0.1.0",
   "source": {
     "repo": "essexlabs/labs",
-    "branch": "ethan/herdr-mods",
-    "commit": "06cb848eb980cf99fc4c4f238c75141bee540cf4",
+    "branch": "main",
+    "commit": "ec71dee685393fa2476e4c75eb1c0d864d418f0c",
     "path": "projects/herdr-mods/notepad-view"
   }
 }
