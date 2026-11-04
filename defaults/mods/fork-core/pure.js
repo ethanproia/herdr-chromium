@@ -111,6 +111,26 @@ export function headerMenuElId(entry) {
   return entry?.kind === "copy" ? "hm-copy" : `hm-act-${entry?.id}`;
 }
 
+// What one header-menu choose does. A stripped note copy ("hold") leaves the popup
+// up for the flush handshake. A second choose in that window ("ignore") must not
+// start another flush: both click and Enter share this, and a new flush would
+// overwrite notepad.flushReq so the first handshake can miss its ack. Every other
+// row ("run") closes the popup and runs immediately. `busy` is the menu's flag.
+export function headerMenuChoose(entry, busy, strippedScript) {
+  if (busy) return "ignore";
+  if (entry?.kind === "copy" && entry.copy?.[0] === strippedScript) return "hold";
+  return "run";
+}
+
+// The wide Copy button. A stripped note file holds the button until its flush
+// finishes; a second click in that window must not start. A copy that does not
+// flush is not held, so it still runs on the first click. Nothing runs when
+// there is no source, or while a note flush already owns the button.
+export function paneNoteCopyClaim(src, copying, strippedScript) {
+  if (!src || copying) return { start: false, hold: false };
+  return { start: true, hold: src[0] === strippedScript };
+}
+
 // Rows in the narrow-pane ••• menu: Copy (when the plan produced a script), then each real header action.
 // A button with no typed action is left out; Copy is left out when there is nothing to copy.
 export function headerMenuEntries(header, copy) {

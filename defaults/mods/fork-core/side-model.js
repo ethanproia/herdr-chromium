@@ -1,7 +1,8 @@
 // Pure model for the side panel strip: no herdr imports, runs under node.
 
 export const BODY = "panel-body";
-export const DEFAULT_PINS = ["files", "changes"];
+// Nothing is pinned until the person pins it (Ethan: Files and Changes are not always-on; pin via right-click).
+export const DEFAULT_PINS = [];
 
 export function find(node, id) {
   if (node?.id === id) return node;

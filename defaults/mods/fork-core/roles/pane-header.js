@@ -10,7 +10,7 @@ import { SELF } from "../self.js";
 import { fadeLabel, over } from "../scroll.js";
 import { icon, runPaneCopy, runHeaderAction, openRegistry, watchRegistry, REGISTRY_WAKE } from "../look.js";
 import { normalizeTool, FALLBACKS } from "../registry.js";
-import { copyPlan, copySpecFor, headerDirPath, headerMenuEntries, menuHeight, toolHeaderElId } from "../pure.js";
+import { copyPlan, copySpecFor, headerDirPath, headerMenuEntries, menuHeight, toolHeaderElId, paneNoteCopyClaim, COPY_FILE_STRIPPED } from "../pure.js";
 
 // "remote-desktop" -> "Remote desktop", "fork-browser" -> "Browser".
 export const properName = (mod) => { const m = String(mod).replace(/^fork-/, "").replace(/[-_]+/g, " ").trim(); return m.charAt(0).toUpperCase() + m.slice(1); };
@@ -44,7 +44,7 @@ function viewedFile(p) {
 
 export default class PaneHeader {
   init(_p, cx) {
-    this.hovered = false; this.w = 9999; this.copied = false;
+    this.hovered = false; this.w = 9999; this.copied = false; this.copying = false;
     this.reg = openRegistry();
     this.stopRegistry = watchRegistry(cx);
   }
@@ -65,11 +65,18 @@ export default class PaneHeader {
 
   // The Copy button: the copy never passes the text through argv, and "Copied" shows only when it succeeded.
   copy(src, cx) {
-    if (!src) return;
+    const claim = paneNoteCopyClaim(src, this.copying, COPY_FILE_STRIPPED);
+    if (!claim.start) return;
+    // A note flush shares one notepad.flushReq. Hold the button until this one finishes
+    // so a second click cannot replace the request the first handshake is waiting on.
+    if (claim.hold) this.copying = true;
     runPaneCopy(src[0], src[1], this.me()?.mod, cx).then((ok) => {
+      if (claim.hold) this.copying = false;
       this.copied = ok;
       cx.notify();
       if (ok) cx.timer.after(1200, (cx) => { this.copied = false; cx.notify(); });
+    }, () => {
+      if (claim.hold) this.copying = false;
     });
   }
 

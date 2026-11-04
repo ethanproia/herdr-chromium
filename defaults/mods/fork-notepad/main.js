@@ -837,34 +837,40 @@ export default class Notes extends View {
     return Popup.new("slash", holder).anchor("top_left").when(Boolean(menu), (el) => el.content(menu));
   }
 
+  // Menu look shared with core's rows (Ethan: one step smaller): 13px names, 11px hints, 15px icons in a 16px slot,
+  // 32px rows, group labels 12px in a fixed 30px box.
+  groupLabel(t, text) {
+    return div().h(30).px(8).flex().items_center().flex_none().text_size(12).font_weight(500).text_color(t.muted).child(text);
+  }
+
   renderMenu(t) {
     const { items, at } = this.menu;
     if (this.menu.type === "at") {
       const LABEL = { date: "Date", agent: "Chat", tab: "Tab", file: "File" };
       return v_flex().id("at-menu").w(S.menuW + 40).max_h(320).mt(4).p(4).gap(1).rounded(8).border(1).border_color(t.border).bg(t.popover).shadow_md()
-        .child(div().px(8).py(6).text_size(12).font_weight(500).text_color(t.muted).child("Mention"))
+        .child(this.groupLabel(t, "Mention"))
         .when(items.length === 0, (el) => el.child(div().px(8).py(6).text_size(13).text_color(t.dim).child(this.mentions.length ? "No results" : "Loading…")))
         .children(items.map((it, k) => h_flex().id(`at-${k}`).h(32).px(8).gap(8).items_center().rounded(6).cursor_pointer()
           .when(k === at, (el) => el.bg(t.selected)).hover((s) => s.bg(t.hover))
           .on_mouse_down("left", (_e, cx) => { cx.stop_propagation(); this.mention(it, undefined, cx); })
-          .child(div().w(18).flex_none().text_size(13).child(KIND_ICON[it.kind] ?? "•"))
-          .child(div().flex_1().min_w_0().truncate().text_size(14).text_color(t.foreground).child(it.label))
-          .child(div().max_w(140).truncate().text_size(12).text_color(t.dim).child(it.hint || LABEL[it.kind]))));
+          .child(div().w(16).flex_none().text_size(13).child(KIND_ICON[it.kind] ?? "•"))
+          .child(div().flex_1().min_w_0().truncate().text_size(13).text_color(t.foreground).child(it.label))
+          .child(div().max_w(140).truncate().text_size(11).text_color(t.dim).child(it.hint || LABEL[it.kind]))));
     }
     // Notion / shadcn Command: one label, groups split by hairlines; each row = line icon, name, the markdown shortcut.
     const KEY = { p: "", h1: "#", h2: "##", h3: "###", task: "[]", bullet: "-", number: "1.", quote: ">", hr: "---" };
     const GROUP = { p: 0, h1: 0, h2: 0, h3: 0, task: 1, bullet: 1, number: 1, quote: 2, hr: 2 };
     const mono = settings().font_family;
     const list = v_flex().id("slash-menu").w(S.menuW).mt(4).p(4).rounded(8).border(1).border_color(t.border).bg(t.popover).shadow_md().font_family(FONT)
-      .child(div().px(8).pt(4).pb(6).text_size(12).font_weight(500).text_color(t.dim).child("Style"));
+      .child(this.groupLabel(t, "Style"));
     items.forEach((it, k) => {
       if (k > 0 && GROUP[it.id] !== GROUP[items[k - 1].id]) list.child(div().h(1).mx(-4).my(4).bg(t.border));
       list.child(h_flex().id(`slash-${it.id}`).h(S.menuItem).px(8).gap(10).items_center().rounded(6).cursor_pointer()
         .when(k === at, (el) => el.bg(t.hover)).hover((s) => s.bg(t.hover))
         .on_mouse_down("left", (_e, cx) => { cx.stop_propagation(); this.pick(it.id, undefined, cx); })
-        .child(svg(`mods/fork-notepad/blocks/${it.id}.svg`).size(16).flex_none().text_color(k === at ? t.foreground : t.muted))
-        .child(div().flex_1().text_size(14).text_color(t.foreground).child(it.name))
-        .child(div().text_size(12).font_family(mono).text_color(t.dim).child(KEY[it.id])));
+        .child(div().size(16).flex_none().flex().items_center().justify_center().child(svg(`mods/fork-notepad/blocks/${it.id}.svg`).size(15).text_color(k === at ? t.foreground : t.muted)))
+        .child(div().flex_1().text_size(13).text_color(t.foreground).child(it.name))
+        .child(div().text_size(11).font_family(mono).text_color(t.dim).child(KEY[it.id])));
     });
     return list;
   }
@@ -1028,8 +1034,8 @@ export default class Notes extends View {
     const lines = (this.blText ?? "").split("\n").filter((l) => parseInline(l).some((x) => x.t === "link" && want.has(x.href)));
     const plain = (l) => toPlain(l.replace(BY, ""));
     return v_flex().id("backlinks").w_full().h(200).p(4).gap(1).bg(t.popover).font_family(FONT)
-      .child(div().px(8).py(6).text_size(12).font_weight(500).text_color(t.muted).child("Mentioned in Notepad"))
-      .children(lines.map((l, k) => div().id(`bl-${k}`).px(8).py(6).rounded(6).text_size(13).text_color(t.foreground).truncate().child(plain(l))))
+      .child(this.groupLabel(t, "Mentioned in Notepad"))
+      .children(lines.map((l, k) => div().id(`bl-${k}`).h(32).px(8).flex().items_center().rounded(6).text_size(13).text_color(t.foreground).truncate().child(plain(l))))
       .when(this.blText !== null && !lines.length, (el) => el.child(div().px(8).py(6).text_size(13).text_color(t.dim).child("No mentions")));
   }
 
@@ -1042,9 +1048,9 @@ export default class Notes extends View {
         const pending = runOverlayItem(() => action(cx), () => closeOverlay(overlay), asyncWork, undefined, (ms) => cx.sleep(ms));
         if (pending && typeof pending.catch === "function") pending.catch(() => {});
       })
-      .child(svg(`mods/fork-notepad/${icon}.svg`).size(16).text_color(t.muted))
+      .child(div().size(16).flex_none().flex().items_center().justify_center().child(svg(`mods/fork-notepad/${icon}.svg`).size(15).text_color(t.muted)))
       .child(div().flex_1().text_size(13).text_color(t.foreground).child(label))
-      .when(on !== null, (el) => el.child(div().text_size(12).text_color(t.dim).child(on ? "On" : "Off")));
+      .when(on !== null, (el) => el.child(div().text_size(11).text_color(t.dim).child(on ? "On" : "Off")));
     const copy = props()?.copy, note = props()?.note !== false, copying = hasCopy(copy);
     return v_flex().id("header-menu").w_full().h(8 + 32 * ((copying ? 1 : 0) + (note ? 2 : 0))).p(4).gap(1).bg(t.popover)
       // Copy the whole pane. A terminal is read with hc first; pbcopy runs only when that read exits 0.
@@ -1054,7 +1060,7 @@ export default class Notes extends View {
       }), true)))
       .when(note, (el) => el
         .child(item("md", "md", "Markdown", this.md, () => this.toggleMd()))
-        .child(item("ex", "export", "Export…", null, () => openOverlay({ mod: SELF, kind: "popup", props: { export: true }, width: 220, height: 176 }))));
+        .child(item("ex", "export", "Export…", null, () => openOverlay({ mod: SELF, kind: "popup", props: { export: true }, width: 220, height: 180 }))));
   }
 
   renderExport() {
@@ -1063,8 +1069,8 @@ export default class Notes extends View {
       .hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.runExport(id, cx))
       .child(div().flex_1().text_size(13).text_color(t.foreground).child(label))
       .child(div().text_size(11).text_color(t.dim).child(hint));
-    return v_flex().id("export").w_full().h(176).p(4).gap(1).bg(t.popover)
-      .child(div().px(8).py(6).text_size(12).font_weight(500).text_color(t.muted).child(this.exporting ? "Exporting…" : "Export"))
+    return v_flex().id("export").w_full().h(180).p(4).gap(1).bg(t.popover)
+      .child(this.groupLabel(t, this.exporting ? "Exporting…" : "Export"))
       .child(item("copy-md", "Copy as Markdown", ""))
       .child(item("copy-text", "Copy as plain text", ""))
       .child(div().h(1).mx(4).my(4).bg(t.border))
@@ -1133,14 +1139,14 @@ export default class Notes extends View {
     const grip = handle(`grip-${i}`, svg("mods/fork-notepad/grip.svg").size(16))
       .on_mouse_down("left", (_e, cx) => { cx.stop_propagation(); this.drag = { from: i, to: i }; this.dragMoved = false; })
       .on_click((_e, cx) => { if (this.dragMoved) return; this.blockMenu = this.blockMenu === i ? -1 : i; cx.notify(); });
-    const menuItem = (id, label, what) => h_flex().id(`bm-${id}-${i}`).h(28).px(8).items_center().rounded(6).cursor_pointer()
+    const menuItem = (id, label, what) => h_flex().id(`bm-${id}-${i}`).h(32).px(8).items_center().rounded(6).cursor_pointer()
       .text_size(13).text_color(t.foreground).hover((s) => s.bg(t.hover))
       .on_mouse_down("left", (_e, cx) => { cx.stop_propagation(); this.blockAction(i, what, cx); }).child(label);
     const menu = v_flex().id(`block-menu-${i}`).w(220).mt(4).p(4).gap(1).rounded(8).border(1).border_color(t.border).bg(t.popover).shadow_md()
       .on_mouse_down_out((_e, cx) => { this.blockMenu = -1; cx.notify(); })
       .child(menuItem("del", "Delete", "delete")).child(menuItem("dup", "Duplicate", "duplicate"))
       .child(div().h(1).mx(4).my(4).bg(t.border))
-      .child(div().px(8).py(4).text_size(12).font_weight(500).text_color(t.muted).child("Turn into"))
+      .child(this.groupLabel(t, "Turn into"))
       .children(TYPES.filter((x) => x.id !== "hr").map((x) => menuItem(x.id, x.name, x.id)));
     const handles = h_flex().id(`handles-${i}`).absolute().left(this.pad - 24 * 2 - 2 - 4).top(snapPad(S.rowPad + top) + (lh - 24) / 2).gap(2)
       .on_hover((h, cx) => this.hoverAt(i, h, cx))
