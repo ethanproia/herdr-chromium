@@ -6,8 +6,11 @@
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { spaces, machines, panes, run, openOverlay, exec, hc, theme, shared, setShared, watchFolder, window, layout, settings } from "herdr";
-import { labelOf, groupByHost } from "./hosts.js";
+import { labelOf, groupByHost, remoteDesktopAllowed } from "./hosts.js";
 import { railFitPx } from "./rail.js";
+import { loadPhase, timeoutReason, pickedFolder, syncLoading, loadTimeoutPlan, railEmpty, EMPTY_COPY } from "./empty.js";
+import { spaceDropPlan } from "./drag.js";
+import { pruneGitState } from "./git-state.js";
 import { scroller, fadeLabel, over, tint } from "./scroll.js";
 // With the fork's "glass" setting the sidebar's layout background draws translucent over a blurred window; painting
 // our own opaque chrome here would hide it, so sidebar roots leave the background to the layout then.
@@ -109,11 +112,14 @@ export default class Spaces extends View {
     this.busy = {}; // pane -> an agent working or a program in front of its shell
     this.ready = {}; // machine -> its layout was readable at the last look
     this.at = {}; // space -> its where() at the last look
-    this.watching = new Set(); // local repos' git folders
+    this.watching = new Map(); // local repos' git folders -> the tag of the loop that owns the watch
     // Spaces made while this runs wait (at most a moment) for their git, so a
     // worktree appears under its repo instead of jumping there.
     this.shown = new Set(spaces().map((s) => s.id));
     this.born = {};
+    this.loadingSince = {}; // machine key ("" = this computer) -> when its list was first seen loading
+    this.loadPending = {}; // key -> stamp a one-shot timeout timer was armed for
+    this.loadNotified = {}; // key -> stamp we already redrew for, so a poll cannot redraw again
     this.pressed = null;
     this.over = null;
     this.machines = [];
@@ -124,12 +130,13 @@ export default class Spaces extends View {
     // `git status` walks the whole tree, on another machine a process there:
     // only when its answer could have changed (see `due`).
     // Live-data changes redraw this mod, and each draw runs one check (see render); this slow tick only covers
-    // what changes without a redraw. It never redraws by itself.
+    // what changes without a redraw. A load timeout arms its own one-shot timer (armLoadTimeouts); this tick
+    // redraws only if that wake was missed and the timeout is already due, once per stamp.
     cx.timer.every(5000, (cx) => this.checkNew(cx));
   }
 
   // Looks for work after a change: git to refresh, colors to assign, and when a new space may be shown.
-  // Redraws only for a deadline (below); a changed git answer redraws through refreshGit.
+  // Redraws only for a deadline (below) or a load timeout that just came due; a changed git answer redraws through refreshGit.
   // Rail: the Spaces section is as tall as its tiles plus any row stacked in that same section (the Expand
   // button on windowed macOS). Tiles alone leave the scroller short by that row, so the rail still scrolls
   // (Ethan: "this is still scrollable in rail view"). Agents gets the rest. Only while Agents is shown; the
@@ -155,6 +162,42 @@ export default class Spaces extends View {
     if (due.size) this.refreshGit(due, cx);
     this.syncColors(sp);
     this.armDeadline(sp, now, cx);
+    this.armLoadTimeouts(now, cx);
+  }
+
+  // This computer and every known machine, folded or not, with rows or not. The same set grouped() draws.
+  machineKeys() {
+    const named = new Set(this.machines.map((m) => m.name).filter(Boolean));
+    for (const s of spaces()) if (s.machine && this.shown.has(s.id)) named.add(s.machine);
+    return ["", ...named];
+  }
+
+  // Layout still loading, a connected machine with no layout yet, or a space of its own not shown yet.
+  isLoading(m) {
+    const layout = machines().find((k) => k.name === m)?.layout;
+    return layout === "loading" || (!layout && this.machines.some((k) => k.name === m && k.state === "connected"))
+      || spaces().some((s) => (s.machine ?? null) === m && !this.shown.has(s.id));
+  }
+
+  // Stamp every machine that is loading, and wake the view once when that stamp times out.
+  // The timer is armed when the stamp is new. The 5s tick does not poll a window that both loops and can miss,
+  // and a heading that is not drawn this frame still gets a stamp (or loses a stale one).
+  // Stamps come from trackAllLoading, the same helper render() uses, so the timer and the row agree.
+  armLoadTimeouts(now, cx) {
+    this.trackAllLoading(now);
+    const plan = loadTimeoutPlan(this.loadingSince, now, this.loadPending, this.loadNotified);
+    this.loadPending = plan.pending;
+    this.loadNotified = plan.notified;
+    for (const item of plan.arm) cx.timer.after(item.wait, (cx) => this.onLoadTimeout(item.key, item.since, cx));
+    if (plan.notify.length) cx.notify();
+  }
+
+  // The one-shot fired. Drop its guard first: if the timeout has flipped, armLoadTimeouts
+  // redraws once; if the timer was early, that same call arms whatever time is left.
+  onLoadTimeout(key, since, cx) {
+    if (this.loadingSince[key] !== since) return;
+    if (this.loadPending[key] === since) delete this.loadPending[key];
+    this.armLoadTimeouts(Date.now(), cx);
   }
 
   // A new space waits for its git (so a worktree appears under its repo), but never longer than GRACE_MS from when
@@ -201,6 +244,18 @@ export default class Spaces extends View {
     const due = new Set([...keys].filter((k) => !(k in this.git)));
     for (const [id, k] of Object.entries(at)) if (this.at[id] && this.at[id] !== k && keys.has(k)) due.add(k);
     this.at = at;
+    // Forget places no space is in. A remote machine that is still listed and not layout-ready
+    // is missing its spaces while it reconnects, so the branch it already showed stays until
+    // it is ready. A machine that has left the list drops with them.
+    const ms = machines();
+    const pruned = pruneGitState({
+      keys, git: this.git, checked: this.checked, unsure: this.unsure, pending: this.pending, watching: this.watching, machines: ms,
+    });
+    this.git = pruned.git;
+    this.checked = pruned.checked;
+    this.unsure = pruned.unsure;
+    this.pending = pruned.pending;
+    this.watching = pruned.watching;
     const spaceOf = {};
     for (const s of sp) for (const t of s.tabs ?? []) spaceOf[t.id] = s;
     const busy = {};
@@ -210,7 +265,7 @@ export default class Spaces extends View {
       if (this.busy[p.pane] && !busy[p.pane]) this.sameRepo(at[spaceOf[p.tab].id], keys).forEach((k) => due.add(k));
     }
     this.busy = busy;
-    for (const m of machines()) {
+    for (const m of ms) {
       const ready = m.layout === "ready";
       if (ready && this.ready[m.name] === false) for (const k of keys) if (JSON.parse(k)[0] === m.name) due.add(k);
       this.ready[m.name] = ready;
@@ -249,21 +304,25 @@ export default class Spaces extends View {
         for (const key of keys) await this.check(key, cx);
       }
       const used = new Set(Object.values(this.git).filter(Boolean).map((g) => JSON.parse(g.repo)).filter(([on]) => !on).map(([, repo]) => repo));
-      for (const repo of this.watching) if (!used.has(repo)) this.watching.delete(repo);
+      for (const repo of this.watching.keys()) if (!used.has(repo)) this.watching.delete(repo);
       this.refreshing = false;
       cx.notify();
     });
   }
 
-  // One place's git: branch, ahead/behind, its repo.
+  // One place's git: branch, ahead/behind, its repo. A slow answer lands only if the place is
+  // still one a space lives in: a checkout closed (or pruned) while git ran keeps nothing.
   async check(key, cx) {
     const [on, cwd] = JSON.parse(key);
+    const live = () => Object.values(this.at).includes(key);
+    if (!live()) return;
     this.checked[key] = Date.now();
     this.unsure.delete(key);
     try {
       // No optional locks: a status that touched the index would wake the watch again.
       // Writes nothing under .git (index lock, fsmonitor cookie): watch() would wake on it.
       const r = await exec("git", ["--no-optional-locks", "-c", "core.fsmonitor=false", "status", "--porcelain=v2", "--branch"], { cwd, on });
+      if (!live()) return;
       if (r.code !== 0) {
         // Only git's own "no" is remembered as no repo; anything else is asked again.
         if (!/not a git repository/i.test(r.stderr)) this.unsure.add(key);
@@ -273,6 +332,7 @@ export default class Spaces extends View {
       // The repo's own .git folder names it; a worktree's top differs from it.
       const top = await exec("git", ["rev-parse", "--show-toplevel"], { cwd, on });
       const common = await exec("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd, on });
+      if (!live()) return;
       const repo = common.stdout.trim();
       const name = repo.endsWith("/.git") ? base(repo.slice(0, -5)) : base(repo).replace(/\.git$/, "");
       const info = { name, branch: null, ahead: 0, behind: 0, repo: JSON.stringify([on, repo]), linked: repo !== `${top.stdout.trim()}/.git` };
@@ -288,22 +348,26 @@ export default class Spaces extends View {
       if (!on) this.watch(repo, cx);
     } catch {
       // Couldn't ask (the machine is away): keep what it showed, look again later.
-      this.git[key] ??= null;
-      this.unsure.add(key);
+      if (live()) { this.git[key] ??= null; this.unsure.add(key); }
     }
   }
 
+  // One watch per local repo. The tag marks which loop owns it: a dropped watch's parked loop
+  // wakes on the next event, sees the tag is gone (or another loop's), and exits without
+  // queueing work — a watchFolder wait cannot be cancelled through the API, so this is what
+  // stops a pruned repo's events from acting.
   watch(repo, cx) {
     if (this.watching.has(repo)) return;
-    this.watching.add(repo);
+    const tag = {};
+    this.watching.set(repo, tag);
     cx.spawn(async (cx) => {
       try {
-        while (this.watching.has(repo)) {
+        while (this.watching.get(repo) === tag) {
           await watchFolder(repo);
           const mine = JSON.stringify([null, repo]);
-          if (this.watching.has(repo)) this.refreshGit(Object.keys(this.git).filter((k) => this.git[k]?.repo === mine), cx);
+          if (this.watching.get(repo) === tag) this.refreshGit(Object.keys(this.git).filter((k) => this.git[k]?.repo === mine), cx);
         }
-      } catch { this.watching.delete(repo); }
+      } catch { if (this.watching.get(repo) === tag) this.watching.delete(repo); }
     });
   }
 
@@ -403,19 +467,73 @@ export default class Spaces extends View {
     return v_flex().id(id).flex_none().ml(ml).border_l(1).border_color(guideColor(t)).children(kids);
   }
 
-  // The rows, under a header per machine once one isn't this computer.
-  grouped(t, collapsed) {
+  // Every machine's loading stamp (drawn, folded or not, rows or not, rail or open list).
+  // Machines that are gone, or finished loading, lose their stamp so it cannot time out the next load.
+  // The one-shot wake is armed from checkNew, which calls this again when nothing is drawing.
+  trackAllLoading(now = Date.now()) {
+    const loading = this.machineKeys().filter((k) => this.isLoading(k || null));
+    this.loadingSince = syncLoading(this.loadingSince, loading, now).since;
+  }
+
+  // A machine with no spaces: Loading… (within the timeout), else the reason (if it timed out) and New Space.
+  stateRows(p, m, loadingRow, reasonRow, empty, connected) {
+    if (p === "loading") return [loadingRow(m)];
+    return [...(p === "timeout" ? [reasonRow(m)] : []), ...empty(m, connected)];
+  }
+
+  // This computer with no spaces at all (a fresh home): a short welcome and three ways in
+  // (prior art: Notion, Claude, Codex empty sidebars). The rail shows the actions as icon tiles only.
+  welcome(t, collapsed) {
+    const action = (id, ic, label, fn) => h_flex().id(id).h(28).flex_none().px(8).gap(9).items_center().rounded(7)
+      .text_size(12).text_color(t.muted).hover(s => s.bg(t.hover).text_color(t.foreground)).cursor_pointer()
+      .when(collapsed, el => el.justify_center().tooltip(label))
+      .on_click(fn)
+      .child(h_flex().size(18).flex_none().items_center().justify_center().child(svg(`mods/workspace-chrome/${ic}.svg`).size(13)))
+      .when(!collapsed, el => el.child(label));
+    const actions = [
+      action("empty-new", "plus", EMPTY_COPY.newSpace, () => run("space.new", {})),
+      action("empty-folder", "folder", EMPTY_COPY.openFolder, () => this.openFolder()),
+      // Agents and Terminal call tab.new with no space, and a person's tab.new then starts one.
+      // Mod and command rows go through openInTab, which starts a space first (they error otherwise).
+      action("empty-agent", "terminal", EMPTY_COPY.startAgent,
+        () => openOverlay({ mod: coreMod(), kind: "popup", width: 260, height: 575, props: { role: "plus" } })),
+    ];
+    if (collapsed) return actions;
+    return [
+      v_flex().id("empty-welcome").flex_none().px(8).pt(6).pb(8).gap(4)
+        .child(div().text_size(13).text_color(t.foreground).child(EMPTY_COPY.title))
+        .child(div().text_size(11.5).text_color(t.dim).child(EMPTY_COPY.body)),
+      ...actions,
+    ];
+  }
+
+  // Open Folder…: the macOS folder chooser, then a space whose terminals start there. Cancel does nothing.
+  openFolder() {
+    exec("osascript", ["-e", 'POSIX path of (choose folder with prompt "Open a folder as a space")'])
+      .then((r) => { const folder = pickedFolder(r); if (folder) run("space.new", { folder }); })
+      .catch(() => {});
+  }
+
+  // The rows, under a header per machine once one isn't this computer. The rail does not use this:
+  // render() calls it only for the open list, so there is no collapsed branch here.
+  grouped(t) {
     const rows = this.ordered();
-    const draw = (r, col) => (collapsed ? this.compact(r, t) : this.row(r, t, col));
+    const draw = (r, col) => this.row(r, t, col);
     const remote = [...new Set([...rows.map(r => r.w.machine).filter(Boolean), ...this.machines.map(m => m.name)])].sort();
-    const loading = m => {
-      const layout = machines().find(k => k.name === m)?.layout;
-      return layout === "loading" || (!layout && this.machines.some(k => k.name === m && k.state === "connected"))
-        || spaces().some(s => (s.machine ?? null) === m && !this.shown.has(s.id));
-    };
-    const loadingRow = m => div().id(`machine-loading-${m ?? "local"}`).h(28).flex_none().px(8).text_size(12).text_color(t.dim).child(collapsed ? "…" : "Loading…");
-    if (!remote.length) return loading(null) && !rows.length ? [loadingRow(null)] : rows.map(r => draw(r, false));
-    const { shared: hostMembers, sharedHost, order: machineNames } = groupByHost(remote, this.machines, collapsed);
+    // Loading is only believed for LOAD_TIMEOUT_MS; then the row says why, and a machine that is up gets New Space.
+    // Stamps were refreshed for every machine in trackAllLoading, before this draw.
+    const now = Date.now();
+    const phase = (m) => loadPhase(this.isLoading(m), this.loadingSince[m ?? ""], now);
+    const loadingRow = m => div().id(`machine-loading-${m ?? "local"}`).h(28).flex_none().px(8).text_size(12).text_color(t.dim).child("Loading…");
+    const reasonRow = m => div().id(`machine-stuck-${m ?? "local"}`).flex_none().px(8).py(4).text_size(11).text_color(t.dim)
+      .child(`Couldn't load spaces · ${timeoutReason(m, this.machines.find(k => k.name === m))}`);
+    if (!remote.length) {
+      if (rows.length) return rows.map(r => draw(r, false));
+      const p = phase(null);
+      if (p === "loading") return [loadingRow(null)];
+      return [...(p === "timeout" ? [reasonRow(null)] : []), ...this.welcome(t)];
+    }
+    const { shared: hostMembers, sharedHost, order: machineNames } = groupByHost(remote, this.machines);
     // A machine with no spaces yet gets a "New Space" row laid out like a space row (its + centred in the 18px tile
     // column, text on the names' line); an offline machine gets none (its heading's + is the disabled one).
     // Ethan: "this should not say There", "new space i think should be indented".
@@ -423,7 +541,7 @@ export default class Spaces extends View {
       .text_size(12).text_color(t.dim).hover(s => s.bg(t.hover).text_color(t.foreground))
       .on_click(() => run("space.new", m ? { machine: m } : {}))
       .child(h_flex().size(18).flex_none().items_center().justify_center().child(svg("mods/workspace-chrome/plus.svg").size(12)))
-      .when(!collapsed, el => el.child("New Space"))];
+      .child("New Space")];
     const out = [];
     let nest = null;   // the open host box: its heading's key, and the rows collected into it
     const flush = () => { if (nest && !nest.skip) { out.push(this.nest(t, `host-box-${nest.h}`, IND.host, nest.kids)); } nest = null; };
@@ -444,18 +562,19 @@ export default class Spaces extends View {
       const connected = !m || machine?.state === "connected";
       const folded = this.folded.has(m);
       const tip = connected ? null : offlineTip(machine);
-      const ctl = this.controls(t, { remote: m ?? null, remoteOff: !connected, add: m ?? null, addOff: !connected, dot: connected ? t.ansi2 : t.dim, folded });
+      // No remote desktop button for the work Mac (outbound-only) or this computer.
+      const ctl = this.controls(t, { remote: remoteDesktopAllowed(m, this.machines.find(k => k.name === m)) ? m : null, remoteOff: !connected, add: m ?? null, addOff: !connected, dot: connected ? t.ansi2 : t.dim, folded });
       if (host) {
         // A host's user: under its host's guide, its spaces under its own (hidden with a folded host heading).
         if (!nest || nest.h !== host) { flush(); nest = { h: host, kids: [] }; }
         if (nest.skip) continue;
         nest.kids.push(this.head(t, { id: `machine-${m}`, key: m, level: 1, label: labelOf(m, host), off: !connected, tip, menu: { key: m, machine: m, online: connected }, controls: ctl }));
-        if (!folded) nest.kids.push(this.nest(t, `user-box-${m}`, IND.user, mine.length ? mine.map(r => draw(r, true)) : (loading(m) ? [loadingRow(m)] : empty(m, connected))));
+        if (!folded) nest.kids.push(this.nest(t, `user-box-${m}`, IND.user, mine.length ? mine.map(r => draw(r, true)) : this.stateRows(phase(m), m, loadingRow, reasonRow, empty, connected)));
         continue;
       }
       flush();
       out.push(this.head(t, { id: `machine-${m ?? "local"}`, key: m, level: 0, icon: svg(machineIcon(m)).size(13).flex_none().text_color(connected ? t.muted : t.dim), label: m ?? "This computer", off: !connected, tip, menu: { key: m, machine: m ?? null, online: connected }, controls: ctl }));
-      if (!folded) out.push(...(mine.length ? mine.map(r => draw(r, true)) : (loading(m) ? [loadingRow(m)] : empty(m, connected))));
+      if (!folded) out.push(...(mine.length ? mine.map(r => draw(r, true)) : this.stateRows(phase(m), m, loadingRow, reasonRow, empty, connected)));
     }
     flush();
     return out;
@@ -519,16 +638,18 @@ export default class Spaces extends View {
       .when(on, (el) => el.bg(t.selected))
       .when(!on && hot, (el) => el.bg(t.hover))
       .on_hover(this.hoverOn(`space-${w.id}`))
-      .when(this.pressed !== null && this.over === i && this.pressed !== i, (el) => el.border_t(2).border_color(t.accent))
+      .when(this.pressed !== null && this.over === w.id && this.pressed.id !== w.id, (el) => el.border_t(2).border_color(t.accent))
+      // The press keeps the space's id and machine, not its index: the list can change before release
+      // (a space closes, a reorder lands, a machine disconnects), and an index would then name another space.
       .on_mouse_down("left", () => {
-        this.pressed = i;
-        this.over = i;
+        this.pressed = { id: w.id, machine: w.machine ?? null };
+        this.over = w.id;
       })
       .on_mouse_up("left", (_e, cx) => {
         const from = this.pressed;
         this.pressed = null;
-        if (from !== null && from !== i) run("space.move", { id: spaces()[from].id, index: i + 1 });
-        else run("space.select", { id: w.id });
+        const plan = spaceDropPlan(from, w.id, spaces());
+        if (plan) run(plan.name, plan.args);
         cx.notify();
       })
       .on_mouse_down("right", (_e, cx) => { cx.stop_propagation(); this.menu(w); })
@@ -555,14 +676,14 @@ export default class Spaces extends View {
     const fill = color.startsWith("#") ? color : (MARK[color] ?? t[color]);
     const hovered = this.hoverTile === w.id;
     return h_flex().id(`space-${w.id}`).relative().w_full().h(34).flex_none().items_center().justify_center()
-      .when(this.pressed !== null && this.over === i && this.pressed !== i, (el) => el.border_t(2).border_color(t.accent))
+      .when(this.pressed !== null && this.over === w.id && this.pressed.id !== w.id, (el) => el.border_t(2).border_color(t.accent))
       .on_hover((h, cx) => { const next = h ? w.id : (this.hoverTile === w.id ? null : this.hoverTile); if (next !== this.hoverTile) { this.hoverTile = next; cx.notify(); } })
-      .on_mouse_down("left", () => { this.pressed = i; this.over = i; })
+      .on_mouse_down("left", () => { this.pressed = { id: w.id, machine: w.machine ?? null }; this.over = w.id; })
       .on_mouse_up("left", (_e, cx) => {
         const from = this.pressed;
         this.pressed = null;
-        if (from !== null && from !== i) run("space.move", { id: spaces()[from].id, index: i + 1 });
-        else run("space.select", { id: w.id });
+        const plan = spaceDropPlan(from, w.id, spaces());
+        if (plan) run(plan.name, plan.args);
         cx.notify();
       })
       .on_mouse_down("right", (_e, cx) => { cx.stop_propagation(); this.menu(w); })
@@ -578,6 +699,27 @@ export default class Spaces extends View {
     const remote = [...new Set([...rows.map((r) => r.w.machine).filter(Boolean), ...this.machines.map((m) => m.name)])].sort();
     const { order } = groupByHost(remote, this.machines, true);
     const groups = order.filter((m) => !m?.startsWith("host:")).map((m) => rows.filter((r) => (r.w.machine ?? null) === m)).filter((g) => g.length);
+    // No spaces anywhere. "…" while any machine (not only this computer) is still inside its
+    // timeout, so a loading remote is not covered by the New Space tiles. Each list that has
+    // timed out gets a "!" tile whose tooltip is that machine's reason. Welcome follows only
+    // once nothing is still loading.
+    if (!rows.length) {
+      const now = Date.now();
+      const empty = railEmpty(this.machineKeys().map((k) => ({
+        key: k,
+        phase: loadPhase(this.isLoading(k || null), this.loadingSince[k], now),
+      })));
+      const out = [];
+      if (empty.loading) out.push(div().id("rail-loading").h(28).flex_none().text_size(12).text_color(t.dim).child("…"));
+      for (const k of empty.timeouts) {
+        const name = k || null;
+        const machine = name ? this.machines.find((m) => m.name === name) : null;
+        out.push(div().id(`rail-stuck-${k || "local"}`).h(28).flex_none().flex().items_center().text_size(12).text_color(t.dim)
+          .tooltip(`Couldn't load spaces · ${timeoutReason(name, machine)}`).child("!"));
+      }
+      if (empty.welcome) out.push(...this.welcome(t, true));
+      return out;
+    }
     const out = [];
     groups.forEach((g, n) => {
       if (n) out.push(div().id(`rail-sep-${n}`).w(20).h(1).my(5).flex_none().bg(t.border));   // rows are 34 (28 + 6): 5 + 1 + 5 keeps the rhythm
@@ -591,6 +733,7 @@ export default class Spaces extends View {
     const collapsed = narrow();
     // One check after every draw (a live-data change redraws), outside the draw itself.
     if (!this.checking) { this.checking = true; cx.spawn(async (cx) => { this.checking = false; this.checkNew(cx); }); }
+    this.trackAllLoading();
     if (collapsed) {
       // Spaces fill the rail; search, settings and expand sit stacked at the bottom (Ethan: "settings and other top
       // controls should move to bottom"), clear of the macOS traffic lights.
@@ -613,7 +756,7 @@ export default class Spaces extends View {
       .child(h_flex().id("spaces-title").on_mouse_down("right", () => openSectionsMenu()).h(31).pl(16).pr(10).items_center().justify_between().text_size(11.5).text_color(t.dim)
         .child("Spaces")
         .child(div().id("space-new").p(4).rounded(5).hover(s => s.bg(t.hover).text_color(t.foreground)).on_click(() => run("space.new")).child(ICON.add())))
-      .child(scroller(this, "list", { id: "spaces-scroll", bg: t.chrome, children: this.grouped(t, collapsed),   // no scrollbar, no scrolling until it overflows, fades at the hidden edges
+      .child(scroller(this, "list", { id: "spaces-scroll", bg: t.chrome, children: this.grouped(t),   // no scrollbar, no scrolling until it overflows, fades at the hidden edges
         outer: (el) => el.flex_1().min_h(0)
           .on_mouse_down("right", () => openSectionsMenu())
           .on_mouse_up("left", (_e, cx) => { this.pressed = null; cx.notify(); }),

@@ -370,3 +370,16 @@ export function registryWatchRelevant(paths, modsDir, self) {
   }
   return false;
 }
+
+// A tab drag, resolved at release by ids in the current list. `from` is what the press stored ({id, space});
+// `to` is the tab released on. Same tab: select it. Either tab gone, or the two in different spaces: nothing.
+// Otherwise move `from` to `to`'s current 1-based place.
+export function tabDropPlan(from, toId, toSpace, tabs) {
+  if (!from) return { name: "tab.select", args: { id: toId } };
+  if (from.id === toId) return { name: "tab.select", args: { id: toId } };
+  if (from.space !== toSpace) return null;
+  const list = Array.isArray(tabs) ? tabs : [];
+  const at = list.findIndex((x) => x.id === toId);
+  if (at < 0 || !list.some((x) => x.id === from.id)) return null;
+  return { name: "tab.move", args: { id: from.id, index: at + 1 } };
+}

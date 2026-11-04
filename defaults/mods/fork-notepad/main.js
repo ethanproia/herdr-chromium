@@ -1027,6 +1027,7 @@ export default class Notes extends View {
   // Flush a pending save when the pane closes, so nothing typed is lost.
   // The draft is written first (one quick local write), so a failed or cut-short save never loses typing.
   async close(cx) {
+    this.embeds?.dispose();          // its images may be swept once no note draws them
     if (!this.isNote) return;      // popups (export, menus, backlinks) hold no note
     try {
       if (this.cur?.dirty) {

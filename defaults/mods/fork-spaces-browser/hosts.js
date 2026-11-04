@@ -22,3 +22,17 @@ export function groupByHost(remote, machines, collapsed = false) {
   }
   return { shared, sharedHost, order };
 }
+
+// The work Mac (ethan-basis) is outbound-only: Remote Login and Screen Sharing are off, so it is never offered as a
+// remote desktop target (remote desktop lead + orchestrator, 2026-11-04). Matched by the machine's name, its host,
+// or any word of its target (a target can be a whole ssh command).
+export function remoteDesktopAllowed(name, record) {
+  const NO_REMOTE_DESKTOP = new Set(["basis", "mac", "ethan-basis"]);   // inside, so the copy test covers the list too
+  if (!name) return false;   // this computer: no remote desktop to itself
+  const bare = (w) => String(w ?? "").toLowerCase().replace(/\.local$/, "");
+  // Name or host: any of the work Mac's names. Target: only host parts (a user@ prefix is dropped, flags skipped),
+  // and only the full "ethan-basis", so an ssh user or a generic word never hides a real machine.
+  if ([name, record?.host].some((w) => NO_REMOTE_DESKTOP.has(bare(w)))) return false;
+  const hosts = String(record?.target ?? "").split(/\s+/).filter((w) => w && !w.startsWith("-")).map((w) => bare(w.split("@").pop().split(":")[0]));
+  return !hosts.includes("ethan-basis");
+}

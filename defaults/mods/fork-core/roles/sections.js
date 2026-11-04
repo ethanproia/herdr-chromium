@@ -2,7 +2,6 @@
 // Writes only from clicks and from the footer's one-time init, never from render.
 import { run, layout, shared, setShared, openOverlay } from "herdr";
 import { SELF } from "../self.js";
-import { appVersion } from "../app-info.js";
 import { normalizeSections, toggleSection, sectionsPlan, menuHeight, SECTION_KEYS } from "../sections-pure.js";
 
 export function find(node, id) {
@@ -18,7 +17,7 @@ export const sections = () => normalizeSections(shared("sidebar.sections"));
 const layoutState = (collapsedNow) => {
   const l = layout();
   return { spacesHidden: find(l, "spaces")?.hidden === true, agentsHidden: find(l, "agents")?.hidden === true, footerPx: find(l, "sidebar-footer")?.size?.px, footerHidden: find(l, "sidebar-footer")?.hidden === true, collapsed: collapsedNow ?? isCollapsed(l),
-    statusHidden: find(l, "status") ? find(l, "status").hidden === true : undefined, version: Boolean(appVersion()) };
+    statusHidden: find(l, "status") ? find(l, "status").hidden === true : undefined };
 };
 // Issues commands only where the layout differs from the sections. Returns how many.
 export function applySections(collapsedNow) {

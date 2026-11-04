@@ -1,18 +1,6 @@
 // Pure helpers for @ mentions: no gpui or herdr imports, so node can test them.
+// Date rows live in dates.js (mentions.js imports dateItems from there).
 const MAX_PER_KIND = 8;
-const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-const p2 = (n) => String(n).padStart(2, "0");
-
-function dateItem(label, d) {
-  const iso = `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}`;
-  const text = `${MONTHS[d.getMonth()]} ${d.getDate()}, ${d.getFullYear()}`;
-  return { kind: "date", label, hint: text, href: "date:" + iso, text };
-}
-
-export function dateItems(now) {
-  const at = (off) => new Date(now.getFullYear(), now.getMonth(), now.getDate() + off);
-  return [dateItem("Today", at(0)), dateItem("Tomorrow", at(1)), dateItem("Yesterday", at(-1))];
-}
 
 const base = (p) => p.slice(p.lastIndexOf("/") + 1);
 
