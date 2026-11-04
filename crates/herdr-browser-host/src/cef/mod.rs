@@ -64,6 +64,42 @@ pub(crate) struct Entry {
     viewport: Option<(f32, f32, f64)>,
 }
 
+impl Entry {
+    fn new(size: Size, scale: f32) -> Entry {
+        Entry { browser: None, size, scale, pool: FramePool::new(), last: None, hidden: false, shots: Vec::new(), resized: None, _devtools: None, queued: Vec::new(), loaded: false, input_ready: false, load_gen: 0, nudged: None, pointer: (0.0, 0.0), view: None, popup: None, popup_shown: false, popup_rect: None, starting: Vec::new(), scroll: None, viewport: None }
+    }
+}
+
+/// A popup's size when the page names none (DIPs).
+const POPUP_DEFAULT: (f32, f32) = (500.0, 600.0);
+
+/// A real popup of `opener` is about to be made by CEF: mint its id (the host alone does) and
+/// register it like a block, at the size the page asked for. None when the opener is unknown.
+pub(crate) fn adopt_popup(opener: &str, w: Option<f32>, h: Option<f32>) -> Option<String> {
+    with_host(|h_| {
+        let scale = h_.browsers.get(opener)?.scale;
+        h_.next_popup += 1;
+        let id = format!("{opener}-pop{}", h_.next_popup);
+        let size = Size { w: w.unwrap_or(POPUP_DEFAULT.0).clamp(200.0, 1600.0), h: h.unwrap_or(POPUP_DEFAULT.1).clamp(200.0, 1200.0) };
+        h_.browsers.insert(id.clone(), Entry::new(size, scale));
+        h_.popups.insert(id.clone(), opener.to_string());
+        Some(id)
+    })
+    .flatten()
+}
+
+/// A browser is closing: if it is a popup, forget it and tell the app.
+pub(crate) fn on_closed(id: &str) {
+    let was_popup = with_host(|h| {
+        h.browsers.remove(id);
+        h.popups.remove(id).is_some()
+    })
+    .unwrap_or(false);
+    if was_popup {
+        send(HostToApp::PopupClosed { id: id.to_string() });
+    }
+}
+
 pub(crate) struct Host {
     out: UnixStream,
     browsers: HashMap<String, Entry>,
@@ -74,6 +110,9 @@ pub(crate) struct Host {
     /// Open file choosers: req -> (the browser that asked, its callback).
     choosers: HashMap<u64, (String, FileDialogCallback)>,
     menus: HashMap<u64, (String, RunContextMenuCallback)>,
+    /// Live popups: popup id -> its opener's id.
+    popups: HashMap<String, String>,
+    next_popup: u64,
     /// Permission requests waiting on the person: req -> (browser, callback, asked at).
     perms: HashMap<u64, (String, PermCb, std::time::Instant)>,
     quit: bool,
@@ -679,6 +718,8 @@ fn serve(socket: &Path, listener: UnixListener, args: &Args) -> io::Result<()> {
             dialogs: HashMap::new(),
             choosers: HashMap::new(),
             menus: HashMap::new(),
+            popups: HashMap::new(),
+            next_popup: 0,
             perms: HashMap::new(),
             quit: false,
             stats: BlitStats::open(profile_dir.parent().unwrap_or(&profile_dir)),
@@ -873,7 +914,7 @@ fn handle(m: AppToHost) {
                     return;
                 }
             };
-            with_host(|h| h.browsers.insert(id.clone(), Entry { browser: None, size, scale, pool: FramePool::new(), last: None, hidden: false, shots: Vec::new(), resized: None, _devtools: None, queued: Vec::new(), loaded: false, input_ready: false, load_gen: 0, nudged: None, pointer: (0.0, 0.0), view: None, popup: None, popup_shown: false, popup_rect: None, starting: Vec::new(), scroll: None, viewport: None }));
+            with_host(|h| h.browsers.insert(id.clone(), Entry::new(size, scale)));
             let window_info = WindowInfo { windowless_rendering_enabled: 1, shared_texture_enabled: 1, ..Default::default() };
             let settings = BrowserSettings { windowless_frame_rate: 60, ..Default::default() };
             let mut client = handlers::client(&id);
@@ -932,6 +973,17 @@ fn handle(m: AppToHost) {
             }
         }
         M::Close { id } => {
+            // An opener takes its popups with it.
+            let popups: Vec<Browser> = with_host(|h| {
+                let ids: Vec<String> = h.popups.iter().filter(|(_, o)| **o == id).map(|(p, _)| p.clone()).collect();
+                ids.iter().filter_map(|p| h.browsers.get(p).and_then(|e| e.browser.clone())).collect()
+            })
+            .unwrap_or_default();
+            for b in popups {
+                if let Some(host) = b.host() {
+                    host.close_browser(1);
+                }
+            }
             deny_permissions(Some(&id), false);
             cancel_choosers(&id);
             let Some(entry) = with_host(|h| h.browsers.remove(&id)).flatten() else { return unknown(&id) };

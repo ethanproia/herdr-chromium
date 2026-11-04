@@ -293,6 +293,13 @@ pub enum HostToApp {
     /// `origin` is untrusted page text, shown plain. Answered once by `PermissionResult`; the host
     /// denies it if no answer arrives in 60 s.
     Permission { id: BrowserId, req: u64, origin: String, kinds: Vec<String> },
+    /// A page opened a real popup (window.open with features, user gesture): `id` is a new browser
+    /// the host already made (opener link intact); the app shows it over `opener`. Size in DIPs.
+    PopupOpened { opener: BrowserId, id: BrowserId, url: String, w: Option<f32>, h: Option<f32> },
+    /// The popup closed itself (window.close) or CEF closed it; the app drops its card.
+    PopupClosed { id: BrowserId },
+    /// A popup without a user gesture was refused; the app may offer to open `url` as a tab.
+    PopupBlocked { id: BrowserId, url: String },
     /// Where the text caret is, in DIPs, so the app can place the IME candidate window.
     ImeCaret { id: BrowserId, x: f32, y: f32, w: f32, h: f32 },
     FindResult { id: BrowserId, count: u32, active: u32, final_update: bool },
@@ -391,6 +398,9 @@ mod tests {
         roundtrip_host(HostToApp::Frame { id: "b1".into(), seq: 2, surface: SurfaceRef::MachPort { name: "com.herdr.s".into() }, size: PixelSize { w: 2, h: 2 }, scale: 1.0 });
         roundtrip_host(HostToApp::Loading { id: "b1".into(), loading: true, can_back: false, can_forward: false });
         roundtrip_host(HostToApp::Permission { id: "b1".into(), req: 3, origin: "https://meet.test".into(), kinds: vec!["camera".into(), "microphone".into()] });
+        roundtrip_host(HostToApp::PopupOpened { opener: "b1".into(), id: "b1-pop1".into(), url: "http://127.0.0.1:9/auth".into(), w: Some(480.0), h: None });
+        roundtrip_host(HostToApp::PopupClosed { id: "b1-pop1".into() });
+        roundtrip_host(HostToApp::PopupBlocked { id: "b1".into(), url: "http://127.0.0.1:9/x".into() });
         roundtrip_host(HostToApp::LoadError { id: "b1".into(), url: "http://127.0.0.1:9/".into(), code: -102, kind: "refused".into() });
         roundtrip_host(HostToApp::ImeCaret { id: "b1".into(), x: 1.0, y: 2.0, w: 1.0, h: 16.0 });
         roundtrip_host(HostToApp::EvalResult { id: "b1".into(), req: 1, ok: true, value: serde_json::json!({"n": 2}) });
