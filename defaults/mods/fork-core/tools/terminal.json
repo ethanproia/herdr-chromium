@@ -1,0 +1,2 @@
+{ "id": "terminal", "name": "Terminal", "group": "Tools", "icon": "shell.svg", "order": 0, "shortcut": "T",
+  "open": { "terminal": true }, "places": ["tab", "split"], "copy": { "copyTerminal": true } }

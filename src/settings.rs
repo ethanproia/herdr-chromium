@@ -378,6 +378,8 @@ pub struct Person {
     pub font: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub font_size: Option<f32>,
+    /// Enable programming ligatures in terminal fonts.
+    pub font_ligatures: bool,
     /// The panels' font (their sizes follow zoom).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ui_font: Option<String>,
@@ -387,6 +389,9 @@ pub struct Person {
     /// Allow terminal programs (including remote ones) to copy text locally.
     #[serde(skip_serializing_if = "is_true")]
     pub clipboard_write: bool,
+    /// A draggable scroll position thumb at a terminal pane's right edge.
+    #[serde(skip_serializing_if = "is_true")]
+    pub pane_scrollbars: bool,
     /// Minimum terminal text contrast ratio; 1 leaves program colors unchanged.
     pub minimum_contrast: f32,
     /// macOS Option sends Alt shortcuts, or follows the keyboard layout.
@@ -399,6 +404,102 @@ pub struct Person {
     pub theme: Option<crate::layout::ThemeChoice>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub colors: BTreeMap<String, String>,
+    /// Where words typed into a browser block's address bar are searched.
+    #[serde(skip_serializing_if = "SearchEngine::is_google")]
+    pub search_engine: SearchEngine,
+    /// The labs checkout (its projects/herdr-mods/remote-desktop/web/bridge.mjs starts the
+    /// + menu's Remote desktop); `$HERDR_LABS_CHECKOUT` wins.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub labs_checkout: Option<String>,
+    /// HERDR: mods turned off by name: not found by the app (layouts, tabs, overlays,
+    /// keys), though their files stay installed. Removing a name turns it back on.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub mods_disabled: Vec<String>,
+    /// HERDR: macOS: the window blurs what's behind it, seen through the layout's own
+    /// backgrounds (sidebar, canvas); panes stay opaque. Off unless set to true.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub glass: bool,
+    /// HERDR: the bell's history, Do Not Disturb and muted sources (src/notifications.rs).
+    #[serde(skip_serializing_if = "NotificationSettings::is_default")]
+    pub notifications: NotificationSettings,
+    /// HERDR: where toasts stack: top right under the top bar (default), or bottom right.
+    #[serde(skip_serializing_if = "ToastCorner::is_top_right")]
+    pub toast_corner: ToastCorner,
+}
+
+/// HERDR: the toast deck's corner (`toast_corner`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ToastCorner {
+    #[default]
+    TopRight,
+    BottomRight,
+}
+
+impl ToastCorner {
+    fn is_top_right(&self) -> bool {
+        *self == Self::TopRight
+    }
+}
+
+/// HERDR: `notifications` in settings.json.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotificationSettings {
+    /// Keep the history on disk (off: this run only).
+    pub history: bool,
+    /// Do Not Disturb: no toasts and no sounds; the bell still counts. Errors don't break through.
+    pub dnd: bool,
+    /// Sources with no toasts, sounds or count: agents, machines, browser, updates, mods, app.
+    pub muted_sources: Vec<String>,
+}
+
+impl Default for NotificationSettings {
+    fn default() -> Self {
+        NotificationSettings { history: true, dnd: false, muted_sources: Vec::new() }
+    }
+}
+
+impl NotificationSettings {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Whether a notice from `source` may show a toast or play a sound.
+    pub fn speaks(&self, source: &str) -> bool {
+        !self.dnd && !self.muted_sources.iter().any(|m| m == source)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchEngine {
+    #[default]
+    Google,
+    Bing,
+}
+
+impl SearchEngine {
+    fn is_google(&self) -> bool {
+        *self == Self::Google
+    }
+
+    /// The results page for `q`.
+    pub fn url(self, q: &str) -> String {
+        let base = match self {
+            Self::Google => "https://www.google.com/search?q=",
+            Self::Bing => "https://www.bing.com/search?q=",
+        };
+        let mut out = String::from(base);
+        for b in q.bytes() {
+            match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+                b' ' => out.push('+'),
+                _ => out.push_str(&format!("%{b:02X}")),
+            }
+        }
+        out
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -423,6 +524,8 @@ pub enum OptionAsAlt {
     Auto,
     Off,
     On,
+    Left,
+    Right,
 }
 
 impl OptionAsAlt {
@@ -443,14 +546,22 @@ impl Default for Person {
             core: None,
             font: None,
             font_size: None,
+            font_ligatures: false,
             ui_font: None,
             telemetry: true,
             clipboard_write: true,
+            pane_scrollbars: true,
             minimum_contrast: 1.0,
             option_as_alt: OptionAsAlt::Auto,
             appearance: Appearance::System,
             theme: None,
             colors: BTreeMap::new(),
+            search_engine: SearchEngine::Google,
+            labs_checkout: None,
+            mods_disabled: Vec::new(),
+            glass: false,
+            notifications: NotificationSettings::default(),
+            toast_corner: ToastCorner::TopRight,
         }
     }
 }
@@ -462,6 +573,7 @@ impl Default for Person {
 pub struct Settings {
     pub font_family: String,
     pub font_size: f32,
+    pub font_ligatures: bool,
     pub ui_font_family: String,
     pub ui_font_size: f32,
     /// How big the whole app is drawn (1 = as designed). The zoom keys change it.
@@ -475,6 +587,8 @@ pub struct Settings {
     pub dark: bool,
     /// Any theme color by name (see `theme()` in herdr.d.ts), `#rrggbb` or `#rrggbbaa`.
     pub colors: BTreeMap<String, String>,
+    /// A draggable scroll position thumb at a terminal pane's right edge.
+    pub pane_scrollbars: bool,
     /// Space between a terminal's edge and its text, in px: [x, y].
     pub terminal_padding: [f32; 2],
     /// 0..1: below 1, what's behind a terminal shows through.
@@ -482,7 +596,14 @@ pub struct Settings {
     pub clipboard_write: bool,
     pub minimum_contrast: f32,
     pub option_as_alt: OptionAsAlt,
+    pub search_engine: SearchEngine,
     pub sounds: Sounds,
+    /// HERDR: see `Person::glass`.
+    pub glass: bool,
+    /// HERDR: see `Person::notifications`.
+    pub notifications: NotificationSettings,
+    /// HERDR: see `Person::toast_corner`.
+    pub toast_corner: ToastCorner,
 }
 
 /// Attention sounds: when an agent needs you, and when one finished while you
@@ -509,6 +630,7 @@ impl Default for Settings {
         Settings {
             font_family: DEFAULT_FONT.into(),
             font_size: 14.0,
+            font_ligatures: false,
             ui_font_family: "Geist".into(),
             ui_font_size: 13.0,
             zoom: 1.0,
@@ -517,12 +639,17 @@ impl Default for Settings {
             theme_dark: DEFAULT_DARK.into(),
             dark: true,
             colors: BTreeMap::new(),
+            pane_scrollbars: true,
             terminal_padding: [10.0, 6.0],
             terminal_opacity: 1.0,
             clipboard_write: true,
             minimum_contrast: 1.0,
             option_as_alt: OptionAsAlt::Auto,
+            search_engine: SearchEngine::Google,
             sounds: Sounds::default(),
+            glass: false,
+            notifications: NotificationSettings::default(),
+            toast_corner: ToastCorner::TopRight,
         }
     }
 }
@@ -545,6 +672,7 @@ impl Settings {
             // The layout's own, else the person's, else Herdr's.
             font_family: look.font.clone().or(person.font.clone()).unwrap_or(d.font_family),
             font_size: look.font_size.or(person.font_size).unwrap_or(d.font_size),
+            font_ligatures: person.font_ligatures,
             ui_font_family: look.ui_font.clone().or(person.ui_font.clone()).unwrap_or(d.ui_font_family),
             ui_font_size: d.ui_font_size,
             zoom: person.zoom,
@@ -553,12 +681,17 @@ impl Settings {
             theme_dark,
             dark,
             colors,
+            pane_scrollbars: person.pane_scrollbars,
             terminal_padding: look.terminal_padding.unwrap_or(d.terminal_padding),
             terminal_opacity: look.terminal_opacity.unwrap_or(1.0).clamp(0.0, 1.0),
             sounds: person.sounds.clone(),
             clipboard_write: person.clipboard_write,
             minimum_contrast: person.minimum_contrast,
             option_as_alt: person.option_as_alt,
+            search_engine: person.search_engine,
+            glass: person.glass,
+            notifications: person.notifications.clone(),
+            toast_corner: person.toast_corner,
         }
     }
 }
@@ -679,16 +812,20 @@ pub fn set(s: Settings) -> bool {
     #[cfg(target_os = "macos")]
     gpui_macos::set_option_as_alt(match s.option_as_alt {
         OptionAsAlt::Auto => None,
-        OptionAsAlt::Off => Some(false),
-        OptionAsAlt::On => Some(true),
+        OptionAsAlt::Off => Some(gpui_macos::OptionAsAlt::None),
+        OptionAsAlt::On => Some(gpui_macos::OptionAsAlt::Both),
+        OptionAsAlt::Left => Some(gpui_macos::OptionAsAlt::Left),
+        OptionAsAlt::Right => Some(gpui_macos::OptionAsAlt::Right),
     });
     CURRENT.with(|c| {
-        if *c.borrow().0 == s {
-            return false;
-        }
+        // Read the theme even when the settings are the same: its file may
+        // have new colors under the same name.
         let (p, mut colors) = palette(&s.theme).unwrap_or_else(|_| (GRAPHITE.clone(), BTreeMap::new()));
         colors.extend(s.colors.clone());
         let theme = resolve(&p, &colors);
+        if *c.borrow().0 == s && *c.borrow().1 == theme {
+            return false;
+        }
         gpui_shell::set_pixel_scale(s.zoom);
         *c.borrow_mut() = (Rc::new(s), Rc::new(theme));
         true
@@ -822,7 +959,38 @@ pub const DEFAULT_FONT: &str = "JetBrains Mono";
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn terminal_ligatures_default_off_and_can_be_enabled() {
+        use super::*;
+        let person: Person = serde_json::from_str("{}").unwrap();
+        assert!(!Settings::compose(&person, &crate::layout::Look::default(), true).font_ligatures);
+        assert!(!Settings::default().font_ligatures);
+        let person: Person = serde_json::from_str(r#"{"font_ligatures":true}"#).unwrap();
+        let saved = serde_json::to_string(&person).unwrap();
+        let restored: Person = serde_json::from_str(&saved).unwrap();
+        assert!(Settings::compose(&restored, &crate::layout::Look::default(), true).font_ligatures);
+        assert!(serde_json::from_str::<Person>(r#"{"font_ligatures":"yes"}"#).is_err());
+    }
+
     use super::*;
+
+    #[test]
+    fn toast_corner_is_top_right_unless_set_and_not_written_by_default() {
+        let d = Person::default();
+        assert_eq!(Settings::compose(&d, &crate::layout::Look::default(), true).toast_corner, ToastCorner::TopRight);
+        assert!(!serde_json::to_string(&d).unwrap().contains("toast_corner"));
+        let b: Person = serde_json::from_str(r#"{"toast_corner": "bottom-right"}"#).unwrap();
+        assert_eq!(Settings::compose(&b, &crate::layout::Look::default(), true).toast_corner, ToastCorner::BottomRight);
+    }
+
+    #[test]
+    fn glass_is_off_unless_set_and_not_written_when_off() {
+        let off: Person = serde_json::from_str("{}").unwrap();
+        assert!(!off.glass && !Settings::compose(&off, &crate::layout::Look::default(), true).glass);
+        assert!(!serde_json::to_string(&off).unwrap().contains("glass"));
+        let on: Person = serde_json::from_str(r#"{"glass": true}"#).unwrap();
+        assert!(Settings::compose(&on, &crate::layout::Look::default(), true).glass);
+    }
 
     #[test]
     fn layout_look_wins_and_settings_fill_what_it_leaves_unset() {
@@ -848,16 +1016,27 @@ mod tests {
     }
 
     #[test]
+    fn search_engine_defaults_to_google_and_encodes_words() {
+        assert_eq!(Person::default().search_engine, SearchEngine::Google);
+        assert!(serde_json::to_value(Person::default()).unwrap().get("search_engine").is_none());
+        let person: Person = serde_json::from_value(serde_json::json!({"search_engine": "bing"})).unwrap();
+        let settings = Settings::compose(&person, &crate::layout::Look::default(), false);
+        assert_eq!(settings.search_engine, SearchEngine::Bing);
+        assert_eq!(SearchEngine::Google.url("rust gpui & cef"), "https://www.google.com/search?q=rust+gpui+%26+cef");
+        assert_eq!(SearchEngine::Bing.url("é"), "https://www.bing.com/search?q=%C3%A9");
+    }
+
+    #[test]
     fn option_as_alt_defaults_to_auto_and_round_trips() {
         let default: Person = serde_json::from_str("{}").unwrap();
         assert_eq!(default.option_as_alt, OptionAsAlt::Auto);
-        for (value, expected) in [("auto", OptionAsAlt::Auto), ("off", OptionAsAlt::Off), ("on", OptionAsAlt::On)] {
+        for (value, expected) in [("auto", OptionAsAlt::Auto), ("off", OptionAsAlt::Off), ("on", OptionAsAlt::On), ("left", OptionAsAlt::Left), ("right", OptionAsAlt::Right)] {
             let person: Person = serde_json::from_value(serde_json::json!({"option_as_alt": value})).unwrap();
             let settings = Settings::compose(&person, &crate::layout::Look::default(), true);
             assert_eq!(settings.option_as_alt, expected);
             assert_eq!(serde_json::to_value(settings).unwrap()["option_as_alt"], value);
         }
-        assert!(serde_json::from_value::<Person>(serde_json::json!({"option_as_alt": "left"})).is_err());
+        assert!(serde_json::from_value::<Person>(serde_json::json!({"option_as_alt": "invalid"})).is_err());
     }
 
     #[test]

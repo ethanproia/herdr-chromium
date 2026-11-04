@@ -1,0 +1,953 @@
+//! Real CEF host only (`HERDR_BROWSER_HOST=<bundle exe>`; skipped otherwise). Every page is served
+//! locally. Frames are read back from the shared IOSurface, as the app will paint them.
+
+mod common;
+use common::*;
+use herdr_browser_protocol::*;
+use std::io::{Read, Write};
+use std::time::Duration;
+
+const SEC: Duration = Duration::from_secs(1);
+const BLUE: [u8; 4] = [0xcc, 0x66, 0x33, 0xff]; // #3366cc as BGRA
+const ORANGE: [u8; 4] = [0x33, 0x66, 0xcc, 0xff]; // #cc6633 as BGRA
+
+const INPUT_PAGE: &str = r#"<!doctype html><html><head><title>input</title></head><body style="margin:0">
+<textarea id=t autofocus style="display:block;width:100vw;height:100vh;border:0;margin:0;padding:0"></textarea>
+<script>
+const log=(k,o)=>console.log("ev "+k+" "+JSON.stringify(o));
+addEventListener("keydown",e=>log("keydown",{key:e.key,code:e.code}),true);
+addEventListener("mousedown",e=>log("mousedown",{x:e.clientX,y:e.clientY,b:e.button}),true);
+addEventListener("wheel",e=>log("wheel",{dy:Math.sign(e.deltaY)}),{capture:true,passive:true});
+t.addEventListener("compositionupdate",e=>log("compositionupdate",{data:e.data}));
+t.addEventListener("compositionend",e=>log("compositionend",{data:e.data}));
+t.addEventListener("input",()=>log("input",{value:t.value}));
+</script></body></html>"#;
+
+/// A hostile page: prints what the old console eval channel accepted as results (SEC3).
+const FORGE_PAGE: &str = r#"<!doctype html><html><head><title>forge</title></head><body><script>
+const forge=()=>{for(let r=0;r<20;r++){console.log('__herdr_eval__:'+r+':{"ok":true,"v":"forged"}')}};
+forge();setInterval(forge,50);
+</script></body></html>"#;
+
+/// A `<select>` whose dropdown list is green: the list is a CEF popup widget (PET_POPUP), not page pixels.
+const SELECT_PAGE: &str = r#"<!doctype html><html><head><title>select</title><style>
+body{margin:0;background:#fff} select{position:absolute;left:10px;top:10px;width:120px;font-size:16px}
+option{background:#00ff00;color:#00ff00}
+</style></head><body><select id=s><option value=a>a</option><option value=b>b</option><option value=c>c</option></select></body></html>"#;
+
+/// Logs every prefers-color-scheme change, so a test sees it update live.
+const SCHEME_PAGE: &str = r#"<!doctype html><html><head><title>scheme</title></head><body><script>
+const q=matchMedia('(prefers-color-scheme: dark)');
+q.addEventListener('change',e=>console.log('ev scheme '+JSON.stringify({dark:e.matches})));
+</script></body></html>"#;
+
+/// A link at the top, a filled text box below it: two different context menus.
+const MENU_PAGE: &str = r#"<!doctype html><html><head><title>menu</title></head><body style="margin:0">
+<a id=l href="/b" style="display:block;height:30px;font-size:20px">a link</a>
+<textarea id=t style="display:block;width:200px;height:60px;margin:0;border:0">hello menu</textarea>
+</body></html>"#;
+
+/// Known geometry: a box at (20, 30) 100x50, three items, a tall page to scroll.
+const GEO_PAGE: &str = r#"<!doctype html><html><head><title>geo</title><style>
+body{margin:0;height:3000px} #box{position:absolute;left:20px;top:30px;width:100px;height:50px;background:#36c}
+.item{position:absolute;left:200px;width:40px;height:10px} #p{position:absolute;left:20px;top:120px;font-size:16px}
+</style></head><body><div id=box></div><div class=item style="top:0"></div><div class=item style="top:20px"></div>
+<div class=item style="top:40px"></div><p id=p>select me please</p></body></html>"#;
+
+/// One big link to page b.
+const LINKS_PAGE: &str = r#"<!doctype html><html><head><title>links</title></head><body style="margin:0">
+<a href="/b" style="display:block;height:60px;font-size:30px">to b</a></body></html>"#;
+
+/// #a has an inline style attribute and a stylesheet margin; #b has no style attribute.
+const STYLES_PAGE: &str = r#"<!doctype html><html><head><title>styles</title><style>
+.c{margin:2px} #b{color:rgb(0, 128, 0)}</style></head><body style="margin:0">
+<div id=a class=c style="color: red; display:inline-block">secret page text</div><div id=b>more text</div></body></html>"#;
+
+/// Known boxes: #go 98x43 at (10, 10); fields with values that must never leak; two cards
+/// without ids; a button inside an open shadow root.
+const PICK_PAGE: &str = r#"<!doctype html><html><head><title>pick</title><style>
+body{margin:0} #go{position:absolute;left:10px;top:10px;width:98px;height:43px;box-sizing:border-box}
+#pw{position:absolute;left:10px;top:70px;width:100px} #name{position:absolute;left:10px;top:100px;width:100px}
+.card{position:absolute;left:200px;width:150px} .card p{margin:0;height:20px}
+#host{position:absolute;left:10px;top:150px}
+</style></head><body><button id=go>Go now please</button>
+<input id=pw type=password value=hunter2><input id=name type=text value=secretvalue>
+<div class=card style="top:10px"><p>one</p><p>two</p></div><div class=card style="top:60px"><p>three</p><p>four</p></div>
+<div id=host></div><script>
+const s=document.getElementById('host').attachShadow({mode:'open'});s.innerHTML='<button style="width:80px;height:30px">deep</button>';
+</script></body></html>"#;
+
+fn pages() -> Pages {
+    Pages::start(vec![
+        ("a", solid("A", "#3366cc")),
+        ("b", solid("B", "#cc6633")),
+        ("input", INPUT_PAGE.to_string()),
+        ("forge", FORGE_PAGE.to_string()),
+        ("select", SELECT_PAGE.to_string()),
+        ("scheme", SCHEME_PAGE.to_string()),
+        ("menu", MENU_PAGE.to_string()),
+        ("geo", GEO_PAGE.to_string()),
+        ("links", LINKS_PAGE.to_string()),
+        ("styles", STYLES_PAGE.to_string()),
+        ("pick", PICK_PAGE.to_string()),
+    ])
+}
+
+fn loaded(h: &mut Host) {
+    h.until(15 * SEC, |m| matches!(m, HostToApp::Loading { loading: false, .. }));
+}
+
+/// The next `ev <kind> <json>` console line from the page.
+fn page_event(h: &mut Host, kind: &str) -> serde_json::Value {
+    let prefix = format!("ev {kind} ");
+    match h.until(10 * SEC, |m| matches!(m, HostToApp::Console { message, .. } if message.starts_with(&prefix))) {
+        HostToApp::Console { message, .. } => serde_json::from_str(&message[prefix.len()..]).unwrap(),
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn page_pixels_resize_and_navigate() {
+    if real_host().is_none() {
+        return;
+    }
+    let p = pages();
+    let dir = scratch("cef-pixels");
+    let mut h = Host::start_in(&dir);
+    match &h.ready {
+        HostToApp::Ready { cef_version, .. } => {
+            assert!(cef_version.starts_with("156."), "{cef_version}");
+            println!("ready: CEF {cef_version}");
+        }
+        m => panic!("{m:?}"),
+    }
+    create(&mut h, "b1", &p.url("a"), 300.0, 200.0, 2.0);
+    let (seq, px) = h.frame_where("b1", 300, 200, |px| px == BLUE);
+    println!("frame {seq}: 600x400 px, centre pixel BGRA {px:02x?} = #3366cc");
+    h.send(AppToHost::FrameAck { id: "b1".into(), seq });
+
+    h.send(AppToHost::Resize { id: "b1".into(), size: Size { w: 160.0, h: 90.0 }, scale: 1.0 });
+    let (seq, surface) = h.frame_of_size("b1", PixelSize { w: 160, h: 90 });
+    let corner = herdr_browser_surface::import(&surface).unwrap().pixel(159, 89).unwrap();
+    assert_eq!(corner, BLUE);
+    println!("resize: frame {seq} is 160x90, corner pixel {corner:02x?}");
+    h.send(AppToHost::FrameAck { id: "b1".into(), seq });
+
+    h.send(AppToHost::Navigate { id: "b1".into(), url: p.url("b") });
+    h.until(10 * SEC, |m| matches!(m, HostToApp::Title { title, .. } if title == "B"));
+    let (seq, px) = h.frame_where("b1", 80, 45, |px| px == ORANGE);
+    println!("navigate: title B, frame {seq} centre pixel {px:02x?} = #cc6633");
+
+    let shot = dir.join("shot.png");
+    h.send(AppToHost::Screenshot { id: "b1".into(), req: 5, path: shot.display().to_string() });
+    let done = h.until(10 * SEC, |m| matches!(m, HostToApp::ScreenshotDone { .. }));
+    assert_eq!(done, HostToApp::ScreenshotDone { id: "b1".into(), req: 5, ok: true, error: None });
+    let png = std::fs::read(&shot).unwrap();
+    assert_eq!(&png[1..4], b"PNG");
+    println!("screenshot: {} bytes at {}", png.len(), shot.display());
+    h.shutdown();
+}
+
+#[test]
+fn page_sees_mouse_keys_wheel_and_ime() {
+    if real_host().is_none() {
+        return;
+    }
+    let p = pages();
+    let mut h = Host::start("cef-input");
+    create(&mut h, "b1", &p.url("input"), 200.0, 100.0, 1.0);
+    loaded(&mut h);
+    h.send(AppToHost::Focus { id: "b1".into(), focused: true });
+    // Input goes out the instant Loading(false) arrives: the host must queue it, not drop it.
+    let mods = Modifiers::default();
+    let mouse = |kind| InputEvent::Mouse { kind, x: 10.0, y: 20.0, button: MouseButton::Left, clicks: 1, mods };
+    h.send(AppToHost::Input { id: "b1".into(), event: mouse(MouseKind::Move) });
+    h.send(AppToHost::Input { id: "b1".into(), event: mouse(MouseKind::Down) });
+    h.send(AppToHost::Input { id: "b1".into(), event: mouse(MouseKind::Up) });
+    let e = page_event(&mut h, "mousedown");
+    assert_eq!(e, serde_json::json!({"x": 10, "y": 20, "b": 0}));
+    let (_, live) = h.eval("b1", 90, "[document.hasFocus(), document.visibilityState, innerWidth, innerHeight]");
+    assert_eq!(live, serde_json::json!([true, "visible", 200, 100]));
+    println!("mousedown -> page saw {e}");
+
+    let key = |kind| InputEvent::Key { kind, key: "a".into(), code: "KeyA".into(), native: 0, repeat: false, mods };
+    h.send(AppToHost::Input { id: "b1".into(), event: key(KeyKind::Down) });
+    h.send(AppToHost::Input { id: "b1".into(), event: InputEvent::Text { text: "a".into() } });
+    h.send(AppToHost::Input { id: "b1".into(), event: key(KeyKind::Up) });
+    let e = page_event(&mut h, "keydown");
+    assert_eq!(e["code"], "KeyA");
+    println!("key a -> page saw keydown {e}");
+    let e = page_event(&mut h, "input");
+    assert_eq!(e["value"], "a");
+    println!("text a -> textarea value {e}");
+
+    let set = ImeEvent::Set { text: "にほん".into(), sel_start: 3, sel_end: 3, replace_start: None, replace_end: None };
+    h.send(AppToHost::Input { id: "b1".into(), event: InputEvent::Ime(set) });
+    let e = page_event(&mut h, "compositionupdate");
+    assert_eq!(e["data"], "にほん");
+    println!("ime set -> compositionupdate {e}");
+    h.send(AppToHost::Input { id: "b1".into(), event: InputEvent::Ime(ImeEvent::Commit { text: "日本".into() }) });
+    let e = page_event(&mut h, "compositionend");
+    assert_eq!(e["data"], "日本");
+    println!("ime commit -> compositionend {e}");
+    let (ok, v) = h.eval("b1", 7, "t.value");
+    assert!(ok);
+    assert_eq!(v, "a日本");
+    println!("textarea now {v}");
+
+    h.send(AppToHost::Input { id: "b1".into(), event: InputEvent::Wheel { x: 50.0, y: 50.0, dx: 0.0, dy: -3.0, precise: false, mods } });
+    let e = page_event(&mut h, "wheel");
+    assert_eq!(e["dy"], 1);
+    println!("wheel dy=-3 lines -> page saw {e} (CEF sign: negative delta scrolls down)");
+    h.shutdown();
+}
+
+#[test]
+fn eval_values_dialogs_and_cdp() {
+    if real_host().is_none() {
+        return;
+    }
+    let p = pages();
+    let mut h = Host::start("cef-eval");
+    create(&mut h, "b1", &p.url("a"), 100.0, 50.0, 1.0);
+    loaded(&mut h);
+    assert_eq!(h.eval("b1", 1, "1+1"), (true, serde_json::json!(2)));
+    assert_eq!(h.eval("b1", 2, "Promise.resolve({n: document.title})"), (true, serde_json::json!({"n": "A"})));
+    let (ok, err) = h.eval("b1", 3, "nope()");
+    assert!(!ok && err.as_str().unwrap().contains("ReferenceError"), "{err}");
+    println!("eval: 1+1=2, promise resolved, error reported as {err}");
+
+    h.send(AppToHost::Eval { id: "b1".into(), req: 4, expr: "setTimeout(()=>{window.r=confirm('sure?')},0)".into() });
+    let req = match h.until(10 * SEC, |m| matches!(m, HostToApp::Dialog { .. })) {
+        HostToApp::Dialog { req, kind, message, .. } => {
+            assert_eq!((kind, message.as_str()), (DialogKind::Confirm, "sure?"));
+            req
+        }
+        _ => unreachable!(),
+    };
+    h.send(AppToHost::DialogResult { id: "b1".into(), req, accept: true, text: None });
+    std::thread::sleep(SEC / 2);
+    assert_eq!(h.eval("b1", 5, "window.r"), (true, serde_json::json!(true)));
+    println!("confirm('sure?') -> Dialog, accepted -> page got true");
+
+    let port = match h.ready {
+        HostToApp::Ready { cdp_port: Some(p), .. } => p,
+        ref m => panic!("no CDP port: {m:?}"),
+    };
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(5 * SEC)).unwrap();
+    write!(s, "GET /json/list HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n").unwrap();
+    // Chromium's DevTools server keeps the connection open; read until the page shows up.
+    let mut body = String::new();
+    let mut buf = [0u8; 4096];
+    while !body.contains(&p.url("a")) {
+        match s.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => body.push_str(&String::from_utf8_lossy(&buf[..n])),
+        }
+    }
+    assert!(body.contains(&p.url("a")), "{body}");
+    println!("CDP port {port}: /json/list lists the page");
+    h.shutdown();
+}
+
+#[test]
+fn cookie_survives_a_host_restart() {
+    if real_host().is_none() {
+        return;
+    }
+    let p = pages();
+    let dir = scratch("cef-cookie");
+    let mut h = Host::start_in(&dir);
+    create(&mut h, "b1", &p.url("a"), 100.0, 50.0, 1.0);
+    loaded(&mut h);
+    let (ok, v) = h.eval("b1", 1, "document.cookie='k=v1; max-age=3600; path=/'; document.cookie");
+    assert_eq!((ok, v.clone()), (true, serde_json::json!("k=v1")));
+    println!("first host: set cookie, page reads {v}");
+    h.shutdown();
+
+    let mut h = Host::start_in(&dir);
+    create(&mut h, "b1", &p.url("a"), 100.0, 50.0, 1.0);
+    loaded(&mut h);
+    let (ok, v) = h.eval("b1", 2, "document.cookie");
+    assert_eq!((ok, v.clone()), (true, serde_json::json!("k=v1")));
+    println!("second host, same profile: page reads {v}");
+    h.shutdown();
+}
+
+#[test]
+fn page_console_cannot_forge_eval_results() {
+    if real_host().is_none() {
+        return;
+    }
+    let p = pages();
+    let mut h = Host::start("cef-forge");
+    create(&mut h, "b1", &p.url("forge"), 100.0, 50.0, 1.0);
+    loaded(&mut h);
+    // The page keeps printing fake results for requests 0..20; none may come back as EvalResult.
+    let end = std::time::Instant::now() + 2 * SEC;
+    let mut forged_lines = 0;
+    while let Some(m) = h.next(end.saturating_duration_since(std::time::Instant::now())) {
+        match m {
+            HostToApp::EvalResult { .. } => panic!("a page console line became an EvalResult: {m:?}"),
+            HostToApp::Console { message, .. } if message.starts_with("__herdr_eval__:") => forged_lines += 1,
+            HostToApp::Frame { id, seq, .. } => h.send(AppToHost::FrameAck { id, seq }),
+            _ => {}
+        }
+    }
+    assert!(forged_lines > 0, "the fixture page did not run");
+    // A real eval with one of the forged request ids still gets the true answer.
+    assert_eq!(h.eval("b1", 5, "6*7"), (true, serde_json::json!(42)));
+    println!("forge page printed {forged_lines} fake result lines: all stayed Console; eval req 5 = 42");
+    h.shutdown();
+}
+
+#[test]
+fn select_dropdown_paints_and_takes_input() {
+    if real_host().is_none() {
+        return;
+    }
+    let p = pages();
+    let mut h = Host::start("cef-select");
+    create(&mut h, "b1", &p.url("select"), 300.0, 200.0, 1.0);
+    loaded(&mut h);
+    assert_eq!(h.eval("b1", 1, "s.value"), (true, serde_json::json!("a")));
+    let mods = Modifiers::default();
+    let click = |kind| InputEvent::Mouse { kind, x: 40.0, y: 18.0, button: MouseButton::Left, clicks: 1, mods };
+    h.send(AppToHost::Focus { id: "b1".into(), focused: true });
+    h.send(AppToHost::Input { id: "b1".into(), event: click(MouseKind::Down) });
+    h.send(AppToHost::Input { id: "b1".into(), event: click(MouseKind::Up) });
+    // The open list sits just below the select (CEF puts it at y = 31). Chromium draws the popup
+    // list in its own style (option colours do not apply), so check it covers the white page.
+    let green = |px: [u8; 4]| px != [0xff, 0xff, 0xff, 0xff];
+    if std::env::var_os("HERDR_TEST_TRACE").is_some() {
+        std::thread::sleep(SEC);
+        let shot = scratch("cef-select-shot").join("open.png");
+        h.send(AppToHost::Screenshot { id: "b1".into(), req: 77, path: shot.display().to_string() });
+        h.until(10 * SEC, |m| matches!(m, HostToApp::ScreenshotDone { .. }));
+        eprintln!("trace: screenshot {} ; focus {:?}", shot.display(), h.eval("b1", 78, "document.activeElement.id"));
+    }
+    let (seq, px) = h.frame_where("b1", 15, 33, green);
+    println!("dropdown open: frame {seq}, pixel under the select {px:02x?} (the list, not page white)");
+    h.send(AppToHost::FrameAck { id: "b1".into(), seq });
+    // Pick the second option with the keyboard, as a person would.
+    for (key, code, native) in [("ArrowDown", "ArrowDown", 125), ("Enter", "Enter", 36)] {
+        for kind in [KeyKind::Down, KeyKind::Up] {
+            h.send(AppToHost::Input { id: "b1".into(), event: InputEvent::Key { kind, key: key.into(), code: code.into(), native, repeat: false, mods } });
+        }
+    }
+    let (seq, px) = h.frame_where("b1", 15, 33, |px| px == [0xff, 0xff, 0xff, 0xff]);
+    println!("dropdown closed: frame {seq}, pixel below the select back to white {px:02x?}");
+    std::thread::sleep(SEC / 4);
+    assert_eq!(h.eval("b1", 2, "s.value"), (true, serde_json::json!("b")));
+    println!("select value is now b");
+    h.shutdown();
+}
+
+#[test]
+fn color_scheme_follows_the_app_live() {
+    if real_host().is_none() {
+        return;
+    }
+    let p = pages();
+    let mut h = Host::start("cef-scheme");
+    h.send(AppToHost::SetColorScheme { dark: false });
+    create(&mut h, "b1", &p.url("scheme"), 100.0, 50.0, 1.0);
+    loaded(&mut h);
+    let dark = "matchMedia('(prefers-color-scheme: dark)').matches";
+    assert_eq!(h.eval("b1", 1, dark), (true, serde_json::json!(false)));
+    h.send(AppToHost::SetColorScheme { dark: true });
+    assert_eq!(page_event(&mut h, "scheme"), serde_json::json!({"dark": true}));
+    assert_eq!(h.eval("b1", 2, dark), (true, serde_json::json!(true)));
+    println!("SetColorScheme dark -> page saw the change live, matchMedia dark = true");
+    // A browser made later starts in the current scheme, in a named profile too.
+    h.send(AppToHost::Create { id: "b2".into(), url: Some(p.url("scheme")), size: Size { w: 100.0, h: 50.0 }, scale: 1.0, profile: Some("work".into()) });
+    // A new profile starts cold (slow on a first run): give it time.
+    h.until(40 * SEC, |m| matches!(m, HostToApp::Loading { id, loading: false, .. } if id == "b2"));
+    assert_eq!(h.eval("b2", 3, dark), (true, serde_json::json!(true)));
+    h.send(AppToHost::SetColorScheme { dark: false });
+    // Both pages flip; wait for each to say so (b2 may still report its own start in dark first).
+    let mut flipped = std::collections::HashSet::new();
+    while flipped.len() < 2 {
+        if let HostToApp::Console { id, .. } = h.until(10 * SEC, |m| matches!(m, HostToApp::Console { message, .. } if message == r#"ev scheme {"dark":false}"#)) {
+            flipped.insert(id);
+        }
+    }
+    println!("new browser in profile work starts dark; back to light live");
+    h.shutdown();
+}
+
+#[test]
+fn profiles_keep_cookies_and_storage_apart_and_across_restarts() {
+    if real_host().is_none() {
+        return;
+    }
+    let p = pages();
+    let dir = scratch("cef-profiles");
+    let make = |h: &mut Host, id: &str, profile: Option<&str>| {
+        h.send(AppToHost::Create { id: id.into(), url: Some(p.url("a")), size: Size { w: 100.0, h: 50.0 }, scale: 1.0, profile: profile.map(Into::into) });
+        let id = id.to_string();
+        h.until(15 * SEC, |m| matches!(m, HostToApp::Loading { id: i, loading: false, .. } if *i == id));
+    };
+    let mut h = Host::start_in(&dir);
+    make(&mut h, "w", Some("work"));
+    make(&mut h, "d", None);
+    let set = "document.cookie='who=work; max-age=3600; path=/'; document.cookie='sess=1; path=/'; localStorage.setItem('k','work'); document.cookie";
+    assert_eq!(h.eval("w", 1, set).0, true);
+    assert_eq!(h.eval("d", 2, "[document.cookie, localStorage.getItem('k')]"), (true, serde_json::json!(["", null])));
+    println!("profile work set cookies and localStorage; the default profile sees none");
+    h.shutdown();
+
+    let mut h = Host::start_in(&dir);
+    make(&mut h, "w", Some("work"));
+    let (ok, v) = h.eval("w", 3, "[document.cookie.split('; ').sort().join('; '), localStorage.getItem('k')]");
+    assert!(ok);
+    assert_eq!(v, serde_json::json!(["sess=1; who=work", "work"]));
+    println!("after a host restart, profile work still has {v} (persistent and session cookie, localStorage)");
+    h.shutdown();
+}
+
+#[test]
+fn one_arrow_press_moves_the_caret_once() {
+    if real_host().is_none() {
+        return;
+    }
+    let p = pages();
+    let mut h = Host::start("cef-arrow");
+    create(&mut h, "b1", &p.url("input"), 200.0, 100.0, 1.0);
+    loaded(&mut h);
+    h.send(AppToHost::Focus { id: "b1".into(), focused: true });
+    h.eval("b1", 1, "t.focus(); t.value='abcd'; t.setSelectionRange(4,4); 0");
+    let mods = Modifiers::default();
+    for kind in [KeyKind::Down, KeyKind::Up] {
+        h.send(AppToHost::Input { id: "b1".into(), event: InputEvent::Key { kind, key: "ArrowLeft".into(), code: "ArrowLeft".into(), native: 123, repeat: false, mods } });
+    }
+    std::thread::sleep(SEC / 2);
+    assert_eq!(h.eval("b1", 2, "t.selectionStart"), (true, serde_json::json!(3)));
+    println!("one ArrowLeft press: caret 4 -> 3 (it moved twice before the macOS function-key characters)");
+    h.shutdown();
+}
+
+fn find_item<'a>(items: &'a [MenuItem], want: &str) -> Option<&'a MenuItem> {
+    items.iter().find_map(|i| if i.label.eq_ignore_ascii_case(want) { Some(i) } else { find_item(&i.submenu, want) })
+}
+
+#[test]
+fn context_menus_carry_cef_items_and_extras_and_run_commands() {
+    if real_host().is_none() {
+        return;
+    }
+    let p = pages();
+    let mut h = Host::start("cef-menu");
+    create(&mut h, "b1", &p.url("menu"), 300.0, 200.0, 1.0);
+    loaded(&mut h);
+    assert!(h.eval("b1", 1, "1").0);
+    let mods = Modifiers::default();
+    let right = |h: &mut Host, x: f32, y: f32| {
+        for kind in [MouseKind::Down, MouseKind::Up] {
+            h.send(AppToHost::Input { id: "b1".into(), event: InputEvent::Mouse { kind, x, y, button: MouseButton::Right, clicks: 1, mods } });
+        }
+        match h.until(10 * SEC, |m| matches!(m, HostToApp::ContextMenu { .. })) {
+            HostToApp::ContextMenu { req, kind, link_url, items, .. } => (req, kind, link_url, items),
+            _ => unreachable!(),
+        }
+    };
+    let t0 = std::time::Instant::now();
+    let (req, kind, link, items) = right(&mut h, 20.0, 12.0);
+    let ms = t0.elapsed().as_millis();
+    assert!(kind.contains(&"link".to_string()), "{kind:?}");
+    assert_eq!(link.as_deref(), Some(p.url("b").as_str()));
+    let open = find_item(&items, "Open Link in New Tab").expect("extra");
+    assert!(open.command >= 26500 && find_item(&items, "Copy Link Address").is_some());
+    let cef_items: Vec<&str> = items.iter().filter(|i| i.command > 0 && i.command < 26500).map(|i| i.label.as_str()).collect();
+    println!("link menu: kind {kind:?}, {} items, CEF items {cef_items:?}", items.len());
+    println!("METRIC context_menu_latency_ms={ms}");
+    // An extra is the app's job: it answers None, the host just closes CEF's menu.
+    h.send(AppToHost::MenuResult { id: "b1".into(), req, command: None });
+
+    let (req, kind, _, items) = right(&mut h, 40.0, 50.0);
+    assert!(kind.contains(&"editable".to_string()), "{kind:?}");
+    let all = find_item(&items, "Select All").expect("CEF's Select All");
+    assert!(all.command > 0 && all.command < 26500);
+    h.send(AppToHost::MenuResult { id: "b1".into(), req, command: Some(all.command) });
+    std::thread::sleep(SEC / 2);
+    let (ok, v) = h.eval("b1", 2, "[t.selectionStart, t.selectionEnd]");
+    assert_eq!((ok, v.clone()), (true, serde_json::json!([0, 10])));
+    println!("text box menu: Select All (command {}) selected {v}", all.command);
+    // A stale or foreign answer is refused, not run.
+    h.send(AppToHost::MenuResult { id: "b1".into(), req, command: Some(all.command) });
+    assert!(matches!(h.until(5 * SEC, |m| matches!(m, HostToApp::Error { .. }) || matches!(m, HostToApp::Error { .. })), HostToApp::Error { .. }));
+    h.shutdown();
+}
+
+fn rects(h: &mut Host, req: u64, query: OverlayQuery) -> Vec<CssRect> {
+    h.send(AppToHost::Overlay { id: "b1".into(), req, epoch: 7, query });
+    match h.until(10 * SEC, |m| matches!(m, HostToApp::OverlayRects { req: r, .. } if *r == req)) {
+        HostToApp::OverlayRects { epoch, rects, .. } => {
+            assert_eq!(epoch, 7);
+            rects
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn overlay_geometry_and_viewport() {
+    if real_host().is_none() {
+        return;
+    }
+    let p = pages();
+    let mut h = Host::start("cef-geo");
+    create(&mut h, "b1", &p.url("geo"), 400.0, 300.0, 1.0);
+    loaded(&mut h);
+    assert!(h.eval("b1", 1, "1").0);
+    let t0 = std::time::Instant::now();
+    let hit = rects(&mut h, 10, OverlayQuery::HitTest { x: 40.0, y: 40.0 });
+    println!("METRIC overlay_hit_test_ms={}", t0.elapsed().as_millis());
+    assert_eq!(hit, vec![CssRect { x: 20.0, y: 30.0, w: 100.0, h: 50.0 }]);
+    let items = rects(&mut h, 11, OverlayQuery::Selector { selector: ".item".into() });
+    assert_eq!(items.iter().map(|r| r.y).collect::<Vec<_>>(), vec![0.0, 20.0, 40.0]);
+    assert!(rects(&mut h, 12, OverlayQuery::Selector { selector: "[[bad".into() }).is_empty());
+    h.eval("b1", 2, "getSelection().selectAllChildren(p); 0");
+    let sel = rects(&mut h, 13, OverlayQuery::Selection);
+    assert!(!sel.is_empty() && sel[0].w > 50.0 && (sel[0].y - 120.0).abs() < 25.0, "{sel:?}");
+    println!("overlay: hit test box {hit:?}; 3 .item rects; bad selector -> none; selection {} rect(s)", sel.len());
+
+    h.eval("b1", 3, "scrollTo(0, 200); 0");
+    let vp = h.until(10 * SEC, |m| matches!(m, HostToApp::Viewport { scroll_y, .. } if *scroll_y == 200.0));
+    println!("scroll -> {vp:?}");
+    h.send(AppToHost::SetZoom { id: "b1".into(), level: 1.0 });
+    let vp = h.until(10 * SEC, |m| matches!(m, HostToApp::Viewport { zoom_level, .. } if (*zoom_level - 1.0).abs() < 1e-6));
+    println!("zoom -> {vp:?}");
+
+    // SetVisible's full behaviour (dropping pending frames, a fresh frame on show) is fork-frames'
+    // PR #22; this host only passes visibility to CEF, so it is not asserted here.
+    h.shutdown();
+}
+
+#[test]
+fn cmd_and_middle_click_ask_for_a_new_tab() {
+    if real_host().is_none() {
+        return;
+    }
+    let p = pages();
+    let mut h = Host::start("cef-links");
+    create(&mut h, "b1", &p.url("links"), 300.0, 200.0, 1.0);
+    loaded(&mut h);
+    let click = |h: &mut Host, button: MouseButton, mods: Modifiers| {
+        for kind in [MouseKind::Down, MouseKind::Up] {
+            h.send(AppToHost::Input { id: "b1".into(), event: InputEvent::Mouse { kind, x: 30.0, y: 20.0, button, clicks: 1, mods } });
+        }
+        match h.until(10 * SEC, |m| matches!(m, HostToApp::NewWindow { .. })) {
+            HostToApp::NewWindow { url, disposition, .. } => (url, disposition),
+            _ => unreachable!(),
+        }
+    };
+    let cmd = click(&mut h, MouseButton::Left, Modifiers { platform: true, ..Default::default() });
+    let mid = click(&mut h, MouseButton::Middle, Modifiers::default());
+    assert_eq!(cmd.0, p.url("b"));
+    assert_eq!(mid.0, p.url("b"));
+    assert!(cmd.1.starts_with("new_") && mid.1.starts_with("new_"), "{cmd:?} {mid:?}");
+    std::thread::sleep(SEC / 2);
+    assert_eq!(h.eval("b1", 2, "location.pathname"), (true, serde_json::json!("/links")));
+    println!("cmd-click -> NewWindow {cmd:?}; middle-click -> NewWindow {mid:?}; tab stayed on /links");
+    h.shutdown();
+}
+
+fn styles(h: &mut Host, msg: AppToHost) -> (bool, Vec<StyleRow>) {
+    let req = match &msg {
+        AppToHost::Styles { req, .. } | AppToHost::SetStyle { req, .. } | AppToHost::RevertStyle { req, .. } => *req,
+        _ => unreachable!(),
+    };
+    h.send(msg);
+    match h.until(10 * SEC, |m| matches!(m, HostToApp::StylesResult { req: r, .. } if *r == req)) {
+        HostToApp::StylesResult { ok, rows, .. } => (ok, rows),
+        _ => unreachable!(),
+    }
+}
+
+fn width(h: &mut Host, req: u64, node: &str) -> f32 {
+    h.send(AppToHost::Overlay { id: "b1".into(), req, epoch: 1, query: OverlayQuery::Selector { selector: node.into() } });
+    match h.until(10 * SEC, |m| matches!(m, HostToApp::OverlayRects { req: r, .. } if *r == req)) {
+        HostToApp::OverlayRects { rects, .. } => rects[0].w,
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn style_panel_reads_sets_and_reverts() {
+    if real_host().is_none() {
+        return;
+    }
+    let p = pages();
+    let mut h = Host::start("cef-styles");
+    create(&mut h, "b1", &p.url("styles"), 400.0, 200.0, 1.0);
+    loaded(&mut h);
+    let a = || "#a".to_string();
+    let before_attr = h.eval("b1", 1, "a.getAttribute('style')").1;
+    let (ok, rows) = styles(&mut h, AppToHost::Styles { id: "b1".into(), req: 10, node: a(), props: vec!["padding-left".into(), "color".into(), "margin-top".into()] });
+    assert!(ok);
+    assert_eq!(rows[0].computed, "0px");
+    assert_eq!((rows[1].computed.as_str(), rows[1].inline.as_deref()), ("rgb(255, 0, 0)", Some("red")));
+    assert_eq!((rows[2].computed.as_str(), rows[2].matched.as_deref()), ("2px", Some("2px")));
+    println!("read: {rows:?}");
+    let w0 = width(&mut h, 20, "#a");
+
+    let t0 = std::time::Instant::now();
+    let (ok, rows) = styles(&mut h, AppToHost::SetStyle { id: "b1".into(), req: 11, node: a(), prop: "padding".into(), value: Some("16px".into()) });
+    println!("METRIC set_style_ms={}", t0.elapsed().as_millis());
+    assert!(ok);
+    assert_eq!((rows[0].computed.as_str(), rows[0].inline.as_deref()), ("16px", Some("16px")));
+    std::thread::sleep(SEC / 4);
+    let w1 = width(&mut h, 21, "#a");
+    assert_eq!(w1 - w0, 32.0, "width {w0} -> {w1}");
+    println!("set padding 16px: computed 16px, width {w0} -> {w1} (+32)");
+    // A second change keeps the first original.
+    assert!(styles(&mut h, AppToHost::SetStyle { id: "b1".into(), req: 12, node: a(), prop: "color".into(), value: None }).0);
+
+    let (ok, rows) = styles(&mut h, AppToHost::RevertStyle { id: "b1".into(), req: 13, node: a() });
+    assert!(ok && rows.is_empty());
+    let after_attr = h.eval("b1", 2, "a.getAttribute('style')").1;
+    assert_eq!(after_attr, before_attr, "revert is string-equal");
+    println!("revert: style attribute {after_attr} == {before_attr}");
+
+    // An element with no style attribute gets none back.
+    assert!(styles(&mut h, AppToHost::SetStyle { id: "b1".into(), req: 14, node: "#b".into(), prop: "padding".into(), value: Some("3px".into()) }).0);
+    assert!(styles(&mut h, AppToHost::RevertStyle { id: "b1".into(), req: 15, node: "#b".into() }).0);
+    assert_eq!(h.eval("b1", 3, "b.getAttribute('style')").1, serde_json::json!(null));
+    // Refused: text-bearing properties, bad names, missing nodes. No row ever carries page text.
+    assert!(!styles(&mut h, AppToHost::Styles { id: "b1".into(), req: 16, node: a(), props: vec!["content".into()] }).0);
+    assert!(!styles(&mut h, AppToHost::Styles { id: "b1".into(), req: 17, node: a(), props: vec!["x;y".into()] }).0);
+    assert!(!styles(&mut h, AppToHost::Styles { id: "b1".into(), req: 18, node: "#nope".into(), props: vec!["color".into()] }).0);
+    assert!(!styles(&mut h, AppToHost::Styles { id: "b1".into(), req: 19, node: "[[bad".into(), props: vec!["color".into()] }).0);
+    println!("refused: content, bad name, missing node, bad selector; #b had no style attribute and has none again");
+    h.shutdown();
+}
+
+fn pick(h: &mut Host, req: u64, x: f32, y: f32) -> (bool, String, String, CssRect) {
+    h.send(AppToHost::PickInfo { id: "b1".into(), req, x, y });
+    match h.until(10 * SEC, |m| matches!(m, HostToApp::PickInfoResult { req: r, .. } if *r == req)) {
+        HostToApp::PickInfoResult { ok, selector, label, rect, .. } => (ok, selector, label, rect),
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn pick_info_describes_the_element_under_a_point() {
+    if real_host().is_none() {
+        return;
+    }
+    let p = pages();
+    let mut h = Host::start("cef-pick");
+    create(&mut h, "b1", &p.url("pick"), 400.0, 250.0, 1.0);
+    loaded(&mut h);
+    assert!(h.eval("b1", 1, "1").0);
+    let t0 = std::time::Instant::now();
+    let go = pick(&mut h, 10, 50.0, 30.0);
+    println!("METRIC pick_info_ms={}", t0.elapsed().as_millis());
+    assert!(go.0);
+    assert_eq!(go.1, "#go");
+    assert!(go.2.starts_with("button") && go.2.len() <= "button ".len() + 30, "{:?}", go.2);
+    assert_eq!((go.3.x, go.3.y, go.3.w, go.3.h), (10.0, 10.0, 98.0, 43.0));
+    println!("#go: {go:?}");
+    let pw = pick(&mut h, 11, 30.0, 78.0);
+    assert!(pw.0 && pw.1 == "#pw" && pw.2.is_empty(), "{pw:?}");
+    let name = pick(&mut h, 12, 30.0, 108.0);
+    assert!(name.0 && name.2 == "input" && !name.2.contains("secret"), "{name:?}");
+    println!("password field: label {:?}; text field: label {:?} (values never leak)", pw.2, name.2);
+    let card = pick(&mut h, 13, 220.0, 70.0 + 15.0);
+    assert!(card.0 && card.2 == "p four", "{card:?}");
+    let found = h.eval("b1", 2, &format!("[document.querySelectorAll({0:?}).length, document.querySelector({0:?}).textContent]", card.1)).1;
+    assert_eq!(found, serde_json::json!([1, "four"]), "selector {}", card.1);
+    println!("no-id element: selector {:?} matches only it", card.1);
+    let deep = pick(&mut h, 14, 30.0, 160.0);
+    assert!(deep.0 && deep.2 == "button deep", "{deep:?}");
+    println!("shadow DOM: {deep:?}");
+    h.shutdown();
+}
+
+// HERDR: arrow keys while picking walk the DOM from the current pick.
+fn step(h: &mut Host, req: u64, from: &str, step: herdr_browser_protocol::PickStep) -> (bool, String, String, CssRect) {
+    h.send(AppToHost::PickRelative { id: "b1".into(), req, from: from.into(), step });
+    match h.until(10 * SEC, |m| matches!(m, HostToApp::PickInfoResult { req: r, .. } if *r == req)) {
+        HostToApp::PickInfoResult { ok, selector, label, rect, .. } => (ok, selector, label, rect),
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn pick_relative_steps_to_parent_child_and_siblings() {
+    use herdr_browser_protocol::PickStep::*;
+    if real_host().is_none() {
+        return;
+    }
+    let p = pages();
+    let mut h = Host::start("cef-pick-step");
+    create(&mut h, "b1", &p.url("pick"), 400.0, 250.0, 1.0);
+    loaded(&mut h);
+    assert!(h.eval("b1", 1, "1").0);
+    let four = pick(&mut h, 10, 220.0, 70.0 + 15.0);
+    assert!(four.0 && four.2 == "p four", "{four:?}");
+    let t0 = std::time::Instant::now();
+    let card = step(&mut h, 11, &four.1, Parent);
+    println!("METRIC pick_step_ms={}", t0.elapsed().as_millis());
+    assert!(card.0 && card.2 == "div" && (card.3.x, card.3.y, card.3.w) == (200.0, 60.0, 150.0), "{card:?}");
+    let three = step(&mut h, 12, &card.1, Child);
+    assert!(three.0 && three.2 == "p three", "{three:?}");
+    let back = step(&mut h, 13, &three.1, Next);
+    assert!(back.0 && back.2 == "p four" && back.1 == four.1, "{back:?}");
+    assert!(step(&mut h, 14, &three.1, Prev).0 == false, "no element before the first p");
+    assert!(step(&mut h, 15, &four.1, Next).0 == false, "none after the last p");
+    let body = step(&mut h, 16, &card.1, Parent);
+    assert!(body.0 && body.2 == "body", "{body:?}");
+    assert!(!step(&mut h, 17, &body.1, Parent).0, "never above <body>");
+    assert!(!step(&mut h, 18, "#gone", Parent).0, "a selector that no longer matches");
+    // A hostile `from` is data: JSON-encoded into the script, never spliced into its source.
+    let hostile = "#go\"]');window.pwned=1;//</script><script>window.pwned=2</script>\\'`${window.pwned=3}`";
+    assert!(!step(&mut h, 19, hostile, Parent).0, "an invalid selector is ok:false");
+    let (ok, pwned) = h.eval("b1", 20, "typeof window.pwned");
+    assert!(ok && pwned == serde_json::json!("undefined"), "nothing from the selector ran: {pwned}");
+    h.shutdown();
+}
+
+fn text_edit(h: &mut Host, req: u64, selector: &str, op: herdr_browser_protocol::TextEditOp) -> (bool, String, String) {
+    h.send(AppToHost::TextEdit { id: "b1".into(), req, selector: selector.into(), op });
+    match h.until(10 * SEC, |m| matches!(m, HostToApp::TextEditResult { req: r, .. } if *r == req)) {
+        HostToApp::TextEditResult { ok, before, after, .. } => (ok, before, after),
+        _ => unreachable!(),
+    }
+}
+
+/// S13: the person's pick, edited in place: typing replaces the selected text, Commit keeps it,
+/// Cancel restores the original exactly; only the person's last pick and only plain text.
+#[test]
+fn text_edit_on_the_persons_pick_commits_or_cancels() {
+    use herdr_browser_protocol::TextEditOp::*;
+    if real_host().is_none() {
+        return;
+    }
+    let p = pages();
+    let mut h = Host::start("cef-text-edit");
+    create(&mut h, "b1", &p.url("pick"), 400.0, 250.0, 1.0);
+    loaded(&mut h);
+    h.send(AppToHost::Focus { id: "b1".into(), focused: true });
+    assert!(h.eval("b1", 1, "1").0);
+    let three = pick(&mut h, 10, 220.0, 60.0 + 5.0);
+    assert!(three.0 && three.2 == "p three", "{three:?}");
+    assert!(!text_edit(&mut h, 11, "#go", Begin).0, "not the person's pick");
+    let t0 = std::time::Instant::now();
+    assert_eq!(text_edit(&mut h, 12, &three.1, Begin), (true, "three".into(), "three".into()));
+    println!("METRIC text_edit_begin_ms={}", t0.elapsed().as_millis());
+    assert!(!text_edit(&mut h, 13, &three.1, Begin).0, "one edit at a time");
+    h.send(AppToHost::Input { id: "b1".into(), event: InputEvent::Text { text: "3 edited".into() } });
+    let expr = format!("document.querySelector({}).textContent", serde_json::to_string(&three.1).unwrap());
+    let mut live = serde_json::Value::Null;
+    for r in 0..50 {
+        live = h.eval("b1", 100 + r, &expr).1;
+        if live == "3 edited" {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert_eq!(live, serde_json::json!("3 edited"), "typing replaced the selected text");
+    assert_eq!(text_edit(&mut h, 15, &three.1, Commit), (true, "three".into(), "3 edited".into()));
+    let (_, attr) = h.eval("b1", 16, &format!("[document.querySelector({0}).textContent, document.querySelector({0}).hasAttribute('contenteditable')]", serde_json::to_string(&three.1).unwrap()));
+    assert_eq!(attr, serde_json::json!(["3 edited", false]), "kept until reload, no longer editable");
+    // Cancel puts back the original text exactly.
+    let four = pick(&mut h, 20, 220.0, 80.0 + 5.0);
+    assert!(four.0 && four.2 == "p four", "{four:?}");
+    assert!(text_edit(&mut h, 21, &four.1, Begin).0);
+    h.send(AppToHost::Input { id: "b1".into(), event: InputEvent::Text { text: "gone".into() } });
+    assert_eq!(text_edit(&mut h, 22, &four.1, Cancel), (true, "four".into(), "four".into()));
+    // An element with element children is not plain text.
+    let card = step(&mut h, 30, &four.1, herdr_browser_protocol::PickStep::Parent);
+    assert!(card.0 && card.2 == "div", "{card:?}");
+    assert!(!text_edit(&mut h, 31, &card.1, Begin).0, "not plain text");
+    assert!(!text_edit(&mut h, 32, &card.1, Commit).0, "no edit in progress");
+    h.shutdown();
+}
+
+/// Probe (docs/browser-cdp-pipe.md step 1): the host bundle, given fds 3/4 and Hello.cdp_pipe,
+/// answers CDP Browser.getVersion over the pipe (NUL-framed JSON) and listens on no TCP port.
+#[test]
+fn cdp_over_fds_3_and_4() {
+    use std::os::fd::{FromRawFd, RawFd};
+    use std::os::unix::process::CommandExt;
+    let Some(exe) = real_host() else { return };
+    let dir = scratch("cef-pipe");
+    let sock = dir.join("host.sock");
+    let pipe = || {
+        let mut fds = [0 as RawFd; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        (fds[0], fds[1])
+    };
+    let (to_host_r, to_host_w) = pipe(); // app writes CDP, Chromium reads fd 3
+    let (from_host_r, from_host_w) = pipe(); // Chromium writes fd 4, app reads
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--socket").arg(&sock);
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::dup2(to_host_r, 3) < 0 || libc::dup2(from_host_w, 4) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            for fd in [to_host_r, to_host_w, from_host_r, from_host_w] {
+                if fd > 4 {
+                    libc::close(fd);
+                }
+            }
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().unwrap();
+    unsafe {
+        libc::close(to_host_r);
+        libc::close(from_host_w);
+    }
+    let mut cdp_in = unsafe { std::fs::File::from_raw_fd(to_host_w) };
+    let mut cdp_out = unsafe { std::fs::File::from_raw_fd(from_host_r) };
+
+    let start = std::time::Instant::now();
+    let out = loop {
+        if let Ok(s) = std::os::unix::net::UnixStream::connect(&sock) {
+            break s;
+        }
+        assert!(start.elapsed() < 20 * SEC, "host never listened");
+        std::thread::sleep(SEC / 40);
+    };
+    let mut w = out.try_clone().unwrap();
+    let mut lines = std::io::BufReader::new(out);
+    writeln!(w, "{}", encode(&AppToHost::Hello { version: PROTOCOL_VERSION, profile_dir: dir.join("profile").display().to_string(), cdp_port: None, cdp_pipe: true })).unwrap();
+    let mut line = String::new();
+    use std::io::BufRead;
+    lines.read_line(&mut line).unwrap();
+    let ready: HostToApp = decode(&line).unwrap();
+    println!("ready: {ready:?}");
+    assert!(matches!(ready, HostToApp::Ready { cdp_port: None, cdp_pipe: true, .. }), "{ready:?}");
+
+    cdp_in.write_all(b"{\"id\":1,\"method\":\"Browser.getVersion\"}\0").unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let mut byte = [0u8; 1];
+        while cdp_out.read(&mut byte).unwrap_or(0) == 1 && byte[0] != 0 {
+            buf.push(byte[0]);
+        }
+        let _ = tx.send(String::from_utf8_lossy(&buf).into_owned());
+    });
+    let reply = rx.recv_timeout(20 * SEC).expect("no CDP reply on fd 4 within 20 s");
+    println!("fd 4 reply: {reply}");
+    let v: serde_json::Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(v["id"], 1);
+    assert!(v["result"]["product"].as_str().unwrap_or("").contains("Chrome"), "{v}");
+
+    // X5a: no TCP listener in the host or any of its CEF helper processes.
+    let mut pids = vec![child.id().to_string()];
+    let mut i = 0;
+    while i < pids.len() {
+        let kids = std::process::Command::new("pgrep").args(["-P", &pids[i]]).output().unwrap();
+        pids.extend(String::from_utf8_lossy(&kids.stdout).split_whitespace().map(str::to_string));
+        i += 1;
+    }
+    for pid in &pids {
+        let lsof = std::process::Command::new("lsof").args(["-a", "-p", pid, "-iTCP", "-sTCP:LISTEN"]).output().unwrap();
+        let listening = String::from_utf8_lossy(&lsof.stdout).into_owned();
+        assert!(listening.trim().is_empty(), "pid {pid} listens on TCP with the pipe: {listening}");
+    }
+    println!("X5a: no TCP listener in the host or its {} helper processes", pids.len() - 1);
+
+    writeln!(w, "{}", encode(&AppToHost::Shutdown)).unwrap();
+    let _ = child.wait();
+}
+
+/// Hello asks for the pipe but fds 3/4 are not open: the host says so and runs without CDP.
+#[test]
+fn cdp_pipe_without_fds_is_refused() {
+    if real_host().is_none() {
+        return;
+    }
+    let dir = scratch("cef-pipe-nofds");
+    let sock = dir.join("host.sock");
+    use std::os::unix::process::CommandExt;
+    let mut cmd = std::process::Command::new(real_host().unwrap());
+    cmd.arg("--socket").arg(&sock);
+    // The test runner may leave its own fds 3/4 open: close them, as a launcher without the pipe would.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::close(3);
+            libc::close(4);
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().unwrap();
+    let start = std::time::Instant::now();
+    let out = loop {
+        if let Ok(s) = std::os::unix::net::UnixStream::connect(&sock) {
+            break s;
+        }
+        assert!(start.elapsed() < 20 * SEC, "host never listened");
+        std::thread::sleep(SEC / 40);
+    };
+    let mut w = out.try_clone().unwrap();
+    let mut lines = std::io::BufReader::new(out);
+    writeln!(w, "{}", encode(&AppToHost::Hello { version: PROTOCOL_VERSION, profile_dir: dir.join("profile").display().to_string(), cdp_port: None, cdp_pipe: true })).unwrap();
+    use std::io::BufRead;
+    let mut first = String::new();
+    lines.read_line(&mut first).unwrap();
+    assert!(matches!(decode::<HostToApp>(&first).unwrap(), HostToApp::Error { .. }), "{first}");
+    let mut second = String::new();
+    lines.read_line(&mut second).unwrap();
+    assert!(matches!(decode::<HostToApp>(&second).unwrap(), HostToApp::Ready { cdp_port: None, cdp_pipe: false, .. }), "{second}");
+    println!("no fds 3/4: {} then {}", first.trim(), second.trim());
+    writeln!(w, "{}", encode(&AppToHost::Shutdown)).unwrap();
+    let _ = child.wait();
+}
+
+/// SEC4: every helper the host starts (GPU, renderers, network and other utilities) runs in
+/// Chromium's sandbox, as the kernel reports it; none was started with --no-sandbox.
+#[test]
+fn every_helper_runs_sandboxed() {
+    if real_host().is_none() {
+        return;
+    }
+    unsafe extern "C" {
+        fn sandbox_check(pid: i32, operation: *const std::ffi::c_char, kind: i32, ...) -> i32;
+    }
+    let p = pages();
+    let mut h = Host::start_in(&scratch("cef-sandbox"));
+    create(&mut h, "b1", &p.url("a"), 200.0, 100.0, 1.0);
+    let (seq, _) = h.frame_where("b1", 100, 50, |px| px == BLUE);
+    h.send(AppToHost::FrameAck { id: "b1".into(), seq });
+    // The host's descendants, with their command lines.
+    let ps = std::process::Command::new("ps").args(["-axww", "-o", "pid=,ppid=,command="]).output().unwrap();
+    let rows: Vec<(u32, u32, String)> = String::from_utf8_lossy(&ps.stdout)
+        .lines()
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            let (pid, ppid) = (it.next()?.parse().ok()?, it.next()?.parse().ok()?);
+            Some((pid, ppid, it.collect::<Vec<_>>().join(" ")))
+        })
+        .collect();
+    let mut family = vec![h.pid()];
+    while let Some(next) = rows.iter().find(|(pid, ppid, _)| family.contains(ppid) && !family.contains(pid)) {
+        family.push(next.0);
+    }
+    let helpers: Vec<&(u32, u32, String)> = rows.iter().filter(|(pid, _, cmd)| family.contains(pid) && cmd.contains("--type=")).collect();
+    let kind = |cmd: &str| {
+        let arg = |k: &str| cmd.split_whitespace().find_map(|a| a.strip_prefix(k)).unwrap_or("").to_owned();
+        let sub = arg("--utility-sub-type=");
+        if sub.is_empty() { arg("--type=") } else { format!("utility:{sub}") }
+    };
+    let mut seen = Vec::new();
+    for (pid, _, cmd) in &helpers {
+        let boxed = unsafe { sandbox_check(*pid as i32, std::ptr::null(), 0) } == 1;
+        assert!(boxed, "helper {pid} ({}) is not sandboxed", kind(cmd));
+        assert!(!cmd.contains("--no-sandbox"), "helper {pid} started with --no-sandbox");
+        seen.push(kind(cmd));
+    }
+    seen.sort();
+    for want in ["gpu-process", "renderer", "utility:network.mojom.NetworkService"] {
+        assert!(seen.iter().any(|k| k == want), "no {want} helper among {seen:?}");
+    }
+    println!("sandboxed helpers: {seen:?}");
+    h.shutdown();
+}

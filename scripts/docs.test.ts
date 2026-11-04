@@ -30,6 +30,16 @@ describe("CLI examples", () => {
     expect(checkExample("curl --not-our-flag https://example.org", ref)).toEqual([]);
     expect(checkExample("herdr-app ls | other --not-our-flag", ref)).toEqual([]);
     expect(checkExample("herdr-app do pane.split --direction herdr-app", ref)).toEqual([]);
+    expect(checkExample("cargo test --locked --bin herdr-app browser::geometry -- --skip x", ref)).toEqual([]);
+  });
+
+  test("command families and a verb's own flags", () => {
+    expect(checkExample("herdr-app do pane.*", ref)).toEqual([]);
+    expect(checkExample("herdr-app do wat.*", ref)).toEqual(["unknown app command: wat.*"]);
+    const r = { ...ref, help: ref.help + "  herdr-app render --layout <file.json> --out <file.png>\n" };
+    expect(checkExample("herdr-app render --layout a.json --out a.png", r)).toEqual([]);
+    expect(checkExample("herdr-app render --wat a", r)).toEqual(["unknown flag for render: --wat"]);
+    expect(checkExample("herdr-app ls --layout x", r)).toEqual(["unknown flag for ls: --layout"]);
   });
 
   test("reports inline and fenced examples with file and line", () => {

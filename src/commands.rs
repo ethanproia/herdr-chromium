@@ -30,12 +30,12 @@ const fn cmd(name: &'static str, args: &'static [Arg], about: &'static str) -> C
 pub const COMMANDS: &[Command] = &[
     // What exists.
     cmd("space.new", &[opt("name"), opt("folder"), opt("tab"), opt("argv"), opt("task"), opt("machine")],
-        "Make a space: its name (default: none, so it's called after where its first terminal is), the folder its terminals start in (default: the focused terminal's), its first tab's name (default: none, so it's called by its number), optionally an agent (argv) and its first message (task), and the machine it lives on (`hc machine ls`; default this one; its terminals start in that machine's home unless folder)."),
+        "Make a space: its name (default: none, so it's called after where its first terminal is), the folder its terminals start in (default: the focused terminal's), its first tab's name (default: none, so it's called by its number), optionally an agent (argv) and its first message (task), and the machine it lives on (`hc machine ls`; default the focused space's machine for keys and clicks, this computer for scripts; empty string: this computer; its terminals start in that machine's home unless folder)."),
     cmd("space.close", &[opt("id"), opt("confirmed")], "Close a space and end its terminals (asks first unless confirmed)."),
     cmd("space.rename", &[opt("id"), opt("name")], "Rename a space (asks the person when no name; an empty name: called after where its first terminal is again)."),
     cmd("space.move", &[req("id"), req("index")], "Move a space to a position (1 = first)."),
     cmd("tab.new", &[opt("name"), opt("space"), opt("folder"), opt("argv"), opt("task"), opt("mod"), opt("props")],
-        "Make a tab in a space (default: the selected one; name default: none, so it's called by its number) with a terminal in folder (default: the focused terminal's), optionally an agent (argv) and its first message (task); or with a mod as its only pane (`mod`, its `props`: a file, a board)."),
+        "Make a tab in a space (default: the selected one; name default: none, so it's called by its number) with a terminal in folder (default: the focused terminal's), optionally an agent (argv) and its first message (task); or with a mod as its only pane (`mod`, its `props`: a file, a board). With no space open, a person's new tab starts a space (as space.new)."),
     cmd("tab.close", &[opt("id"), opt("confirmed")], "Close a tab and end its terminals."),
     cmd("tab.rename", &[opt("id"), opt("name")], "Rename a tab (asks the person when no name; an empty name: called by its number again)."),
     cmd("tab.move", &[req("id"), req("index")], "Move a tab to a position in its space (1 = first)."),
@@ -45,6 +45,7 @@ pub const COMMANDS: &[Command] = &[
     cmd("terminal.keep", &[req("terminal"), opt("place")], "Give a running terminal without a pane (a sub-agent) a pane: a new tab, or \"right\"/\"down\"."),
     cmd("terminal.park", &[req("terminal")], "Take a terminal's pane away and disable core keep; it keeps running (a sub-agent shows under its parent again)."),
     cmd("terminal.right_click", &[req("to"), opt("terminal")], "Where right-clicks in a terminal (default: the focused one) go when its program takes the mouse: \"program\" or \"menu\" (Herdr's, the default). Shift+right-click is always the menu."),
+    cmd("terminal.pin", &[req("terminal"), req("pinned")], "Pin an agent to the top of the agent lists (pinned true) or unpin it (false). Pins are kept with the terminal, so every Herdr client shows them, and end with it."),
     cmd("terminal.kill", &[req("terminal")], "End a terminal and its sub-agents."),
     // What you see.
     cmd("space.select", &[opt("index"), opt("id")], "Show a space (by position or id)."),
@@ -57,13 +58,15 @@ pub const COMMANDS: &[Command] = &[
     cmd("tab.prev", &[], "Show the previous tab."),
     cmd("pane.zoom", &[opt("pane")], "Show only this pane of its tab, or all again."),
     cmd("pane.focus", &[opt("pane"), opt("terminal")], "Focus a pane (or the pane showing a terminal)."),
-    cmd("pane.go", &[req("direction")], "Focus the pane to the \"left\", \"right\", \"up\" or \"down\"."),
+    cmd("pane.go", &[req("direction")], "Focus the pane or focusable mod to the \"left\", \"right\", \"up\" or \"down\"."),
     cmd("pane.swap", &[req("direction")], "Swap the focused pane with its neighbor in a direction."),
     cmd("terminal.peek", &[req("terminal")], "Peek at a running terminal over the tab, with keep-as-tab and close controls."),
     cmd("terminal.show", &[opt("terminal"), opt("pane")], "Show a terminal in a pane for now, in place of its own (no terminal: back)."),
-    cmd("terminal.copy", &[], "Copy the focused terminal's selection."),
+    cmd("terminal.copy", &[], "Copy the focused terminal's selection. With nothing selected, that key goes to the program."),
+    cmd("terminal.scroll", &[opt("lines"), opt("pages"), opt("to"), opt("terminal")], "Scroll a terminal's view of its history (default: the focused one). Give exactly one of: lines (a whole number; negative goes up, toward history), pages (a number, fractions allowed; one page is the terminal's rows), to: \"top\" (oldest history) or \"bottom\" (the live screen). This scrolls Herdr's view, not the program."),
     cmd("terminal.paste", &[], "Paste into the focused terminal (copied files as if dropped; an image alone as terminal.paste_image pastes it)."),
     cmd("terminal.paste_image", &[], "Ctrl+V: the clipboard's image as a file on the focused terminal's machine, when that's another one; on Windows, paste clipboard text; otherwise Ctrl+V goes to the terminal."),
+    cmd("terminal.search", &[], "Search the focused terminal's screen and scrollback; the find bar and query stay with that terminal."),
     cmd("agent.focus", &[req("terminal")], "Show an agent (sub-agents too)."),
     cmd("agent.next", &[], "Show the next agent, in the order the agents list shows them."),
     cmd("agent.prev", &[], "Show the previous agent."),
@@ -77,14 +80,35 @@ pub const COMMANDS: &[Command] = &[
     cmd("layout.resize", &[req("id"), opt("px"), opt("weight")], "Size a layout node."),
     cmd("layout.select", &[req("stack"), req("child")], "Show one child of a stack."),
     cmd("layout.reset", &[opt("name")], "Reset a shipped layout and its clicks (the old file is kept aside)."),
-    cmd("mod.open", &[req("name")], "Open a mod as the overlay its mod.json describes."),
+    cmd("mod.open", &[req("name")], "Toggle a mod as the overlay its mod.json describes; calling again closes it."),
     cmd("overlay.close", &[opt("id")], "Close an overlay (default: the top dialog or popup)."),
+    // HERDR: browser block (part 5, src/browser/agent.rs). id: a browser block; else pane's; else the focused one.
+    cmd("browser.open", &[opt("url"), opt("place"), opt("profile")], "Open a browser block at url (place \"tab\", default, or \"right\"/\"down\" of the focused pane) with its own cookies and logins (profile, default \"agent\"; \"default\" is the person's); answers its id."),
+    cmd("browser.navigate", &[req("url"), opt("id"), opt("pane")], "Load url in a browser (id, or the one in pane; default: the focused browser)."),
+    cmd("browser.back", &[opt("id"), opt("pane")], "Go back in a browser's history."),
+    cmd("browser.forward", &[opt("id"), opt("pane")], "Go forward in a browser's history."),
+    cmd("browser.device", &[opt("id"), opt("pane"), opt("name"), opt("w"), opt("h"), opt("scale"), opt("off")], "Preview a browser as a device (responsive mode): name \"iPhone 15\", \"Pixel 8\" or \"iPad Air\", or a custom w and h (scale optional); off: true goes back. The page gets that real viewport; named devices also get their mobile user agent and touch."),
+    cmd("browser.reload", &[opt("id"), opt("pane"), opt("ignore_cache")], "Reload a browser's page (ignore_cache: true skips the cache)."),
+    cmd("browser.stop", &[opt("id"), opt("pane")], "Stop loading a browser's page."),
+    cmd("browser.screenshot", &[opt("id"), opt("pane"), opt("path")], "Save a full-resolution PNG of a browser's page to path (default: browser/shots/ in the app's home); answers the path."),
+    cmd("browser.eval", &[req("expr"), opt("id"), opt("pane")], "Run JavaScript in a browser's page; answers its value."),
+    cmd("browser.find", &[opt("text"), opt("id"), opt("pane"), opt("forward"), opt("match_case"), opt("next")], "Find text in a browser's page (answers the match count); no text ends the find."),
+    cmd("browser.close", &[opt("id"), opt("pane")], "Close a browser block (default: the focused browser)."),
+    cmd("browser.pick", &[opt("id"), opt("pane"), opt("x"), opt("y")], "Ask the person to pick an element in a browser (it enters pick mode); answers when they click: its selector, trimmed HTML, box, text, key styles and a cropped screenshot. With x and y (page DIPs), captures the element there at once."),
+    cmd("browser.annotations", &[opt("id"), opt("pane"), opt("wait")], "What the person sent from a browser (Send: comments, markup, a picture; default: from any block): the newest batch, or with wait the next one. Page fields are listed as untrusted."),
+    cmd("browser.lock", &[opt("id"), opt("pane"), opt("agent"), opt("on")], "An agent takes a browser (on, default true): the person's input there is refused with a visible \"<agent> is driving · Take Control\" strip until the agent unlocks (on: false) or the person takes control."),
+    cmd("browser.new", &[opt("url"), opt("place"), opt("pane")], "Open a browser. From the + menu, cmd-shift-b or the pane menu it is the person's own (profile \"default\", their logins); through `herdr-app do` it is an agent-profile browser (never their logins). A new tab (place \"tab\", default) or \"right\"/\"down\" of pane (else the focused pane)."),
+    cmd("browser.remote", &[opt("machine")], "Open a remote desktop: the person's + menu only (not `herdr-app do`, where browser.* goes to the agent and an agent must not start the bridge). Starts the labs bridge (labs_checkout in settings.json) and opens its page in a new browser block with raw chords (Cmd+A/Z go to the remote machine). No machine: the page asks."),
+    cmd("browser.devtools", &[opt("id"), opt("pane"), opt("open")], "Open a browser's DevTools (open: false closes them)."),
     // The app.
-    cmd("app.help", &[], "Show the keys."),
+    cmd("app.help", &[], "Toggle the keys dialog."),
     cmd("app.welcome", &[], "Show the welcome again."),
     cmd("app.whats_new", &[], "Show what this release brought (it opens once by itself after an update)."),
     cmd("app.feedback", &[opt("message"), opt("from")], "Draft feedback for the person to review and send (from: person or agent)."),
-    cmd("app.palette", &[], "Open the command palette: every command by name, with its key."),
+    cmd("app.palette", &[], "Toggle the command palette: every command by name, with its key; calling again closes it."),
+    cmd("notifications.read_all", &[], "Mark every notification in the bell read."),
+    cmd("notifications.clear_all", &[], "Delete every notification in the bell's history."),
+    cmd("notifications.toggle_dnd", &[], "Turn Do Not Disturb on or off: no toasts or sounds; the bell still counts."),
     cmd("app.settings", &[opt("section")], "Open the settings (section: look, alerts, updates)."),
     cmd("app.check_updates", &[], "Look for a newer Herdr and herdr-core now."),
     cmd("app.update_core", &[], "Update herdr-core to its latest release of this generation; terminals keep running."),
@@ -101,10 +125,29 @@ pub const COMMANDS: &[Command] = &[
     cmd("window.close", &[], "Close the window (on Linux, quits)."),
     cmd("window.minimize", &[], "Minimize the window."),
     cmd("window.maximize", &[], "Maximize the window, or back."),
+    cmd("window.native", &[], "macOS: the title bar as the system sees it (see-through, full-size content, title hidden, fullscreen), for checking it."),
 ];
 
+// HERDR: test-only input, never in a normal run (an agent could click a mod's approval prompt).
+// It exists only when the app started with HERDR_APP_TEST_INPUT=1 (fork-run.sh's headless homes);
+// otherwise it is an unknown command, and `herdr-app commands` never lists it.
+pub const TEST_COMMANDS: &[Command] = &[
+    cmd("mod.click", &[req("copy"), req("x"), req("y")], "Test runs only: a left click (mouse down and up) at x, y in pixels from the top left of a shown mod copy (its slot: a block id)."),
+];
+
+/// HERDR: read once, at start: a later change to the environment can't turn it on.
+pub fn test_input() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("HERDR_APP_TEST_INPUT").as_deref() == Ok("1"))
+}
+
 pub fn find(name: &str) -> Option<&'static Command> {
-    COMMANDS.iter().find(|c| c.name == name)
+    find_with(name, test_input())
+}
+
+fn find_with(name: &str, test_input: bool) -> Option<&'static Command> {
+    let tests: &'static [Command] = if test_input { TEST_COMMANDS } else { &[] };
+    COMMANDS.iter().chain(tests).find(|c| c.name == name)
 }
 
 /// A key's `name:value` shorthand: the value fills the first argument (a
@@ -126,11 +169,15 @@ pub fn validate_args(c: &Command, args: &Value) -> Result<(), String> {
         Value::Null => Ok(()),
         Value::Object(args) => {
             let unknown: Vec<_> = args.keys().filter(|key| !c.args.iter().any(|a| a.name == key.as_str())).map(String::as_str).collect();
-            if unknown.is_empty() {
-                Ok(())
-            } else {
-                Err(format!("{}: unknown argument(s): {}; valid arguments: {valid}", c.name, unknown.join(", ")))
+            if !unknown.is_empty() {
+                return Err(format!("{}: unknown argument(s): {}; valid arguments: {valid}", c.name, unknown.join(", ")));
             }
+            for (key, value) in args {
+                if matches!(key.as_str(), "id" | "pane" | "space" | "terminal") && !value.is_string() && !value.is_null() {
+                    return Err(format!("{}: argument {key} must be a string (or null to omit it)", c.name));
+                }
+            }
+            Ok(())
         }
         _ => Err(format!("{}: arguments must be an object; valid arguments: {valid}", c.name)),
     }
@@ -190,6 +237,21 @@ mod tests {
     }
 
     #[test]
+    fn malformed_targets_cannot_fall_back_to_the_current_work() {
+        for (name, arg) in [("tab.close", "id"), ("pane.close", "pane"), ("space.close", "id"), ("tab.new", "space"), ("terminal.show", "terminal")] {
+            let c = find(name).unwrap();
+            for value in [json!(123), json!(false), json!([]), json!({"id": "target"})] {
+                let error = validate_args(c, &json!({arg: value})).unwrap_err();
+                assert!(error.contains(name) && error.contains(arg), "{error}");
+            }
+            // Null keeps its existing omitted-argument meaning for optional targets.
+            for value in [Value::Null, json!("target")] {
+                assert!(validate_args(c, &json!({arg: value})).is_ok());
+            }
+        }
+    }
+
+    #[test]
     fn names_are_unique_and_shorthand_fills_the_first_argument() {
         let mut names: Vec<&str> = COMMANDS.iter().map(|c| c.name).collect();
         names.sort();
@@ -202,5 +264,14 @@ mod tests {
         assert_eq!(missing(move_, &json!({ "id": "sp1", "index": 1 })), None);
         // Names are optional: none is Herdr's automatic one.
         assert_eq!(missing(find("space.new").unwrap(), &json!({})), None);
+    }
+
+    // HERDR: test-only input exists only with HERDR_APP_TEST_INPUT=1, and is never listed.
+    #[test]
+    fn mod_click_only_with_test_input() {
+        assert!(super::find_with("mod.click", false).is_none(), "unknown in a normal run");
+        assert!(super::find_with("mod.click", true).is_some());
+        assert!(super::COMMANDS.iter().all(|c| c.name != "mod.click"), "never in the listed commands");
+        assert!(super::find_with("space.new", false).is_some());
     }
 }

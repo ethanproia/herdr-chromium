@@ -8,14 +8,19 @@ use crate::hc::Core;
 mod floats;
 mod movable;
 mod pane_drag;
+#[cfg(target_os = "macos")]
+mod native_titlebar;
+mod pane_size;
 mod titlebar;
+// HERDR: toasts as a Sonner-style deck.
+mod toasts;
 
 use crate::layout::{Axis, Background as Paint, Content, Fit, HeaderContent, Kind, Line, Node, PaneFrame, Size as Span};
 use crate::model::{self, Tab, Model};
 use crate::mods::{self, Found, Instance, Request};
 use crate::settings;
 use crate::layout_sync;
-use crate::terminal::{TerminalEvent, TerminalView};
+use crate::terminal::{TerminalEvent, TerminalView, scroll_target};
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_shell::action::ShellAction;
@@ -67,6 +72,9 @@ fn separator_line(row: bool, width: f32, color: Hsla, top: f32) -> Div {
         .when(!row, |d| d.h(px(width)).w_full())
 }
 
+/// HERDR: how much of a layout color stays with `glass` on (the rest is the blur).
+const GLASS_ALPHA: f32 = 0.6;
+
 fn c(name: &str) -> Hsla {
     settings::color_or_literal(name)
 }
@@ -107,13 +115,15 @@ pub fn shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())
 }
 
-fn unix_agent_argv(sh: String, cmd: Vec<String>) -> Vec<String> {
-    let script = if std::path::Path::new(&sh).file_name().and_then(|s| s.to_str()) == Some("fish") {
-        "command $argv[2..]; exec $argv[1] -i"
-    } else {
-        "\"$@\"; exec \"$0\" -i"
+fn unix_agent_argv(sh: String, cmd: Vec<String>, login: bool) -> Vec<String> {
+    let fish = std::path::Path::new(&sh).file_name().and_then(|s| s.to_str()) == Some("fish");
+    let script = match (fish, login) {
+        (true, true) => "command $argv[2..]; exec $argv[1] -li",
+        (true, false) => "command $argv[2..]; exec $argv[1] -i",
+        (false, true) => "\"$@\"; exec \"$0\" -li",
+        (false, false) => "\"$@\"; exec \"$0\" -i",
     };
-    let mut run = vec![sh.clone(), "-ic".into(), script.into(), sh];
+    let mut run = vec![sh.clone(), if login { "-lic" } else { "-ic" }.into(), script.into(), sh];
     run.extend(cmd);
     run
 }
@@ -135,10 +145,23 @@ const LAYOUTS: &[(&str, &str)] = &[
     ("main", include_str!("../defaults/layouts/main.json")),
     ("terminals", include_str!("../defaults/layouts/terminals.json")),
     ("win98", include_str!("../defaults/layouts/win98.json")),
+    // HERDR: the fork's own layout "labs" (Ethan's), built from the bundled fork-* mods (defaults/bundled-mods.lock.json).
+    ("labs", include_str!("../defaults/layouts/labs.json")),
 ];
 
 /// Pictures shipped layouts name as their `preview`, written beside them.
-const LAYOUT_PREVIEWS: &[(&str, &str)] = &[("win98.svg", include_str!("../defaults/layouts/win98.svg"))];
+const LAYOUT_PREVIEWS: &[(&str, &str)] = &[
+    ("win98.svg", include_str!("../defaults/layouts/win98.svg")),
+    // HERDR
+    ("labs.svg", include_str!("../defaults/layouts/labs.svg")),
+];
+
+// HERDR: the fork starts on its own layout; homes left on the old name "fork" open "labs".
+pub(crate) const FORK_DEFAULT_LAYOUT: &str = "labs";
+
+pub(crate) fn renamed_layout(name: String) -> String {
+    if name == "fork" { FORK_DEFAULT_LAYOUT.to_owned() } else { name }
+}
 
 pub fn shipped_layouts() -> Vec<&'static str> {
     LAYOUTS.iter().map(|(n, _)| *n).collect()
@@ -326,6 +349,8 @@ struct Overlay {
     /// The app's own screen (a `frame-` mod: What's new, the welcome): only
     /// its own close ends it, never a layout switch.
     frame: bool,
+    /// HERDR: a toast fading out since then (removed once the fade is over).
+    leaving: Option<Instant>,
 }
 
 struct Drag {
@@ -372,11 +397,16 @@ pub struct AppWindow {
     terms: HashMap<String, Term>,
     /// Mod copies by slot (block id, `<stack>#header`, or `overlay:<id>`).
     copies: HashMap<String, Copy>,
+    // HERDR: one browser view per browser block (src/browser/view.rs).
+    browsers: crate::browser::view::Browsers,
     overlays: Vec<Overlay>,
     folders: BTreeMap<String, Found>,
     /// Mods placed once; later the layout decides where (or whether) they show.
     seen: BTreeSet<String>,
     bounds: Rc<RefCell<HashMap<String, Bounds<Pixels>>>>,
+    /// HERDR: each shown mod copy's bounds by slot, for test-only mod.click (filled only with test input on).
+    slot_bounds: Rc<RefCell<HashMap<String, Bounds<Pixels>>>>,
+    hidden_fit: pane_size::HiddenFit,
     drag: Option<Drag>,
     written_layout: String,
     /// The shown layout as its file has it; `chrome` is this plus the clicks
@@ -394,6 +424,10 @@ pub struct AppWindow {
     reply: Option<Value>,
     /// The `where` label last written per terminal address.
     written_where: HashMap<String, String>,
+    /// `herdr.seen` turns written but not yet back from the core.
+    written_seen: HashMap<String, u64>,
+    /// Agents the person is looking at, and the turn they were shared as seen at.
+    looked: HashMap<String, u64>,
     watched: Watched,
     /// Core's terminal records by address.
     live: HashMap<String, Value>,
@@ -420,8 +454,15 @@ pub struct AppWindow {
     /// Where a press on a `window_drag` node started, until it moves the window.
     drag_from: Option<Point<Pixels>>,
     titlebar_applied: Option<(crate::layout::Titlebar, Option<[f32; 2]>)>,
+    /// HERDR: the glass setting the window background was last set for.
+    glass_applied: Option<bool>,
     focused_pane: Option<String>,
+    /// The mod block holding the keyboard for directional navigation.
+    focused_block: Option<String>,
     synced_model_pane: Option<String>,
+    /// Whether the last sync showed the tab, to hand it the keyboard back when a stack shows it again.
+    tab_shown: bool,
+    pane_history: Vec<String>,
     window_active: bool,
     /// The system's appearance; a layout with a light and a dark theme follows it.
     system_dark: bool,
@@ -432,6 +473,17 @@ pub struct AppWindow {
     /// What's waiting, in words (`update_label`).
     update_ready: Option<String>,
     update_dismissed: Option<String>,
+    /// HERDR: the bell's history (src/notifications.rs); saved from the poll when it changed.
+    notes: crate::notifications::Store,
+    /// HERDR: the history file was read (once, when settings first load with `history` on).
+    notes_loaded: bool,
+    notes_save_failed: bool,
+    /// HERDR: the core update error last put in the bell (a keyed item, read once it clears).
+    core_error_noted: Option<String>,
+    /// HERDR: the pointer is over the toast deck since then: every toast's timer waits.
+    deck_hover: Option<Instant>,
+    /// HERDR: each toast card's last two y's in the deck (design px), for the move animation.
+    deck_moves: RefCell<HashMap<String, (f32, f32)>>,
     update_success: bool,
     update_status: String,
     focus: FocusHandle,
@@ -468,10 +520,13 @@ impl AppWindow {
             model: Model::default(),
             terms: HashMap::new(),
             copies: HashMap::new(),
+            browsers: Default::default(), // HERDR: browser block
             overlays: Vec::new(),
             folders: mods::scan().into_iter().map(|f| (f.id.clone(), f)).collect(),
             seen,
             bounds: Default::default(),
+            slot_bounds: Default::default(),
+            hidden_fit: Default::default(),
             drag: None,
             written_layout: String::new(),
             file_chrome: default_layout("main"),
@@ -482,6 +537,8 @@ impl AppWindow {
             person: settings::Person::default(),
             reply: None,
             written_where: HashMap::new(),
+            written_seen: HashMap::new(),
+            looked: HashMap::new(),
             watched: Watched::default(),
             live: HashMap::new(),
             listed_once: false,
@@ -504,14 +561,25 @@ impl AppWindow {
             pointer: Point::default(),
             drag_from: None,
             titlebar_applied: None,
+            glass_applied: None,
             focused_pane: None,
+            focused_block: None,
             synced_model_pane: None,
+            tab_shown: true,
+            pane_history: Vec::new(),
             window_active: true,
             system_dark: is_dark(window.appearance()),
             file_events: crate::files::watch(&mods::app_dir()),
             polls: 0,
             update_ready: None,
             update_dismissed: None,
+            // Loaded with the person's settings (reload_config), not before: `history: false` reads nothing.
+            notes: crate::notifications::Store::default(),
+            notes_loaded: false,
+            notes_save_failed: false,
+            core_error_noted: None,
+            deck_hover: None,
+            deck_moves: RefCell::default(),
             update_success: false,
             update_status: String::new(),
             focus: cx.focus_handle(),
@@ -545,16 +613,16 @@ impl AppWindow {
         crate::programs::install_icons();
         w.reload_config(window, cx);
         install_layouts();
-        let name = mods::shared("layout").and_then(|v| v.as_str().map(str::to_owned)).filter(|n| layout_path(n).exists());
+        let name = mods::shared("layout").and_then(|v| v.as_str().map(str::to_owned)).map(renamed_layout).filter(|n| layout_path(n).exists());
         // A layout whose mods are gone (Zen, T4, ADE after the update took
         // theirs) starts on Herdr's instead of a wall of "did not load".
         let gone = name.as_deref().map(missing_mods).unwrap_or_default();
-        w.load_layout(if gone.is_empty() { name.as_deref().unwrap_or("main") } else { "main" });
+        w.load_layout(if gone.is_empty() { name.as_deref().unwrap_or(FORK_DEFAULT_LAYOUT) } else { "main" });
         w.apply_look(window, cx);
         w.show_layout_notes(window, cx);
         if let (Some(n), false) = (&name, gone.is_empty()) {
             let note = json!({ "title": format!("{n} needs mods that aren't here"), "body": format!("Showing Herdr instead. Missing: {}. Your {n} layout file is still there.", gone.join(", ")), "level": "info", "timeout": 12000 });
-            w.open_overlay(mods::new_overlay_id(), json!({ "kind": "toast", "notification": note }), window, cx);
+            w.post_note("app", "herdr", "Herdr", note, window, cx);
         }
 
         w._tasks.push(cx.spawn_in(window, async move |this, cx| {
@@ -654,8 +722,16 @@ impl AppWindow {
                 let watching = sub.is_some();
                 subscription = sub;
                 event_lines = lines;
+                let (seen, resynced) = event_lines.take_seen();
                 if this.update_in(cx, |this, window, cx| {
                     if generation != this.core_generation { return; }
+                    // Our seen writes the core has applied (or, after a fresh
+                    // snapshot, can't tell): its labels decide again.
+                    if resynced {
+                        this.written_seen.clear();
+                    } else {
+                        this.written_seen.retain(|a, w| seen.get(a).is_none_or(|s| s < w));
+                    }
                     this.documents_watching = watching;
                     if watching { this.documents.entry(String::new()).or_default().connection(true, None, None); }
                     let changed = this.documents_updated(machines, vec![], window, cx);
@@ -664,6 +740,7 @@ impl AppWindow {
                         None => this.tend_terminals(false, window, cx),
                     }
                     if changed { this.sync(window, cx); }
+                    this.fit_hidden_tabs(window, cx);
                     this.flush_documents(refresh, window, cx);
                 }).is_err() { break; }
                 cx.background_executor().timer(Duration::from_millis(500)).await;
@@ -690,6 +767,7 @@ impl AppWindow {
         }));
         Self::note_core(&w.core);
         w.sync(window, cx);
+        w.restore_focus(window, cx);
         // The first time the app opens: the frame's welcome (it sets
         // "frame.welcomed" when you start or skip).
         cx.defer_in(window, |this, window, cx| this.open_kept_windows(window, cx));
@@ -818,6 +896,9 @@ impl AppWindow {
             self.report_layout(&problems.join("; "));
         }
         if settings::set(s) {
+            for term in self.terms.values() {
+                term.view.read(cx).refresh_theme();
+            }
             mods::apply_theme(cx);
             self.refresh_mods(cx);
             window.refresh();
@@ -831,7 +912,21 @@ impl AppWindow {
             crate::telemetry::set_setting(settings::telemetry_setting(&loaded));
             match loaded {
                 Ok(p) => {
+                    // HERDR: a changed mods_disabled list: find mods again and rebind keys.
+                    let off_changed = p.mods_disabled != self.person.mods_disabled;
                     self.person = p;
+                    // HERDR: the bell's history loads with the first settings that keep it, and every
+                    // settings change (DND, muted sources) reaches the snapshot at once.
+                    if !self.notes_loaded && self.person.notifications.history {
+                        self.notes_loaded = true;
+                        let saved = crate::notifications::Store::load(&crate::notifications::path(), model::now_ms());
+                        self.notes.merge_loaded(saved);
+                    }
+                    self.publish_notes(cx);
+                    if off_changed {
+                        self.sync_folders(window, cx);
+                        self.watched.keys = Some(std::time::SystemTime::UNIX_EPOCH);
+                    }
                     let _ = std::fs::remove_file(file("settings.error"));
                 }
                 Err(e) => self.report("settings", &e),
@@ -1063,8 +1158,13 @@ impl AppWindow {
     /// What installing layouts kept of the person's own, as toasts.
     fn show_layout_notes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         for clone in mods::take_sync_notes() {
-            let n = json!({ "title": format!("Your edits are in {clone}"), "body": "Herdr's own layouts and mods can't be changed: clone one to make it yours.", "level": "info", "timeout": 12000 });
-            self.open_overlay(mods::new_overlay_id(), json!({ "kind": "toast", "notification": n }), window, cx);
+            let n = json!({ "title": format!("Your edits are in {clone}"), "body": "Herdr's own layouts and mods can't be changed: clone one to make it yours.", "level": "info", "timeout": 12000, "keep": false });
+            self.post_note("app", "herdr", "Herdr", n, window, cx);
+        }
+        // HERDR: keys a mod wanted that the person already uses (src/mod_keys.rs).
+        for line in crate::mod_keys::take_notes() {
+            let n = json!({ "title": "Mod keys", "body": line, "level": "info", "timeout": 12000 });
+            self.post_note("app", "herdr", "Herdr", n, window, cx);
         }
     }
 
@@ -1312,8 +1412,10 @@ impl AppWindow {
 
     /// What's on screen now, for done-vs-seen.
     fn visible_addresses(&self) -> Vec<String> {
-        let mut out = if self.shows_tab() { self.model.visible_addresses() } else { Vec::new() };
-        out.extend(self.chrome.visible_blocks().into_iter().filter_map(|n| n.terminal().map(str::to_owned)));
+        let (terms, _) = self.visible();
+        // A swapped-in terminal is drawn instead of its pane's own.
+        let covered: HashSet<&str> = terms.iter().filter_map(|(slot, _)| slot.strip_suffix(SWAP)).collect();
+        let mut out: Vec<String> = terms.iter().filter(|(slot, _)| !covered.contains(slot.as_str())).map(|(_, a)| a.clone()).collect();
         if self.shows_agent() {
             out.extend(self.shown_agent());
         }
@@ -1391,6 +1493,12 @@ impl AppWindow {
         // A mod copy lives while its slot is in the layout, hidden or not (an
         // inactive stack child, a hidden column, a pane in another tab), so it
         // keeps its place; only shown slots start a copy. Gone or changed: dropped.
+        // HERDR: the shown layout reaches mods before any new copy starts: a copy's first
+        // layout() otherwise saw the previous layout, and core's start-time layout.set wrote that
+        // stale tree over the new layout's file (switching to a core layout rewrote it as stock).
+        if mods::publish_layout(&self.chrome) {
+            self.refresh_snapshot_mods(cx);
+        }
         let owned = self.owned_mods();
         let gone: Vec<_> = self.copies.iter().filter(|(slot, copy)| owned.get(*slot).is_none_or(|inst| *inst != copy.inst)).map(|(slot, _)| slot.clone()).collect();
         for slot in gone {
@@ -1409,6 +1517,7 @@ impl AppWindow {
             }
         }
         self.publish_shown_copies();
+        self.sync_browsers(window, cx); // HERDR: browser block
 
         // Keyboard to the focused pane when it changes (never steal it from an open dialog).
         let model_pane = self.model.focused_pane();
@@ -1418,12 +1527,28 @@ impl AppWindow {
         } else {
             model_pane.clone()
         };
-        self.synced_model_pane = model_pane;
         let pane_changed = focused != self.focused_pane;
+        // A pane focused some other way, or the block leaving, ends it.
+        if (pane_changed && self.focused_block != focused) || self.focused_block.as_ref().is_some_and(|b| !self.mod_block_shown(b)) {
+            self.focused_block = None;
+        }
+        // Mod blocks too, so `pane.go` goes back to a mod it came from.
+        self.pane_history.retain(|id| {
+            self.copies.contains_key(id) || self.model.spaces.iter().any(|s| s.tabs.iter().any(|t| t.root.find(id).is_some()))
+        });
+        if let Some(id) = self.focused_block.as_ref().or(model_pane.as_ref()) {
+            remember_pane(&mut self.pane_history, id);
+        }
+        self.synced_model_pane = model_pane;
         self.focused_pane = focused.clone();
         let no_dialog = !self.overlays.iter().any(|o| o.kind.modal_keys());
+        // The tab shown again (`layout.select` back from another stack child): its
+        // focused pane gets the keyboard, which went to the window while it was hidden.
+        let tab_shown = self.shows_tab();
+        let revealed = tab_shown && !self.tab_shown;
+        self.tab_shown = tab_shown;
         if terminal_block(&self.chrome, focused.as_deref()).is_some() {
-            if pane_changed && no_dialog && let Some(f) = focused.as_deref().and_then(|p| self.pane_focus(p)) {
+            if pane_changed && no_dialog && let Some(f) = focused.as_deref().and_then(|p| self.pane_focus(p, cx)) {
                 f.focus(window, cx);
             }
         } else if let Some(block) = self.agent_block() {
@@ -1440,16 +1565,62 @@ impl AppWindow {
             // A mod pane takes the keyboard on a click; until then the window holds
             // it, so another tab's terminal can't keep it (and pull its tab back).
             if no_dialog {
-                focused.and_then(|p| self.pane_focus(&p)).unwrap_or_else(|| self.focus.clone()).focus(window, cx);
+                focused.and_then(|p| self.pane_focus(&p, cx)).unwrap_or_else(|| self.focus.clone()).focus(window, cx);
             }
+        } else if revealed {
+            self.refocus_pane(window, cx);
         }
         if self.window_active {
             let visible = self.visible_addresses();
             self.model.mark_seen(&visible);
+            // HERDR: what the person is looking at reads its bell items.
+            let read: usize = visible.iter().map(|a| self.notes.resolve_prefix(&format!("agent:{a}:"))).sum();
+            if read > 0 {
+                self.publish_notes(cx);
+            }
         }
+        self.share_seen(cx);
         self.publish(cx);
         self.save();
         cx.notify();
+    }
+
+    /// Shares what the person looks at as `herdr.seen` (docs/labels.md): an
+    /// agent on screen in the active window, once per turn while it stays
+    /// there, so a phone marking it unread isn't undone by a screen nobody
+    /// watches. Only ever raises it. True when a status changed.
+    fn share_seen(&mut self, cx: &mut Context<Self>) -> bool {
+        let looking: HashSet<String> = if self.window_active { self.visible_addresses().into_iter().collect() } else { HashSet::new() };
+        self.looked.retain(|a, _| looking.contains(a));
+        let mut changed = false;
+        for addr in looking {
+            let Some(a) = self.model.agents.get(&addr) else { continue };
+            let turn = a.turn;
+            if a.word.is_none() || !self.live.contains_key(&addr) || self.looked.get(&addr) == Some(&turn) {
+                continue;
+            }
+            self.looked.insert(addr.clone(), turn);
+            if a.seen_turn.is_some_and(|s| s >= turn) {
+                continue;
+            }
+            // Shown as seen now, not after the core's round trip.
+            changed |= self.model.set_turn(&addr, turn, Some(turn));
+            self.written_seen.insert(addr.clone(), turn);
+            let core = self.core.clone();
+            cx.spawn(async move |this, cx| {
+                let params = json!({ "terminal": addr, "labels": { "herdr.seen": turn.to_string() } });
+                let Err(e) = cx.background_executor().spawn(async move { core.call("terminal.label", params) }).await else { return };
+                tracing::warn!("seen label for {addr}: {e:#}");
+                let _ = this.update(cx, |this, _| {
+                    if this.written_seen.get(&addr) == Some(&turn) {
+                        this.written_seen.remove(&addr);
+                        this.looked.remove(&addr);
+                    }
+                });
+            })
+            .detach();
+        }
+        changed
     }
 
     /// The keyboard never ends up nowhere. When what had it leaves the screen (a
@@ -1458,12 +1629,17 @@ impl AppWindow {
     /// else the window, where the app's keys work.
     fn restore_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let dialog = self.overlays.iter().rev().find(|o| o.kind.modal_keys()).map(|o| o.focus.clone());
+        // A mod block holding the keyboard gets it back (a popup over it closed).
+        if dialog.is_none() && self.focused_block.as_ref().is_some_and(|b| self.mod_block_shown(b)) {
+            self.focus.focus(window, cx);
+            return self.hand_keyboard();
+        }
         let shown = if terminal_block(&self.chrome, self.focused_pane.as_deref()).is_some() {
-            self.focused_pane.as_deref().and_then(|p| self.pane_focus(p))
+            self.focused_pane.as_deref().and_then(|p| self.pane_focus(p, cx))
         } else if let Some(block) = self.agent_block() {
             self.shown_agent().and_then(|a| self.agent_view(&block, &a)).map(|t| t.focus.clone())
         } else if self.shows_tab() {
-            self.model.focused_pane().and_then(|p| self.pane_focus(&p))
+            self.model.focused_pane().and_then(|p| self.pane_focus(&p, cx))
         } else {
             None
         };
@@ -1475,15 +1651,67 @@ impl AppWindow {
         self.swapped.get(pane).and_then(|_| self.terms.get(&format!("{pane}{SWAP}"))).or_else(|| self.terms.get(pane))
     }
 
+    /// Key path for `terminal.copy`. Copies and clears when there is a selection.
+    /// Returns whether it copied. False means the key should reach the program.
+    fn copy_key(&mut self, window: &Window, cx: &mut Context<Self>) -> bool {
+        let Some(t) = self.focused_terminal(window, cx) else { return true };
+        t.view.update(cx, |v, cx| {
+            if !v.copy(cx) {
+                return false;
+            }
+            v.clear_selection(cx);
+            true
+        })
+    }
+
     /// Peeks, floats and swapped-in views own keyboard focus without changing the model pane.
-    fn focused_terminal(&self, window: &Window) -> Option<&Term> {
-        self.terms.values().find(|t| t.focus.is_focused(window))
+    fn focused_terminal(&self, window: &Window, cx: &App) -> Option<&Term> {
+        self.terms.values().find(|t| t.view.read(cx).owns_keyboard_focus(window, cx))
             .or_else(|| self.focused_pane.as_deref().and_then(|p| self.pane_term(p)))
             .or_else(|| self.model.focused_pane().and_then(|p| self.pane_term(&p)))
     }
 
-    fn pane_focus(&self, pane: &str) -> Option<FocusHandle> {
-        self.pane_term(pane).map(|t| t.focus.clone())
+    fn shown_terminal_view(&self, address: &str, window: &Window, cx: &App) -> Result<Entity<TerminalView>, String> {
+        if !self.live.contains_key(address) {
+            return Err(format!("no running terminal {address:?}"));
+        }
+
+        let own_pane = self.model.pane_of(address);
+        // The view the person sees wins over a hidden one, such as a peek over its own tab's pane.
+        let best = self.terms.iter().filter(|(_, t)| t.address == address).max_by_key(|(pane, t)| {
+            let view = t.view.read(cx);
+            (view.owns_keyboard_focus(window, cx), view.on_screen_this_frame(), own_pane.as_deref() == Some(pane.as_str()))
+        });
+        best.map(|(_, t)| t.view.clone()).ok_or_else(|| format!("terminal {address:?} is running but not shown in this window, so it has no view to scroll"))
+    }
+
+    fn scroll_terminal(&self, args: &Value, window: &Window, cx: &mut Context<Self>) -> Result<(), String> {
+        let target = scroll_target(args)?;
+
+        let view = match Self::owned(args, "terminal") {
+            Some(address) => self.shown_terminal_view(&address, window, cx)?,
+            None => self.focused_terminal(window, cx).map(|t| t.view.clone()).ok_or("no focused terminal to scroll")?,
+        };
+
+        view.update(cx, |view, cx| view.scroll_history(target, cx));
+        Ok(())
+    }
+
+    /// Gives the focused pane the keyboard, unless something other than the
+    /// window holds it: a dialog, a mod block, an input.
+    fn refocus_pane(&self, window: &mut Window, cx: &mut App) {
+        let dialog = self.overlays.iter().any(|o| o.kind.modal_keys());
+        let window_holds_keys = window.focused(cx).is_none() || self.focus.is_focused(window);
+        if dialog || self.focused_block.is_some() || !window_holds_keys {
+            return;
+        }
+        if let Some(f) = self.focused_pane.as_ref().and_then(|p| self.pane_focus(p, cx)) {
+            f.focus(window, cx);
+        }
+    }
+
+    fn pane_focus(&self, pane: &str, cx: &App) -> Option<FocusHandle> {
+        self.pane_term(pane).map(|t| t.view.read(cx).focus_target(cx))
     }
 
     fn load(&self, inst: Instance, window: &mut Window, cx: &mut Context<Self>) -> Copy {
@@ -1509,9 +1737,19 @@ impl AppWindow {
     }
 
     fn refresh_mods(&self, cx: &mut Context<Self>) {
+        self.refresh_mods_matching(|_| true, cx);
+    }
+
+    fn refresh_snapshot_mods(&self, cx: &mut Context<Self>) {
+        self.refresh_mods_matching(mods::snapshot_changed, cx);
+    }
+
+    fn refresh_mods_matching(&self, changed: impl Fn(u64) -> bool, cx: &mut Context<Self>) {
         if let Some(runtime) = &self.runtime {
             for c in self.copies.values() {
-                if let Some(root) = &c.root {
+                if let Some(root) = &c.root
+                    && changed(c.id)
+                {
                     let _ = runtime.refresh(root, cx);
                 }
             }
@@ -1536,7 +1774,21 @@ impl AppWindow {
                 // The branch of the terminal the space shows first.
                 let first = p.active_tab().and_then(|c| c.focused_pane()).and_then(|pane| m.address_of(&pane));
                 let branch = first.and_then(|a| m.folder_info.get(&a)).and_then(|f| f.branch.clone());
-                model::space_json(m, p, i, branch.as_deref(), &home)
+                let mut sj = model::space_json(m, p, i, branch.as_deref(), &home);
+                // HERDR: browser block (I17). A tab showing a page: unnamed, it takes the page's
+                // title; its favicon goes with it for tab strips that draw icons.
+                if let Some(tabs) = sj.get_mut("tabs").and_then(Value::as_array_mut) {
+                    for (t, c) in tabs.iter_mut().zip(&p.tabs) {
+                        let page = c.focused.iter().chain(c.root.panes().iter().map(|n| &n.id)).find_map(|id| {
+                            use crate::browser::BrowserRegistry as _;
+                            self.browsers.state(id).filter(|_| matches!(c.root.find(id).and_then(|n| n.content()), Some(Content::Browser { .. })))
+                        });
+                        if let Some(st) = page {
+                            crate::browser::view::annotate_tab(t, &st, !c.name.is_empty());
+                        }
+                    }
+                }
+                sj
             })
             .collect();
         let block = terminal_block(&self.chrome, self.focused_pane.as_deref());
@@ -1548,6 +1800,14 @@ impl AppWindow {
                 for p in ctx.root.panes() {
                     let focused = m.active.as_deref() == Some(pr.id.as_str()) && focused_pane.as_deref() == Some(p.id.as_str());
                     let zoomed = ctx.zoomed.as_deref() == Some(p.id.as_str());
+                    // HERDR: browser block. A browser pane: its page's title, url and favicon.
+                    if let Some(Content::Browser { browser }) = p.content() {
+                        use crate::browser::BrowserRegistry as _;
+                        let st = self.browsers.state(&p.id).unwrap_or_default();
+                        let url = if st.url.is_empty() { browser.url.clone() } else { st.url.clone() };
+                        panes.push(json!({ "pane": p.id, "terminal": null, "browser": true, "tab": ctx.id, "title": st.title, "url": url, "favicon": st.favicon, "focused": focused, "zoomed": zoomed, "movable": self.pane_movable(&p.id) }));
+                        continue;
+                    }
                     // A mod pane: what it shows, no terminal.
                     if let Some(Content::Mod { name, .. }) = p.content() {
                         panes.push(json!({ "pane": p.id, "terminal": null, "mod": name, "tab": ctx.id, "title": name, "focused": focused, "zoomed": zoomed, "movable": self.pane_movable(&p.id) }));
@@ -1570,6 +1830,7 @@ impl AppWindow {
                         "tab": ctx.id, "tab_index": ci + 1, "tab_name": Model::tab_name(pr, ctx),
                         "status": status, "app": a.and_then(|a| a.app.clone()), "program": self.program(addr), "title": title.unwrap_or_default(),
                         "seq": a.map(|a| a.seq).unwrap_or(0),
+                        "pinned": self.live.get(addr).and_then(|r| r.pointer("/labels/herdr.pinned")).and_then(Value::as_str).is_some_and(|v| !v.is_empty()),
                         "focused": m.active.as_deref() == Some(pr.id.as_str()) && focused_pane.as_deref() == Some(p.id.as_str()),
                     }));
                 }
@@ -1598,7 +1859,7 @@ impl AppWindow {
         changed |= mods::publish_floats(self.float_placements());
         changed |= mods::publish_layout(&self.chrome);
         if changed {
-            self.refresh_mods(cx);
+            self.refresh_snapshot_mods(cx);
         }
         self.write_where(cx);
     }
@@ -1690,14 +1951,15 @@ impl AppWindow {
     }
 
     fn layout_notice(&mut self, title: &str, body: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let spec = json!({"kind":"toast", "notification":{"title":title,"body":body,"level":"info"}});
-        self.open_overlay(mods::new_overlay_id(), spec, window, cx);
+        self.post_note("machines", "herdr", "Herdr", json!({"title":title,"body":body,"level":"info"}), window, cx);
     }
 
     /// Finish the accepted edit and any newer projection before the window goes.
     pub fn drain_documents(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.draining { return; }
         self.save();
+        // HERDR: the bell's history is written before the window goes.
+        self.flush_notes();
         self.draining = true;
         QUITTING.store(true, std::sync::atomic::Ordering::SeqCst);
         while let Some(address) = self.pending_terminals.keys().next().cloned() {
@@ -1859,7 +2121,7 @@ impl AppWindow {
         let terminals_changed = mods::publish_terminals(list);
         self.tend_terminals(true, window, cx);
         if terminals_changed {
-            self.refresh_mods(cx);
+            self.refresh_snapshot_mods(cx);
         }
     }
 
@@ -1883,7 +2145,12 @@ impl AppWindow {
                 alerts.push((addr.clone(), alert, looking));
             }
             changed |= self.model.set_word(addr, word, app, looking);
+            let turn = rec.get("turn").and_then(Value::as_u64).unwrap_or(0);
+            let label = rec.pointer("/labels/herdr.seen").and_then(Value::as_str).and_then(|s| s.parse::<u64>().ok());
+            changed |= self.model.set_turn(addr, turn, label.max(self.written_seen.get(addr).copied()));
         }
+        self.written_seen.retain(|a, _| self.live.contains_key(a));
+        changed |= self.share_seen(cx);
         // Changes already made before Herdr started aren't news.
         if self.listed_once {
             for (addr, alert, looking) in alerts {
@@ -1909,7 +2176,8 @@ impl AppWindow {
     /// toast (drawn by the `toast` mod; click it to go there) unless they're
     /// looking at that agent.
     fn alert(&mut self, addr: &str, alert: model::Alert, looking: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if settings::get().sounds.enabled {
+        // HERDR: Do Not Disturb or muted agents: no sound (the bell still records it).
+        if settings::get().sounds.enabled && self.person.notifications.speaks("agents") {
             crate::sound::play(if alert == model::Alert::Blocked { "blocked" } else { "done" });
         }
         // Needing the person brings a settled tab back.
@@ -1938,11 +2206,13 @@ impl AppWindow {
             model::Alert::Blocked => (format!("{name} needs you"), "error"),
             model::Alert::Done => (format!("{name} finished"), "info"),
         };
+        // HERDR: one bell item per agent and state; a repeat bumps it, focusing the agent reads it.
+        let key = format!("agent:{addr}:{}", if alert == model::Alert::Blocked { "blocked" } else { "done" });
         let notification = json!({
-            "title": title, "body": place, "level": level,
+            "title": title, "body": place, "level": level, "key": key,
             "action": { "name": "agent.focus", "args": { "terminal": addr } },
         });
-        self.open_overlay(mods::new_overlay_id(), json!({ "kind": "toast", "notification": notification }), window, cx);
+        self.post_note("agents", "herdr", &name, notification, window, cx);
     }
 
     /// Keeps the model true to core, on every listing: drops panes whose terminal
@@ -2037,7 +2307,9 @@ impl AppWindow {
             let before = tab.before.clone();
             let zoomed = tab.zoomed.clone();
             let id = tab.id.clone();
-            self.model.split(&target, Axis::Row, &pane, addr);
+            // A terminal that already runs is placed even without room (minimums squeeze).
+            let share = self.split_room(&target, Axis::Row, &Node::block("", Content::Terminal { terminal: String::new() })).unwrap_or(0.5);
+            self.model.split_share(&target, Axis::Row, crate::model::pane(&pane, addr), share);
             let tab = self.model.tab_mut(&id).unwrap();
             tab.focused = focused;
             tab.before = before;
@@ -2126,7 +2398,7 @@ impl AppWindow {
             let id = o.id.clone();
             return self.close_overlay(&id, window, cx);
         }
-        if self.chrome.find(block).is_some() {
+        if self.chrome.find(block).is_some_and(|n| n.terminal().is_some()) {
             self.chrome.remove(block);
             self.sync(window, cx);
         }
@@ -2160,7 +2432,7 @@ impl AppWindow {
             }).await;
             if let Some(body) = failure {
                 let _ = this.update_in(cx, |this, window, cx| {
-                    this.open_overlay(mods::new_overlay_id(), json!({"kind":"toast", "notification":{"title":"Terminal failed to start", "body":body, "level":"error"}}), window, cx);
+                    this.post_note("app", "herdr", "Herdr", json!({"title":"Terminal failed to start", "body":body, "level":"error"}), window, cx);
                 });
             }
         }).detach();
@@ -2195,15 +2467,15 @@ impl AppWindow {
     /// Starts a terminal for `space`, on `on` (another machine) or here. An
     /// empty `cwd`: the machine's home. With no argv, that machine's core
     /// picks its own shell.
-    fn spawn(&self, argv: Option<Vec<String>>, cwd: String, space: &str, ctx: &str, on: Option<&str>) -> Result<String, String> {
+    fn spawn(&self, argv: Option<Vec<String>>, cwd: String, space: &str, ctx: &str, on: Option<&str>, size: Option<(u16, u16)>, window: &Window) -> Result<String, String> {
         let argv = argv.unwrap_or_default();
         let cwd = Some(cwd).filter(|c| !c.is_empty());
         self.require_document(on)?;
-        let labels = json!({ "herdr.space": crate::mirror::local(space, on), "herdr.tab": crate::mirror::local(ctx, on) });
-        let addr = match self.core.run(argv.clone(), cwd.clone(), labels.clone(), on) {
+        let labels = json!({ "herdr.space": crate::mirror::local(space, on), "herdr.tab": crate::mirror::local(ctx, on), "herdr.seen": "0" });
+        let addr = match self.core.run(argv.clone(), cwd.clone(), labels.clone(), on, size, crate::terminal::initial_display(window)) {
             // An agent on a machine without `sh` (Windows): in its PowerShell instead.
             Err(e) if on.is_some() && argv.first().map(String::as_str) == Some("sh") && format!("{e:#}").contains("not found") => {
-                self.core.run(Self::powershell_argv(&argv), cwd, labels, on)
+                self.core.run(Self::powershell_argv(&argv), cwd, labels, on, size, crate::terminal::initial_display(window))
             }
             r => r,
         }
@@ -2226,22 +2498,21 @@ impl AppWindow {
         argv.filter(|a| !a.is_empty()).map(|mut cmd| {
             cmd.extend(task.map(str::to_owned));
             if on.is_some() {
-                let mut run = vec!["sh".into(), "-c".into(), "\"$@\"; exec \"${SHELL:-sh}\" -i".into(), "sh".into()];
-                run.extend(cmd);
-                return run;
+                return crate::remote_shell::launch(cmd);
             }
             let sh = shell();
             if cfg!(windows) {
                 // PowerShell has no `-ic`: run it, then stay. `&` finds npm's `.cmd` shims too.
                 return vec![sh, "-NoExit".into(), "-Command".into(), crate::programs::powershell_line(&cmd)];
             }
-            unix_agent_argv(sh, cmd)
+            // macOS terminal sessions load login profiles (including Homebrew's PATH).
+            unix_agent_argv(sh, cmd, cfg!(target_os = "macos"))
         })
     }
 
     /// A space with its first tab and terminal, shown at once.
     /// `machine`: another machine (`hc machine ls`); its space starts in that machine's home.
-    fn new_space(&mut self, name: &str, folder: Option<String>, ctx_name: Option<&str>, argv: Option<Vec<String>>, task: Option<&str>, machine: Option<String>) -> Result<Value, String> {
+    fn new_space(&mut self, name: &str, folder: Option<String>, ctx_name: Option<&str>, argv: Option<Vec<String>>, task: Option<&str>, machine: Option<String>, window: &Window) -> Result<Value, String> {
         let on = machine.as_deref();
         // The focused pane's folder only means something on its own machine.
         let here = || self.model.focused_pane().and_then(|p| self.model.address_of(&p))
@@ -2249,7 +2520,8 @@ impl AppWindow {
             .and_then(|a| self.cwds.get(&a).cloned());
         let folder = folder.or_else(here).unwrap_or_else(|| if on.is_some() { String::new() } else { home() });
         let (space, ctx, pane) = (self.model.fresh_id_on("sp", on), self.model.fresh_id_on("tb", on), self.model.fresh_id_on("p", on));
-        let addr = self.spawn(Self::agent_argv(argv.clone(), task, on).or(argv), folder.clone(), &space, &ctx, on)?;
+        let size = self.initial_size(&Tab::new(&ctx, "", &pane, "").root, &pane, window);
+        let addr = self.spawn(Self::agent_argv(argv.clone(), task, on).or(argv), folder.clone(), &space, &ctx, on, size, window)?;
         let ctx_name = ctx_name.map(str::trim).unwrap_or_default();
         self.model.add_space(&space, name.trim(), &folder, Tab::new(&ctx, ctx_name, &pane, &addr));
         if let Some(p) = self.model.space_mut(&space) {
@@ -2259,7 +2531,7 @@ impl AppWindow {
     }
 
     /// A tab in a space (default: the shown one), shown at once.
-    fn new_tab(&mut self, space: Option<String>, name: &str, folder: Option<String>, argv: Option<Vec<String>>, task: Option<&str>) -> Result<Value, String> {
+    fn new_tab(&mut self, space: Option<String>, name: &str, folder: Option<String>, argv: Option<Vec<String>>, task: Option<&str>, window: &Window) -> Result<Value, String> {
         let space = space.or_else(|| self.model.active_space().map(|p| p.id.clone())).ok_or("no space yet: make one first (space.new)")?;
         if self.model.space(&space).is_none() {
             return Err(format!("no space {space:?}"));
@@ -2267,7 +2539,8 @@ impl AppWindow {
         let folder = folder.unwrap_or_else(|| self.folder_for(&space));
         let on = self.machine_of(&space);
         let (ctx, pane) = (self.model.fresh_id_on("tb", on.as_deref()), self.model.fresh_id_on("p", on.as_deref()));
-        let addr = self.spawn(Self::agent_argv(argv.clone(), task, on.as_deref()).or(argv), folder, &space, &ctx, on.as_deref())?;
+        let size = self.initial_size(&Tab::new(&ctx, "", &pane, "").root, &pane, window);
+        let addr = self.spawn(Self::agent_argv(argv.clone(), task, on.as_deref()).or(argv), folder, &space, &ctx, on.as_deref(), size, window)?;
         self.model.add_tab(&space, Tab::new(&ctx, name.trim(), &pane, &addr));
         self.model.active = Some(space.clone());
         Ok(json!({ "space": space, "tab": ctx, "terminal": addr }))
@@ -2280,7 +2553,7 @@ impl AppWindow {
             return Err(format!("no space {space:?}"));
         }
         if !self.folders.contains_key(&m) {
-            return Err(format!("no mod {m:?} in mods/"));
+            return Err(mods::missing(&m));
         }
         let machine = self.machine_of(&space);
         self.require_document(machine.as_deref())?;
@@ -2290,7 +2563,7 @@ impl AppWindow {
         Ok(json!({ "space": space, "tab": ctx, "pane": pane }))
     }
 
-    fn split(&mut self, pane: Option<String>, axis: Axis, argv: Option<Vec<String>>, folder: Option<String>) -> Result<Value, String> {
+    fn split(&mut self, pane: Option<String>, axis: Axis, argv: Option<Vec<String>>, folder: Option<String>, window: &Window) -> Result<Value, String> {
         let target = pane.or_else(|| self.model.focused_pane()).ok_or("no pane to split")?;
         let (Some(p), Some(c)) = (self.model.space_of(&target), self.model.tab_of(&target)) else { return Err(format!("no pane {target:?}")) };
         let (space, ctx, fallback) = (p.id.clone(), c.id.clone(), p.folder.clone());
@@ -2298,9 +2571,15 @@ impl AppWindow {
         let cwd = folder.unwrap_or_else(|| target_addr.as_ref().and_then(|a| self.cwds.get(a).cloned()).unwrap_or(fallback));
         // A split stays on the machine of the pane it splits (else its space's).
         let on = target_addr.and_then(|a| a.split_once('/').map(|(m, _)| m.to_owned())).or_else(|| self.machine_of(&space));
+        let share = self.split_room(&target, axis, &Node::block("", Content::Terminal { terminal: String::new() }))?;
         let new = self.model.fresh_id_on("p", on.as_deref());
-        let addr = self.spawn(argv, cwd, &space, &ctx, on.as_deref())?;
-        self.model.split(&target, axis, &new, &addr);
+        // Upstream sizes the new terminal before it starts; HERDR keeps the split's share (pane minimums).
+        let mut root = self.model.tab(&ctx).expect("target tab").root.clone();
+        root.split_share(&target, axis, Node::block(new.clone(), Content::Terminal { terminal: String::new() }), "initial-size".into(), share);
+        let size = self.model.active_tab().filter(|tab| tab.id == ctx)
+            .and_then(|_| self.initial_size(&root, &new, window));
+        let addr = self.spawn(argv, cwd, &space, &ctx, on.as_deref(), size, window)?;
+        self.model.split_share(&target, axis, crate::model::pane(&new, &addr), share);
         Ok(json!({ "pane": new, "terminal": addr }))
     }
 
@@ -2311,13 +2590,38 @@ impl AppWindow {
             return Err(format!("no pane {target:?}"));
         }
         if !self.folders.contains_key(&name) {
-            return Err(format!("no mod {name:?} in mods/"));
+            return Err(mods::missing(&name));
         }
         let machine = self.model.space_of(&target).and_then(|s| s.machine.clone());
         self.require_document(machine.as_deref())?;
+        let block = Node::block("", Content::Mod { name, props });
+        let share = self.split_room(&target, axis, &block)?;
         let new = self.model.fresh_id_on("p", machine.as_deref());
-        self.model.split_with(&target, axis, Node::block(new.clone(), Content::Mod { name, props }));
+        self.model.split_share(&target, axis, Node { id: new.clone(), ..block }, share);
         Ok(json!({ "pane": new }))
+    }
+
+    /// A mod's minimum along `axis` (mod.json min_width / min_height); other blocks have none.
+    fn leaf_min(&self) -> impl Fn(&Content, Axis) -> Option<f32> + '_ {
+        |content, axis| match content {
+            Content::Mod { name, .. } => self.folders.get(name).and_then(|f| match axis {
+                Axis::Row => f.hint.min_width,
+                Axis::Column => f.hint.min_height,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Whether `new` fits beside `target` along `axis` with both at their minimums: the new pane's
+    /// share of the room (half, or more or less so each keeps its minimum), else why not. A pane
+    /// not drawn yet has no size to check: half.
+    fn split_room(&self, target: &str, axis: Axis, new: &Node) -> Result<f32, String> {
+        let Some(old) = self.model.tab_of(target).and_then(|c| c.root.find(target)) else { return Err(format!("no pane {target:?}")) };
+        let Some(b) = self.bounds.borrow().get(target).copied() else { return Ok(0.5) };
+        let room = f32::from(match axis { Axis::Row => b.size.width, Axis::Column => b.size.height }) / settings::zoom();
+        let leaf = self.leaf_min();
+        let (m_old, m_new) = (old.min_along(axis, &leaf), new.min_along(axis, &leaf));
+        split_share(m_old, m_new, room)
     }
 
     /// Ask only whether a missing terminal is closed. Core owns restarting it.
@@ -2445,7 +2749,8 @@ impl AppWindow {
                     let destination = target.filter(|p| self.model.tab_of(p).is_some_and(|t| t.id == tab))
                         .or_else(|| self.model.tab(&tab).and_then(|t| t.root.panes().first().map(|p| p.id.clone())));
                     if let Some(target) = destination {
-                        self.model.split(&target, axis, &pane, &address);
+                        let share = self.split_room(&target, axis, &Node::block("", Content::Terminal { terminal: String::new() })).unwrap_or(0.5);
+                        self.model.split_share(&target, axis, crate::model::pane(&pane, &address), share);
                     } else {
                         self.model.add_tab(&space, Tab::new(&tab, &name, &pane, &address));
                     }
@@ -2512,6 +2817,43 @@ impl AppWindow {
         }
     }
 
+    /// HERDR: `mod.click` (test runs only): a left click at pane-local x, y in a shown mod copy,
+    /// dispatched after this command returns, as real input would arrive.
+    fn mod_click(&mut self, a: &Value, window: &mut Window, cx: &mut Context<Self>) -> Result<Value, String> {
+        if !crate::commands::test_input() {
+            return Err("unknown command \"mod.click\"".into());
+        }
+        let slot = Self::arg(a, "copy").unwrap_or_default();
+        let num = |k: &str| a.get(k).and_then(|v| v.as_f64().or_else(|| v.as_str()?.parse().ok()));
+        let (Some(x), Some(y)) = (num("x"), num("y")) else { return Err("mod.click needs numbers x and y".into()) };
+        if !self.copies.contains_key(slot) {
+            return Err(format!("no mod copy {slot:?} is shown"));
+        }
+        if x < 0. || y < 0. {
+            return Err(format!("{x}, {y}: x and y count from the copy's top left"));
+        }
+        // Outside this window's update: draw first (a headless window paints nothing by itself, so
+        // the copy has no measured place yet), then click as real input arrives.
+        let (handle, map, slot) = (window.window_handle(), self.slot_bounds.clone(), slot.to_owned());
+        cx.defer(move |cx| {
+            use gpui::InputEvent;
+            let _ = handle.update(cx, |_, window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+                let Some(b) = map.borrow().get(&slot).copied() else { return tracing::warn!("mod.click: {slot:?} has no place on screen") };
+                if x > f64::from(f32::from(b.size.width)) || y > f64::from(f32::from(b.size.height)) {
+                    return tracing::warn!("mod.click: {x}, {y} is outside {slot:?} ({} x {})", f32::from(b.size.width), f32::from(b.size.height));
+                }
+                let position = gpui::point(b.origin.x + px(x as f32), b.origin.y + px(y as f32));
+                let down = MouseDownEvent { button: MouseButton::Left, position, modifiers: Default::default(), click_count: 1, first_mouse: false };
+                let up = gpui::MouseUpEvent { button: MouseButton::Left, position, modifiers: Default::default(), click_count: 1 };
+                window.dispatch_event(down.to_platform_input(), cx);
+                window.dispatch_event(up.to_platform_input(), cx);
+            });
+        });
+        Ok(json!({ "ok": true }))
+    }
+
     fn argv(args: &Value) -> Option<Vec<String>> {
         args.get("argv").and_then(|v| serde_json::from_value(v.clone()).ok())
     }
@@ -2540,9 +2882,14 @@ impl AppWindow {
     fn run(&mut self, name: &str, args: Value, window: &mut Window, cx: &mut Context<Self>) {
         // A click or key has nobody to read the reply: show why it failed.
         if let Some(error) = self.run_as(name, args, true, window, cx).get("error").and_then(Value::as_str) {
-            let spec = json!({"kind":"toast", "notification":{"title":format!("{name} failed"),"body":error,"level":"error"}});
-            self.open_overlay(mods::new_overlay_id(), spec, window, cx);
+            self.command_error(name, error, window, cx);
         }
+    }
+
+    fn command_error(&mut self, name: &str, error: &str, window: &mut Window, cx: &mut Context<Self>) {
+        // HERDR: through the notification store (bell, stacking, one per command), not a bare toast.
+        let n = json!({"title":format!("{name} failed"),"body":error,"level":"error","key":format!("cmd:{name}")});
+        self.post_note("app", "herdr", "Herdr", n, window, cx);
     }
 
     /// Runs a command and says what it made or why not. Scripts and agents
@@ -2581,7 +2928,11 @@ impl AppWindow {
         if let Err(error) = crate::commands::validate_args(command, &args) {
             return json!({ "error": error });
         }
-        if terminal_block(&self.chrome, self.focused_pane.as_deref()).is_some() && needs_model_pane(name, &args) {
+        // pane.go from a mod block starts at the block, not at the terminal block focused before it.
+        if terminal_block(&self.chrome, self.focused_pane.as_deref()).is_some()
+            && needs_model_pane(name, &args)
+            && !(name == "pane.go" && self.focused_block.is_some())
+        {
             return json!({ "error": "a terminal layout block is focused, not a pane; focus a pane or pass an explicit pane id" });
         }
         if person && name.ends_with(".rename") && args.get("name").is_none_or(Value::is_null) {
@@ -2593,6 +2944,11 @@ impl AppWindow {
         }
         if person {
             crate::telemetry::command(command.name);
+        }
+        if name == "space.new" {
+            let machine = new_space_machine(&args, person, &self.model);
+            if !args.is_object() { args = json!({}); }
+            args["machine"] = json!(machine);
         }
         if matches!(name, "space.new" | "space.close" | "space.rename" | "space.move" | "tab.new" | "tab.close" | "tab.rename" | "tab.move" | "pane.split" | "pane.close" | "pane.swap" | "terminal.keep" | "terminal.park") {
             let node = ["id", "space", "pane"].into_iter().find_map(|k| Self::arg(&args, k));
@@ -2643,7 +2999,7 @@ impl AppWindow {
             // ---- spaces
             "space.new" => {
                 let name = Self::arg(a, "name").unwrap_or_default();
-                let r = self.new_space(name, Self::owned(a, "folder"), Self::arg(a, "tab"), Self::argv(a), Self::arg(a, "task"), Self::owned(a, "machine").filter(|m| !m.is_empty()));
+                let r = self.new_space(name, Self::owned(a, "folder"), Self::arg(a, "tab"), Self::argv(a), Self::arg(a, "task"), Self::owned(a, "machine").filter(|m| !m.is_empty()), window);
                 self.answer(r);
             }
             "space.close" => {
@@ -2693,7 +3049,11 @@ impl AppWindow {
                 let name = Self::arg(a, "name").unwrap_or_default();
                 let r = match Self::owned(a, "mod") {
                     Some(m) => self.new_mod_tab(Self::owned(a, "space"), name, m, a.get("props").cloned().unwrap_or(Value::Null)),
-                    None => self.new_tab(Self::owned(a, "space"), name, Self::owned(a, "folder"), Self::argv(a), Self::arg(a, "task")),
+                    // A person's new tab with no space open starts one, as space.new does.
+                    None if person && a.get("space").is_none() && self.model.active_space().is_none() => {
+                        self.new_space("", Self::owned(a, "folder"), Some(name), Self::argv(a), Self::arg(a, "task"), None, window)
+                    }
+                    None => self.new_tab(Self::owned(a, "space"), name, Self::owned(a, "folder"), Self::argv(a), Self::arg(a, "task"), window),
                 };
                 self.answer(r);
             }
@@ -2761,7 +3121,7 @@ impl AppWindow {
                 };
                 let r = match Self::owned(a, "mod") {
                     Some(name) => self.split_mod(Self::owned(a, "pane"), axis, name, a.get("props").cloned().unwrap_or(Value::Null)),
-                    None => self.split(Self::owned(a, "pane"), axis, Self::argv(a), None),
+                    None => self.split(Self::owned(a, "pane"), axis, Self::argv(a), None, window),
                 };
                 self.answer(r);
             }
@@ -2795,9 +3155,10 @@ impl AppWindow {
                     && let Some(block) = self.chrome.visible_blocks().into_iter().find(|n| n.terminal() == Some(terminal))
                 {
                     let id = block.id.clone();
+                    self.focused_block = None;
                     self.focused_pane = Some(id.clone());
                     self.synced_model_pane = self.model.focused_pane();
-                    if !self.overlays.iter().any(|o| o.kind.modal_keys()) && let Some(f) = self.pane_focus(&id) {
+                    if !self.overlays.iter().any(|o| o.kind.modal_keys()) && let Some(f) = self.pane_focus(&id, cx) {
                         f.focus(window, cx);
                     }
                     self.publish(cx);
@@ -2806,6 +3167,7 @@ impl AppWindow {
                 }
                 let pane = Self::owned(a, "pane").or_else(|| Self::arg(a, "terminal").and_then(|t| self.model.pane_of(t)));
                 let Some(p) = pane.filter(|p| self.model.tab_of(p).is_some()) else { return self.fail("no such pane") };
+                self.focused_block = None;
                 self.model.focus_pane(&p);
                 self.focused_pane = None;
                 self.agent = self.model.address_of(&p);
@@ -2816,32 +3178,22 @@ impl AppWindow {
                 if !matches!(dir, "left" | "right" | "up" | "down") {
                     return self.fail(format!("{name} direction is left, right, up or down, not {dir:?}"));
                 }
-                if let Some(from) = self.model.focused_pane()
-                    && let Some(to) = self.neighbor(&from, dir)
-                {
-                    if name == "pane.swap" {
-                        if let Some(ctx) = self.model.tab_of(&from).map(|c| c.id.clone())
-                            && let Some(c) = self.model.tab_mut(&ctx)
-                        {
-                            c.root.swap(&from, &to);
-                        }
-                    } else {
-                        self.model.focus_pane(&to);
-                        self.focused_pane = None;
-                    }
+                if name == "pane.go" {
+                    return self.go(dir, window, cx);
                 }
+                self.swap_pane(dir);
             }
             // ---- terminals
             "terminal.open" => {
                 let argv = Self::argv(a);
                 let r = match Self::arg(a, "place").unwrap_or("tab") {
-                    "right" => self.split(None, Axis::Row, argv, Self::owned(a, "folder")),
-                    "down" => self.split(None, Axis::Column, argv, Self::owned(a, "folder")),
+                    "right" => self.split(None, Axis::Row, argv, Self::owned(a, "folder"), window),
+                    "down" => self.split(None, Axis::Column, argv, Self::owned(a, "folder"), window),
                     _ => {
                         let name = Self::owned(a, "name")
                             .or_else(|| argv.as_ref().and_then(|v| v.first()).map(|p| p.rsplit('/').next().unwrap_or(p).to_owned()))
                             .unwrap_or_else(|| "shell".into());
-                        self.new_tab(None, &name, Self::owned(a, "folder"), argv, None)
+                        self.new_tab(None, &name, Self::owned(a, "folder"), argv, None, window)
                     }
                 };
                 self.answer(r);
@@ -2860,7 +3212,7 @@ impl AppWindow {
                     Some("menu") => "",
                     other => return self.fail(format!("terminal.right_click to is \"program\" or \"menu\", not {other:?}")),
                 };
-                let t = Self::owned(a, "terminal").or_else(|| self.focused_terminal(window).map(|t| t.address.clone()));
+                let t = Self::owned(a, "terminal").or_else(|| self.focused_terminal(window, cx).map(|t| t.address.clone()));
                 let Some(t) = t.filter(|t| self.live.contains_key(t)) else { return self.fail("no such running terminal") };
                 // Off the UI thread: a terminal on a slow machine answers late.
                 let core = self.core.clone();
@@ -2869,6 +3221,22 @@ impl AppWindow {
                     .spawn(async move {
                         if let Err(e) = core.call("terminal.label", params) {
                             tracing::warn!("right-click label: {e:#}");
+                        }
+                    })
+                    .detach();
+            }
+            "terminal.pin" => {
+                let Some(pinned) = a.get("pinned").and_then(Value::as_bool) else { return self.fail("terminal.pin pinned is true or false") };
+                let t = Self::arg(a, "terminal").unwrap_or_default().to_owned();
+                if !self.live.contains_key(&t) {
+                    return self.fail(format!("no running terminal {t:?}"));
+                }
+                let core = self.core.clone();
+                let params = json!({ "terminal": t, "labels": { "herdr.pinned": if pinned { "1" } else { "" } } });
+                cx.background_executor()
+                    .spawn(async move {
+                        if let Err(e) = core.call("terminal.label", params) {
+                            tracing::warn!("pin label: {e:#}");
                         }
                     })
                     .detach();
@@ -2908,15 +3276,26 @@ impl AppWindow {
                     self.focused_pane = None;
                 }
             }
+            "terminal.search" => {
+                let Some(t) = self.focused_terminal(window, cx) else { return self.fail("no focused terminal to search") };
+                t.view.update(cx, |view, cx| view.open_search(window, cx));
+                return;
+            }
             "terminal.copy" | "terminal.paste" | "terminal.paste_image" => {
-                if let Some(t) = self.focused_terminal(window) {
+                if let Some(t) = self.focused_terminal(window, cx) {
                     t.view.update(cx, |v, cx| match name {
                         "terminal.paste" => v.paste(cx),
                         "terminal.paste_image" => v.paste_image(cx),
-                        _ => v.copy(cx),
+                        // A command, not a key: copy and leave the selection.
+                        _ => { let _ = v.copy(cx); }
                     });
                 }
                 return;
+            }
+            "terminal.scroll" => {
+                if let Err(error) = self.scroll_terminal(a, window, cx) {
+                    self.fail(error);
+                }
             }
             // ---- agents
             "agent.focus" => {
@@ -2944,7 +3323,8 @@ impl AppWindow {
             }
             // ---- layout
             "layout.switch" => {
-                self.switch_layout(Self::arg(a, "name"), window, cx);
+                // HERDR: "fork" is the old name of "labs".
+                self.switch_layout(Self::arg(a, "name").map(|n| if n == "fork" { FORK_DEFAULT_LAYOUT } else { n }), window, cx);
                 return;
             }
             "layout.clone" => {
@@ -2965,6 +3345,17 @@ impl AppWindow {
                 }
                 self.folders = mods::scan().into_iter().map(|f| (f.id.clone(), f)).collect();
             }
+            // HERDR: browser block. The + menu's Remote desktop: the labs bridge prints one url with a
+            // one-time token; it opens in a new browser block with raw chords on. The person's
+            // explicit source for raw chords; agents can't run it (their browser.* go to the agent).
+            // HERDR: browser block. The person's own browser (+ menu, cmd-shift-b, the pane menu): their
+            // profile, raw chords off; a new tab, or right/down of `pane` (else the focused pane).
+            "browser.new" => {
+                if let Err(e) = self.open_person_browser(a) {
+                    return self.fail(e);
+                }
+            }
+            "browser.remote" => self.open_remote_desktop(Self::arg(a, "machine").map(str::to_owned), window, cx),
             "layout.set" if shipped_layouts().contains(&self.layout_name.as_str()) => {
                 let n = match serde_json::from_value::<Node>(a.get("layout").cloned().unwrap_or_default()) {
                     Ok(n) => n,
@@ -3046,10 +3437,16 @@ impl AppWindow {
             }
             "mod.open" => {
                 let name = Self::arg(a, "name").unwrap_or_default();
-                let Some(f) = self.folders.get(name) else { return self.fail(format!("no mod folder {name:?}")) };
+                let Some(f) = self.folders.get(name) else { return self.fail(mods::missing(name)) };
                 let mut spec = mod_overlay(&f.dir);
                 spec["mod"] = json!(name);
-                self.open_overlay(mods::new_overlay_id(), spec, window, cx);
+                // One popup per mod: running mod.open again toggles it, like app.settings.
+                let id = format!("mod-{name}");
+                if self.overlays.iter().any(|o| o.id == id) {
+                    self.close_overlay(&id, window, cx);
+                } else {
+                    self.open_overlay(id, spec, window, cx);
+                }
             }
             "overlay.close" => {
                 let id = Self::owned(a, "id").or_else(|| self.overlays.iter().rev().find(|o| o.kind.modal_keys()).map(|o| o.id.clone()));
@@ -3068,8 +3465,13 @@ impl AppWindow {
                 return;
             }
             "app.palette" => {
-                let spec = json!({ "mod": "frame-palette", "kind": "popup", "at": "top", "offset": 60, "width": 620, "height": 0.85 });
-                self.open_overlay(mods::new_overlay_id(), spec, window, cx);
+                // Once: a second press closes the palette instead of stacking another.
+                if self.overlays.iter().any(|o| o.id == "palette") {
+                    self.close_overlay("palette", window, cx);
+                } else {
+                    let spec = json!({ "mod": "frame-palette", "kind": "popup", "at": "top", "offset": 60, "width": 620, "height": 0.85 });
+                    self.open_overlay("palette".into(), spec, window, cx);
+                }
                 return;
             }
             "app.feedback" => {
@@ -3081,6 +3483,22 @@ impl AppWindow {
                 let spec = json!({ "mod": "frame-feedback", "kind": "window", "key": "feedback", "width": 680,
                     "props": { "message": Self::owned(a, "message").unwrap_or_default(), "from": from, "layout": self.layout_name } });
                 self.open_overlay(mods::new_overlay_id(), spec, window, cx);
+                return;
+            }
+            // HERDR: the bell's history (also what the bell panel's header buttons run).
+            "notifications.read_all" => {
+                self.notes.mark_read(&crate::notifications::Target::All);
+                self.publish_notes(cx);
+                return;
+            }
+            "notifications.clear_all" => {
+                self.notes.clear(&crate::notifications::Target::All);
+                self.publish_notes(cx);
+                return;
+            }
+            "notifications.toggle_dnd" => {
+                self.write_person(|p| p.notifications.dnd = !p.notifications.dnd, window, cx);
+                self.publish_notes(cx);
                 return;
             }
             "app.settings" => {
@@ -3104,8 +3522,12 @@ impl AppWindow {
                 crate::update::update_core();
             }
             "app.help" => {
-                let spec = json!({ "mod": "help", "kind": "dialog", "width": 640, "height": 520 });
-                self.open_overlay(mods::new_overlay_id(), spec, window, cx);
+                if self.overlays.iter().any(|o| o.id == "help") {
+                    self.close_overlay("help", window, cx);
+                } else {
+                    let spec = json!({ "mod": "help", "kind": "dialog", "width": 640, "height": 520 });
+                    self.open_overlay("help".into(), spec, window, cx);
+                }
                 return;
             }
             "app.reset" => self.reset(window, cx),
@@ -3143,6 +3565,12 @@ impl AppWindow {
                 cx.quit();
             }
             "window.close" | "window.minimize" | "window.maximize" => return self.window_command(name, window, cx),
+            "window.native" => return self.answer(Self::window_native(window)),
+            // HERDR: test-only (commands::TEST_COMMANDS): unknown unless HERDR_APP_TEST_INPUT=1 at start.
+            "mod.click" => {
+                let r = self.mod_click(a, window, cx);
+                return self.answer(r);
+            }
             // Hiding apps is macOS's (bound natively there).
             "app.hide" | "app.hide_others" | "app.show_all" => return,
             other => {
@@ -3160,27 +3588,75 @@ impl AppWindow {
         self.model.spaces.iter_mut().flat_map(|p| p.tabs.iter_mut()).find_map(|c| c.root.find_mut(id))
     }
 
-    /// The nearest visible pane in a direction, by what's on screen.
-    fn neighbor(&self, from: &str, dir: &str) -> Option<String> {
+    /// The nearest visible pane, also considering focusable mods for `pane.go`.
+    fn neighbor(&self, from: &str, dir: &str, use_history: bool) -> Option<String> {
         let bounds = self.bounds.borrow();
         let cur = *bounds.get(from)?;
-        let c = self.model.active_tab()?;
-        let candidates: Vec<String> = c.shown().visible_blocks().iter().filter(|n| n.is_pane() && n.id != from).map(|n| n.id.clone()).collect();
-        let overlap = |a0: Pixels, a1: Pixels, b0: Pixels, b1: Pixels| f32::from(a1.min(b1) - a0.max(b0)).max(0.0);
-        candidates
-            .into_iter()
-            .filter_map(|id| {
-                let r = *bounds.get(&id)?;
-                let (gap, ov) = match dir {
-                    "left" => (f32::from(cur.left() - r.right()), overlap(cur.top(), cur.bottom(), r.top(), r.bottom())),
-                    "right" => (f32::from(r.left() - cur.right()), overlap(cur.top(), cur.bottom(), r.top(), r.bottom())),
-                    "up" => (f32::from(cur.top() - r.bottom()), overlap(cur.left(), cur.right(), r.left(), r.right())),
-                    _ => (f32::from(r.top() - cur.bottom()), overlap(cur.left(), cur.right(), r.left(), r.right())),
-                };
-                (gap > -2.0 && ov > 0.0).then_some((gap, -ov, id))
-            })
-            .min_by(|a, b| a.partial_cmp(b).unwrap())
-            .map(|(_, _, id)| id)
+        let mut candidates: Vec<String> = self.model.active_tab().into_iter()
+            .flat_map(|c| c.shown().visible_blocks().into_iter().filter(|n| n.is_pane()).map(|n| n.id.clone()))
+            .collect();
+        if use_history {
+            candidates.extend(self.chrome.visible_blocks().into_iter().filter(|n| self.focusable(&n.id)).map(|n| n.id.clone()));
+        }
+        let candidates = candidates.into_iter().filter(|id| id != from).filter_map(|id| Some((id.clone(), *bounds.get(&id)?)));
+        nearest(cur, dir, candidates, if use_history { &self.pane_history } else { &[] })
+    }
+
+    /// `pane.go`: the nearest pane or focusable mod.
+    fn go(&mut self, dir: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(from) = self.focused_block.clone().or_else(|| self.model.focused_pane()) else { return };
+        let Some(to) = self.neighbor(&from, dir, true) else { return };
+        if self.focusable(&to) {
+            return self.focus_block(&to, window, cx);
+        }
+        self.focused_block = None;
+        self.model.focus_pane(&to);
+        self.focused_pane = None;
+        self.sync(window, cx);
+    }
+
+    /// Until the mod takes the keyboard, the window holds the keys.
+    fn focus_block(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.model.tab_of(id).is_some() {
+            self.model.focus_pane(id);
+            self.focused_pane = None;
+        }
+        self.focused_block = Some(id.to_owned());
+        self.sync(window, cx);
+        if !self.overlays.iter().any(|o| o.kind.modal_keys()) {
+            self.focus.focus(window, cx);
+            self.hand_keyboard();
+        }
+    }
+
+    /// Its copy gets `focus` from `nextCommand()`.
+    fn hand_keyboard(&self) {
+        if let Some(copy) = self.focused_block.as_ref().and_then(|b| self.copies.get(b)) {
+            mods::send_command_to(copy.id, "focus");
+        }
+    }
+
+    /// A mod block on screen: in the layout, or a mod pane of the shown tab.
+    fn mod_block_shown(&self, id: &str) -> bool {
+        self.copies.contains_key(id)
+            && (self.chrome.visible_blocks().iter().any(|n| n.id == id && matches!(n.content(), Some(Content::Mod { .. })))
+                || self.model.active_tab().is_some_and(|t| t.shown().visible_blocks().iter().any(|n| n.id == id)))
+    }
+
+    /// Its mod.json says `"focusable": true` (`go` asks only of visible blocks).
+    fn focusable(&self, id: &str) -> bool {
+        self.copies.get(id).and_then(|c| self.folders.get(&c.inst.name)).is_some_and(|f| f.hint.focusable)
+    }
+
+    /// Swaps the focused pane with its neighbor in a direction.
+    fn swap_pane(&mut self, dir: &str) {
+        if let Some(from) = self.model.focused_pane()
+            && let Some(to) = self.neighbor(&from, dir, false)
+            && let Some(ctx) = self.model.tab_of(&from).map(|c| c.id.clone())
+            && let Some(c) = self.model.tab_mut(&ctx)
+        {
+            c.root.swap(&from, &to);
+        }
     }
 
     // ---- overlays ----------------------------------------------------------
@@ -3295,6 +3771,7 @@ impl AppWindow {
             place,
             key: key.clone(),
             frame: spec.get("mod").and_then(Value::as_str).is_some_and(|m| m.starts_with("frame-")),
+            leaving: None,
         });
         if let Some(k) = &key {
             if spec.get("keep").and_then(Value::as_bool) == Some(true) {
@@ -3401,6 +3878,36 @@ impl AppWindow {
             Request::OpenOverlay { id, spec } => self.open_overlay(id, spec, window, cx),
             Request::CloseOverlay { id } => self.close_overlay(&id, window, cx),
             Request::Refresh => self.refresh_mods(cx),
+            Request::Notes { op, arg, folder, owner } => self.mod_notes(op, arg, folder, owner, window, cx),
+            // HERDR: browser block. `browser.*` may answer later (eval, screenshot): the reply goes with it.
+            // browser.new over the control socket is anyone's (agents included): it opens an agent-profile
+            // browser, never the person's logins; the person's own path is the menu and keys (`run`).
+            Request::Control { cmd, reply } if cmd.get("do").and_then(Value::as_str) == Some("browser.new") => {
+                let a = cmd.get("args").cloned().unwrap_or(json!({}));
+                let r = self.open_new_browser(&a, new_browser(Self::arg(&a, "url"), Via::Control));
+                let _ = reply.send(r.unwrap_or_else(|error| json!({ "error": error })));
+                self.flush_documents(false, window, cx);
+                self.sync(window, cx);
+                cx.notify();
+            }
+            Request::Control { cmd, reply } if cmd.get("do").and_then(Value::as_str).is_some_and(|n| n.starts_with("browser.")) => {
+                let name = cmd["do"].as_str().unwrap_or_default().to_owned();
+                let args = cmd.get("args").cloned().unwrap_or(json!({}));
+                self.browser_command(&name, args, Box::new(move |r| {
+                    let _ = reply.send(r.unwrap_or_else(|error| json!({ "error": error })));
+                }), window, cx);
+            }
+            // HERDR: every window shot is drawn outside this view's update (a headless window is never
+            // asked to display, and a masked draw covers sensitive pages), then saved to a new private file.
+            Request::Control { cmd, reply } if cmd.get("shot").and_then(Value::as_str).is_some() => {
+                let path = PathBuf::from(cmd["shot"].as_str().unwrap_or_default());
+                window.defer(cx, move |window, cx| {
+                    let _ = reply.send(match crate::control::masked_shot(window, cx, &path) {
+                        Ok(()) => json!({ "path": path }),
+                        Err(error) => json!({ "error": format!("cannot save screenshot: {error:#}") }),
+                    });
+                });
+            }
             Request::Control { cmd, reply } => {
                 let _ = reply.send(self.control(cmd, window, cx));
             }
@@ -3411,12 +3918,6 @@ impl AppWindow {
         if let Some(name) = cmd.get("do").and_then(Value::as_str) {
             let args = cmd.get("args").cloned().unwrap_or(Value::Null);
             return self.run_as(name, args, false, window, cx);
-        }
-        if let Some(path) = cmd.get("shot").and_then(Value::as_str) {
-            return match crate::control::save_shot(window, std::path::Path::new(path)) {
-                Ok(()) => json!({ "path": path }),
-                Err(error) => json!({ "error": format!("cannot save screenshot: {error:#}") }),
-            };
         }
         if cmd.get("commands").is_some() {
             return crate::commands::listing();
@@ -3448,6 +3949,12 @@ impl AppWindow {
                 "layout": self.layout_name,
                 "agent": self.shown_agent(),
                 "floats": self.float_status(),
+                // HERDR: the bell, for agents and tests (no item text).
+                "notifications": {
+                    "unread": self.notes.unread(&self.person.notifications.muted_sources),
+                    "total": self.notes.items.len(),
+                    "dnd": self.person.notifications.dnd,
+                },
                 "overlays": self.overlays.iter().map(|o| match &o.layout {
                     Some(_) => Some("layout".to_owned()),
                     None => self.copies.get(&o.slot).map(|c| c.inst.name.clone()),
@@ -3529,8 +4036,36 @@ impl AppWindow {
             self.check_layout_file(window, cx);
             self.sync_folders(window, cx);
         }
+        // HERDR: a failed herdr-core update is one bell item; it reads as read once the update works.
+        let core_error = crate::update::core().error;
+        if core_error != self.core_error_noted {
+            match &core_error {
+                Some(e) => self.post_note("updates", "herdr", "herdr-core", json!({
+                    "title": "herdr-core update failed", "body": e, "level": "error", "key": "updates:core",
+                    // The pinned banner already shows it: history only, no toast.
+                    "silent": true,
+                    "action": { "name": "app.settings", "args": { "section": "updates" } },
+                }), window, cx),
+                None => {
+                    if self.notes.resolve("updates:core") {
+                        self.publish_notes(cx);
+                    }
+                }
+            }
+            self.core_error_noted = core_error;
+        }
+        // HERDR: the bell's history is written at most once a poll; `history: false` keeps it in memory.
+        self.flush_notes();
         let now = Instant::now();
-        let expired: Vec<String> = self.overlays.iter().filter(|o| o.expires.is_some_and(|e| e <= now)).map(|o| o.id.clone()).collect();
+        // HERDR: toasts wait while the pointer is over the deck; a timed-out one fades, then goes.
+        if self.deck_hover.is_none() {
+            for o in self.overlays.iter_mut().filter(|o| o.leaving.is_none() && o.expires.is_some_and(|e| e <= now)) {
+                o.leaving = Some(now);
+                cx.notify();
+            }
+        }
+        let fade = Duration::from_millis(toasts::ANIM_MS);
+        let expired: Vec<String> = self.overlays.iter().filter(|o| o.leaving.is_some_and(|t| now >= t + fade)).map(|o| o.id.clone()).collect();
         for id in expired {
             self.close_overlay(&id, window, cx);
         }
@@ -3539,6 +4074,14 @@ impl AppWindow {
             self.window_active = active;
             if active {
                 self.sync(window, cx);
+            } else {
+                self.looked.clear();
+            }
+            // Tell mods now: render publishes window() too, but a mod it refreshes
+            // waits for another frame, which an idle window that just lost focus
+            // may not draw for a long time.
+            if mods::publish_window(self.window_json(window)) {
+                self.refresh_snapshot_mods(cx);
             }
         }
         let dark = is_dark(window.appearance());
@@ -3550,9 +4093,16 @@ impl AppWindow {
 
     /// Files people or agents edited: apply what they change.
     fn files_changed(&mut self, changed: Vec<std::path::PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        for path in changed_asset_paths(&mods::app_dir(), &changed) {
+            invalidate_asset(&path, window, cx);
+        }
         let top = |p: &std::path::PathBuf| p.components().next().and_then(|c| c.as_os_str().to_str().map(str::to_owned)).unwrap_or_default();
         if changed.iter().any(|p| matches!(top(p).as_str(), "settings.json" | "keys.json" | "programs.json" | "themes")) {
             self.reload_config(window, cx);
+        }
+        // The theme showing may be the file that changed.
+        if changed.iter().any(|p| top(p) == "themes") {
+            self.apply_look(window, cx);
         }
         if changed.iter().any(|p| top(p) == "layouts") {
             self.check_layout_file(window, cx);
@@ -3614,9 +4164,18 @@ impl AppWindow {
 
     // ---- rendering ---------------------------------------------------------
 
-    fn focused_path(&self) -> HashSet<String> {
+    fn focused_path(&self, window: &Window, cx: &App) -> HashSet<String> {
         let mut out = HashSet::new();
+        // A mod block in the layout holding the keyboard: its `focus` looks, not the pane's.
+        if let Some(path) = self.focused_block.as_ref().and_then(|b| self.chrome.path_to(b)) {
+            out.extend(path);
+            return out;
+        }
         if let Some(p) = &self.focused_pane {
+            // Pane selection survives an input, float or dialog taking the keyboard.
+            if self.pane_term(p).is_some_and(|t| !t.view.read(cx).owns_keyboard_focus(window, cx)) {
+                return out;
+            }
             if let Some(c) = self.model.active_tab()
                 && let Some(path) = c.root.path_to(p)
             {
@@ -3641,7 +4200,7 @@ impl AppWindow {
     /// A pane in its frame: the look, and the header mod above or below it
     /// (on hover: drawn over the terminal, so it never resizes).
     fn frame_pane(&self, n: &Node, f: &PaneFrame, on: bool, inner: AnyElement, cx: &mut Context<Self>) -> AnyElement {
-        let line = if on { f.focus.as_ref().or(f.border.as_ref()) } else { f.border.as_ref() };
+        let line = pane_size::frame_border(f, on);
         let group = SharedString::from(format!("pane-{}", n.id));
         let mut el = div().size_full().relative().flex().flex_col().overflow_hidden().group(group.clone());
         if let Some(r) = f.radius {
@@ -3656,7 +4215,7 @@ impl AppWindow {
         el = shadow(el, f.shadow.as_deref());
         let body = div().flex_1().min_h_0().flex().child(inner);
         let Some(h) = &f.header else { return el.child(body).into_any_element() };
-        let head = div().flex_none().h(settings::z(h.height.unwrap_or(HEADER_HEIGHT))).w_full().flex()
+        let head = div().flex_none().h(settings::z(pane_size::header_height(h))).w_full().flex()
             .child(self.render_slot(&format!("{}#frame", n.id), cx));
         if h.hover() {
             let head = head.absolute().left_0().right_0().opacity(0.).group_hover(group, |s| s.opacity(1.));
@@ -3671,7 +4230,7 @@ impl AppWindow {
         let mut el = div().relative().overflow_hidden().size_full().flex();
         let bounds_map = self.bounds.clone();
         let id = n.id.clone();
-        el = el.child(canvas(move |b, _, _| { bounds_map.borrow_mut().insert(id, b); }, |_, _, _, _| {}).absolute().size_full());
+        el = el.child(canvas(move |b, _, _| { bounds_map.borrow_mut().insert(id, b); }, |_, _, _, _| {}).absolute().top_0().left_0().size_full());
         el = apply_look(el, n, focused.contains(&n.id));
         if n.window_drag {
             el = self.window_drag(el, cx);
@@ -3688,15 +4247,11 @@ impl AppWindow {
                 let axis = n.axis().unwrap();
                 el = if axis == Axis::Row { el.flex_row() } else { el.flex_col() };
                 let shown: Vec<&Node> = children.iter().filter(|c| !c.hidden).collect();
-                let gap = n.gap.or(frame.and_then(|f| f.gap)).unwrap_or(0.0);
+                let gap = pane_size::gap(n, frame);
                 // Weights are shares of what the fixed-size siblings leave, so they always fill it.
                 let total: f32 = shown
                     .iter()
-                    .filter_map(|c| match c.size {
-                        Some(Span::Px { .. }) => None,
-                        Some(Span::Weight { weight }) => Some(weight),
-                        None => Some(1.0),
-                    })
+                    .map(|c| pane_size::weight(c))
                     .sum::<f32>()
                     .max(f32::EPSILON);
                 for (i, child) in shown.iter().enumerate() {
@@ -3713,7 +4268,7 @@ impl AppWindow {
             Kind::Stack { header, .. } => {
                 el = el.flex_col();
                 let head = header.as_ref().map(|h| {
-                    let height = h.height.unwrap_or(HEADER_HEIGHT);
+                    let height = pane_size::header_height(h);
                     let head: AnyElement = match &h.content {
                         HeaderContent::Mod { .. } => self.render_slot(&format!("{}#header", n.id), cx),
                         HeaderContent::Builtin(_) => self.builtin_tabs(n, cx),
@@ -3732,7 +4287,7 @@ impl AppWindow {
                 }
             }
         };
-        let row = frame.and_then(|f| f.header.as_ref()).filter(|h| !h.bottom() && !h.hover()).map(|h| h.height.unwrap_or(HEADER_HEIGHT));
+        let row = frame.and_then(|f| f.header.as_ref()).filter(|h| !h.bottom() && !h.hover()).map(pane_size::header_height);
         el.children(self.render_floats(n, cx)).children(self.pane_grip(&n.id, row, cx)).into_any_element()
     }
 
@@ -3762,6 +4317,11 @@ impl AppWindow {
                 None => div().into_any_element(),
             },
             Content::Mod { .. } => self.render_slot(&n.id, cx),
+            // HERDR: browser block
+            Content::Browser { .. } => match self.browsers.view(&n.id) {
+                Some(v) => div().size_full().child(v.clone()).into_any_element(),
+                None => div().into_any_element(),
+            },
             Content::Agent { .. } => match self.shown_agent() {
                 Some(addr) => match self.agent_view(&n.id, &addr) {
                     Some(t) => div().size_full().child(shown_terminal(&t.view, cx)).into_any_element(),
@@ -3794,6 +4354,253 @@ impl AppWindow {
         }
     }
 
+    // HERDR: browser block. A view per browser block in any layout (chrome, tabs, overlays,
+    // floats); a block that goes closes its page. The page's url is written back to the document.
+    fn sync_browsers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut blocks = crate::layout::browser_blocks(&self.chrome);
+        for t in self.model.tabs() {
+            blocks.extend(crate::layout::browser_blocks(&t.root));
+        }
+        for l in self.overlays.iter().filter_map(|o| o.layout.as_ref()) {
+            blocks.extend(crate::layout::browser_blocks(l));
+        }
+        self.browsers.sync(blocks, window, cx, |this, id, ev, window, cx| {
+            let url = match ev {
+                crate::browser::view::BrowserEvent::Url(url) => url,
+                crate::browser::view::BrowserEvent::Focused => {
+                    this.browsers.focused = Some(id.to_owned());
+                    return;
+                }
+                crate::browser::view::BrowserEvent::NewWindow(url) => {
+                    this.browser_new_window(id, url, window, cx);
+                    return;
+                }
+                // Pick results go to the agent tools (part 5) through the view; nothing for the layout.
+                crate::browser::view::BrowserEvent::Picked { x, y } => {
+                    this.browsers.picked(id, *x, *y);
+                    return;
+                }
+                crate::browser::view::BrowserEvent::Region(_) => return,
+                // S27: fork-input's arm answers with show_recipients; a no-op until it lands.
+                // HERDR: S27. The Send badge asks who to send to: the live agents, as in the panes list.
+                crate::browser::view::BrowserEvent::PickRecipient => {
+                    let m = &this.model;
+                    let rows = m.agents.iter().filter(|(a, _)| this.live.contains_key(*a) && m.status(a).is_some()).map(|(addr, a)| {
+                        let name = this.live.get(addr).and_then(|r| r["name"].as_str()).filter(|s| !s.is_empty()).map(str::to_owned)
+                            .or_else(|| a.app.as_deref().map(agent_name)).unwrap_or_else(|| addr.to_owned());
+                        (addr.clone(), name, a.word.clone())
+                    });
+                    let list = crate::browser::send_to::candidates(rows.collect::<Vec<_>>());
+                    if let Some(view) = this.browsers.view(id).cloned() {
+                        view.update(cx, |v, cx| v.show_recipients(list, cx));
+                    }
+                    return;
+                }
+                // HERDR: browser block. Send's batch goes to the agent side (fork-agent's S8).
+                crate::browser::view::BrowserEvent::Annotations(batch) => {
+                    this.browsers.annotations(batch.clone());
+                    return;
+                }
+                // The page's title or favicon changed: tab strips and panes lists follow.
+                crate::browser::view::BrowserEvent::PageInfo => {
+                    this.publish(cx);
+                    cx.notify();
+                    return;
+                }
+                // A download finished or failed: a toast, like other notices.
+                crate::browser::view::BrowserEvent::Notice(n) => {
+                    // A failed download's URL goes into the history without its user, query or fragment.
+                    let mut n = serde_json::to_value(n).unwrap_or(Value::Null);
+                    // Only a failure names a URL; a finished download's body is its saved path, kept as is.
+                    if n["level"] == "error"
+                        && let Some(b) = n["body"].as_str()
+                    {
+                        n["body"] = json!(crate::notifications::strip_query(b));
+                    }
+                    this.post_note("browser", "herdr", "Browser", n, window, cx);
+                    return;
+                }
+            };
+            let tab = this.model.tabs().find(|t| crate::layout::browser_blocks(&t.root).iter().any(|(b, _)| b == id)).map(|t| t.id.clone());
+            let changed = match tab.and_then(|t| this.model.tab_mut(&t)) {
+                Some(t) => crate::layout::set_browser_url(&mut t.root, id, url),
+                None => crate::layout::set_browser_url(&mut this.chrome, id, url),
+            };
+            if changed {
+                this.publish(cx);
+                this.save();
+            }
+        });
+    }
+
+    // HERDR: browser block. `herdr-app do browser.*`: part 5's agent answers, the window makes
+    // and closes blocks (`browser.open` place "tab", default, or "right"/"down" of the focused pane).
+    fn browser_command(&mut self, name: &str, args: Value, reply: crate::browser::agent::Reply, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::browser::agent::Step;
+        let blocks: HashSet<String> = self.browsers.ids().into_iter().collect();
+        let step = self.browsers.run(name, &args, &|pane| blocks.get(pane).cloned(), reply, cx);
+        let made = match step {
+            Step::Done => return,
+            Step::Open { url, place, profile, reply } => {
+                let block = crate::layout::BrowserBlock { url: url.unwrap_or_default(), profile, ..Default::default() };
+                let r = self.open_browser(block, place.as_deref());
+                let ok = r.is_ok();
+                reply(r);
+                ok
+            }
+            Step::Close { id, reply } => {
+                if self.model.tab_of(&id).is_none() {
+                    reply(Err(format!("browser {id:?} is a layout block, not a pane: change the layout to remove it")));
+                    return;
+                }
+                let r = self.run_as("pane.close", json!({ "pane": id }), false, window, cx);
+                reply(match r.get("error").and_then(Value::as_str) {
+                    Some(e) => Err(e.to_owned()),
+                    None => Ok(json!({ "id": id, "closed": true })),
+                });
+                true
+            }
+            // `browser.pick`: the block enters pick mode; the agent answers when the person clicks an element.
+            Step::Pick { id } => {
+                if let Some(view) = self.browsers.view(&id).cloned() {
+                    let input = view.read(cx).input().clone();
+                    input.update(cx, |i, _| i.enter(crate::browser::input::Owner::Pick));
+                    cx.notify();
+                }
+                // HERDR: P2-18. Nobody picked in time: the agent is told so, and the block leaves pick mode.
+                self._tasks.push(cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(crate::browser::agent::PERSON_WAIT + Duration::from_millis(200)).await;
+                    let _ = this.update(cx, |this, cx| {
+                        for ended in this.browsers.expire_picks() {
+                            this.browsers.end_pick(&ended, cx);
+                        }
+                        cx.notify();
+                    });
+                }));
+                return;
+            }
+            // The person sees "<agent> is driving · Take Control" and their input is refused while the lease holds.
+            Step::Lease { id, agent, reply } => {
+                let Some(view) = self.browsers.view(&id).cloned() else { return reply(Err(format!("no browser {id:?}"))) };
+                let input = view.read(cx).input().clone();
+                input.update(cx, |i, _| match &agent {
+                    Some(a) => i.grant_lease(a),
+                    None => i.end_lease(),
+                });
+                reply(Ok(json!({ "id": id, "locked": agent.is_some() })));
+                cx.notify();
+                return;
+            }
+        };
+        if made {
+            self.flush_documents(false, window, cx);
+            self.sync(window, cx);
+            cx.notify();
+        }
+    }
+
+    // HERDR: browser block. A page asked for a new window: a browser beside it (a split in its
+    // tab, when both minimums fit); a layout block's page (or no room) opens a new tab.
+    fn browser_new_window(&mut self, from: &str, url: &str, window: &mut Window, cx: &mut Context<Self>) {
+        // The page's new window keeps its opener's profile: an agent page can't open one on the person's logins.
+        let profile = self.browsers.profile_of(from).unwrap_or_else(|| crate::browser::agent::AGENT_PROFILE.into());
+        let block = crate::layout::BrowserBlock { url: url.to_owned(), profile, ..Default::default() };
+        // Beside the page when there is room for both minimums, else a new tab.
+        let room = self.model.tab_of(from).is_some().then(|| self.split_room(from, Axis::Row, &Node::block("", Content::Browser { browser: block.clone() })).ok()).flatten();
+        let r = if let Some(share) = room {
+            let machine = self.model.space_of(from).and_then(|s| s.machine.clone());
+            let pane = self.model.fresh_id_on("p", machine.as_deref());
+            self.model.split_share(from, Axis::Row, Node::block(pane.clone(), Content::Browser { browser: block }), share);
+            self.model.focus_pane(&pane);
+            Ok(json!({ "id": pane }))
+        } else {
+            self.open_browser(block, Some("tab"))
+        };
+        match r {
+            Ok(_) => {
+                self.flush_documents(false, window, cx);
+                self.sync(window, cx);
+                cx.notify();
+            }
+            Err(e) => tracing::warn!("browser {from}: new window for {url}: {e}"),
+        }
+    }
+
+    // HERDR: browser block. Runs `node <labs>/projects/herdr-mods/remote-desktop/web/bridge.mjs
+    // --ensure [--machine m]` off the UI thread; its one printed url opens with raw chords. The
+    // url carries a token: it is never logged, and the document keeps it without the token.
+    fn open_remote_desktop(&mut self, machine: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let labs = std::env::var("HERDR_LABS_CHECKOUT").ok().filter(|v| !v.is_empty())
+            .or_else(|| settings::load_person().ok().and_then(|p| p.labs_checkout));
+        let Some(labs) = labs else {
+            return self.fail("Remote desktop needs the labs checkout: set labs_checkout in settings.json (or HERDR_LABS_CHECKOUT)");
+        };
+        let bridge = std::path::Path::new(&labs).join("projects/herdr-mods/remote-desktop/web/bridge.mjs");
+        if !bridge.exists() {
+            return self.fail(format!("no remote-desktop bridge at {}", bridge.display()));
+        }
+        cx.spawn_in(window, async move |this, cx| {
+            let found = cx.background_executor().spawn(async move { remote_desktop_url(&bridge, machine.as_deref()) }).await;
+            let _ = this.update_in(cx, |this, window, cx| match found {
+                Ok(url) => {
+                    let block = crate::layout::BrowserBlock { url: crate::browser::view::without_token(&url), launch_url: Some(url), raw_chords: true, ..Default::default() };
+                    if let Err(e) = this.open_browser(block, Some("tab")) {
+                        tracing::warn!("remote desktop: {e}");
+                    }
+                    this.flush_documents(false, window, cx);
+                    this.sync(window, cx);
+                    cx.notify();
+                }
+                Err(e) => {
+                    this.post_note("machines", "herdr", "Remote desktop", json!({"title":"Remote desktop failed","body":e,"level":"error"}), window, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    // HERDR: browser block. The person's browser (browser.new): their profile, raw chords off; a new
+    // tab, or right/down of `pane` (else the focused pane).
+    fn open_person_browser(&mut self, a: &Value) -> Result<Value, String> {
+        self.open_new_browser(a, new_browser(Self::arg(a, "url"), Via::Person))
+    }
+
+    fn open_new_browser(&mut self, a: &Value, block: crate::layout::BrowserBlock) -> Result<Value, String> {
+        if let Some(pane) = Self::arg(a, "pane") {
+            if self.model.tab_of(pane).is_none() {
+                return Err(format!("no pane {pane:?}"));
+            }
+            self.model.focus_pane(pane);
+        }
+        self.open_browser(block, Self::arg(a, "place"))
+    }
+
+    // HERDR: browser block. A browser pane: a new tab (default) or beside the focused pane.
+    fn open_browser(&mut self, block: crate::layout::BrowserBlock, place: Option<&str>) -> Result<Value, String> {
+        let content = Content::Browser { browser: block };
+        match place.unwrap_or("tab") {
+            "tab" => {
+                let space = self.model.active_space().map(|p| p.id.clone()).ok_or("no space yet: make one first (space.new)")?;
+                let machine = self.machine_of(&space);
+                let (tab, pane) = (self.model.fresh_id_on("tb", machine.as_deref()), self.model.fresh_id_on("p", machine.as_deref()));
+                self.model.add_tab(&space, Tab::with_pane(&tab, "", Node::block(pane.clone(), content)));
+                self.model.active = Some(space.clone());
+                Ok(json!({ "id": pane, "tab": tab }))
+            }
+            side @ ("right" | "down") => {
+                let target = self.model.focused_pane().ok_or("no pane to open beside")?;
+                let machine = self.model.space_of(&target).and_then(|s| s.machine.clone());
+                let pane = self.model.fresh_id_on("p", machine.as_deref());
+                let axis = if side == "right" { Axis::Row } else { Axis::Column };
+                let block = Node::block(pane.clone(), content);
+                let share = self.split_room(&target, axis, &block)?;
+                self.model.split_share(&target, axis, block, share);
+                Ok(json!({ "id": pane }))
+            }
+            other => Err(format!("browser.open place {other:?}: tab, right or down")),
+        }
+    }
+
     fn render_slot(&self, slot: &str, cx: &mut Context<Self>) -> AnyElement {
         let in_overlay = slot.starts_with("overlay:") || self.overlays.iter().any(|o| o.layout.as_ref().is_some_and(|l| l.find(slot).is_some()));
         // A mod that is a pane in a tab: a click makes it the focused pane, and the
@@ -3819,16 +4626,7 @@ impl AppWindow {
                 // or other focusable control owns the keyboard once it takes focus.
                 .when(!in_overlay && !in_pane, |d| {
                     d.capture_any_mouse_down(cx.listener(|_, _, window, cx| {
-                        cx.defer_in(window, |this, window, cx| {
-                            let dialog = this.overlays.iter().any(|o| o.kind.modal_keys());
-                            if !dialog
-                                && (window.focused(cx).is_none() || this.focus.is_focused(window))
-                                && let Some(f) = this.focused_pane.as_ref().and_then(|p| this.pane_focus(p))
-                                && !f.is_focused(window)
-                            {
-                                f.focus(window, cx);
-                            }
-                        });
+                        cx.defer_in(window, |this, window, cx| this.refocus_pane(window, cx));
                     }))
                 })
                 // Popups size to their content, up to the window: a column, so a mod
@@ -3837,6 +4635,11 @@ impl AppWindow {
                 // spinners over it, waking only itself (GPUI rebuilds all under a cached
                 // view that changed, so a spinner step would rebuild the mod).
                 .map(|d| if in_overlay { d.h_auto().min_h_0().flex().flex_col().child(root.clone()) } else { d.child(root.clone()) })
+                // HERDR: where each copy is, for test-only mod.click (recorded only with HERDR_APP_TEST_INPUT=1).
+                .when(crate::commands::test_input(), |d| {
+                    let (map, id) = (self.slot_bounds.clone(), slot.to_owned());
+                    d.relative().child(canvas(move |b, _, _| { map.borrow_mut().insert(id, b); }, |_, _, _, _| {}).absolute().top_0().left_0().size_full())
+                })
                 .into_any_element(),
             Some(Copy { error, inst, .. }) => div()
                 .id(SharedString::from(format!("err-{slot}")))
@@ -3878,7 +4681,7 @@ impl AppWindow {
         let row = axis == Axis::Row;
         let zoom = settings::zoom();
         let line = n.divider.as_ref().map(|d| (d.width * zoom, c(&d.color)));
-        let width = gap * zoom + line.map_or(0.0, |l| l.0);
+        let width = pane_size::separator_width(n, gap) * zoom;
         let mut sep = div().flex_none().relative().flex().items_center().justify_center();
         sep = if row { sep.w(px(width)).h_full() } else { sep.h(px(width)).w_full() };
         if let Some((w, color)) = line {
@@ -3921,9 +4724,9 @@ impl AppWindow {
         let bounds = self.bounds.borrow();
         let (Some(ba), Some(bb)) = (bounds.get(&a.id).copied(), bounds.get(&b.id).copied()) else { return };
         drop(bounds);
-        let (start, end, p) = match axis {
-            Axis::Row => (f32::from(ba.left()), f32::from(bb.right()), f32::from(pos.x)),
-            Axis::Column => (f32::from(ba.top()), f32::from(bb.bottom()), f32::from(pos.y)),
+        let (start, p) = match axis {
+            Axis::Row => (f32::from(ba.left()), f32::from(pos.x)),
+            Axis::Column => (f32::from(ba.top()), f32::from(pos.y)),
         };
         let (la, lb) = match axis {
             Axis::Row => (f32::from(ba.size.width), f32::from(bb.size.width)),
@@ -3931,16 +4734,19 @@ impl AppWindow {
         };
         // Measured on screen; sizes are stored as designed (unzoomed).
         let zoom = settings::zoom();
-        let (la, lb, start, end, p) = (la / zoom, lb / zoom, start / zoom, end / zoom, p / zoom);
+        let (la, lb, start, p) = (la / zoom, lb / zoom, start / zoom, p / zoom);
         let total = la + lb;
-        let mut new_a = (p - start).clamp(24.0, (end - start) - 24.0);
-        if let Some(min) = a.min {
-            new_a = new_a.max(min);
-        }
+        // Each side keeps its minimum (its own `min`, a mod's mod.json); a window too small for
+        // both squeezes them in proportion, down to FLOOR.
+        let (ma, mb) = {
+            let leaf = self.leaf_min();
+            (a.min_along(axis, &leaf).max(a.min.unwrap_or(0.0)), b.min_along(axis, &leaf).max(b.min.unwrap_or(0.0)))
+        };
+        let (lo, hi) = crate::layout::squeeze(ma, mb, total);
+        let mut new_a = (p - start).clamp(lo, hi);
         if let Some(max) = a.max {
-            new_a = new_a.min(max);
+            new_a = new_a.min(max).max(lo);
         }
-        let new_a = new_a.min(total - 24.0);
         let (a_id, b_id) = (a.id.clone(), b.id.clone());
         let (sa, sb) = (a.size, b.size);
         let Some(parent) = self.find_node_mut(&container) else { return };
@@ -3963,14 +4769,97 @@ impl AppWindow {
         }
     }
 
+    /// HERDR: every notice goes through here: recorded in the bell's history (unless private or a
+    /// quick confirmation) and shown as a toast unless Do Not Disturb or its source is muted.
+    /// `n` is a toast's notification: title, body, level, icon, action, timeout, key, keep, private.
+    /// `owner`: who posted it, assigned here (a mod's folder, or "herdr"); `from` is only what it shows.
+    fn post_note(&mut self, source: &str, owner: &str, from: &str, mut n: Value, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::notifications::{Note, keeps};
+        // The history's id is ours: a caller can't hand the toast one (the toast marks it read).
+        let Some(fields) = n.as_object_mut() else { return };
+        fields.remove("notification_id");
+        let level = n["level"].as_str().unwrap_or("info").to_owned();
+        if keeps(&level, n["timeout"].as_u64(), n["keep"].as_bool(), n["private"].as_bool().unwrap_or(false)) {
+            let text = |k: &str| n[k].as_str().unwrap_or_default().to_owned();
+            let note = Note {
+                source: source.to_owned(),
+                owner: owner.to_owned(),
+                from: from.to_owned(),
+                title: text("title"),
+                body: text("body"),
+                level,
+                icon: n["icon"].as_str().map(str::to_owned),
+                action: n.get("action").filter(|a| a.is_object()).cloned(),
+                key: n["key"].as_str().map(str::to_owned),
+            };
+            let id = self.notes.post(note, model::now_ms());
+            n["notification_id"] = json!(id);
+            self.publish_notes(cx);
+        }
+        if !n["silent"].as_bool().unwrap_or(false) && self.person.notifications.speaks(source) {
+            let toast = n["toast_id"].as_str().map(str::to_owned).unwrap_or_else(mods::new_overlay_id);
+            self.open_overlay(toast, json!({ "kind": "toast", "notification": n }), window, cx);
+        }
+    }
+
+    /// HERDR: a mod's notify / markRead / clearNotifications / setNotificationMute.
+    fn mod_notes(&mut self, op: &str, arg: Value, folder: String, owner: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::notifications::Target;
+        match op {
+            "post" => self.post_note("mods", &folder, &folder, arg, window, cx),
+            "read" | "clear" => {
+                let Some(t) = Target::from_value(&arg) else { return };
+                if op == "read" { self.notes.mark_read_as(&t, owner.as_deref()); } else { self.notes.clear_as(&t, owner.as_deref()); }
+                self.publish_notes(cx);
+            }
+            "mute" if owner.is_none() => {
+                self.write_person(|p| {
+                    let n = &mut p.notifications;
+                    if let Some(d) = arg["dnd"].as_bool() {
+                        n.dnd = d;
+                    }
+                    if let Some(src) = arg["source"].as_str() {
+                        n.muted_sources.retain(|m| m != src);
+                        if arg["muted"].as_bool().unwrap_or(true) {
+                            n.muted_sources.push(src.to_owned());
+                        }
+                    }
+                }, window, cx);
+                self.publish_notes(cx);
+            }
+            _ => {}
+        }
+    }
+
+    /// HERDR: writes the history if it changed. A failed write stays dirty and is tried again on
+    /// the next poll (warned once until it works); quitting flushes it too.
+    fn flush_notes(&mut self) {
+        if !self.notes.dirty || !self.person.notifications.history {
+            return;
+        }
+        match self.notes.save(&crate::notifications::path()) {
+            Ok(()) => self.notes_save_failed = false,
+            Err(e) => {
+                if !self.notes_save_failed {
+                    tracing::warn!("notifications: cannot save the history (will retry): {e}");
+                }
+                self.notes_save_failed = true;
+            }
+        }
+    }
+
+    /// HERDR: mods reading `notifications()` re-render; the file is written from the poll.
+    fn publish_notes(&mut self, cx: &mut Context<Self>) {
+        if mods::publish_notifications(crate::notifications::view(&self.notes, &self.person.notifications)) {
+            self.refresh_snapshot_mods(cx);
+        }
+    }
+
     fn render_overlays(&self, viewport: Size<Pixels>, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut out = Vec::new();
-        let mut toast_y = 16.0;
+        let mut toast_cards = Vec::new();
         // Drawn last, so it stays clickable over an open dialog.
         let pill = self.render_update_pill(cx);
-        if pill.is_some() {
-            toast_y += UPDATE_PILL_HEIGHT + 8.0;
-        }
         // Windows under dialogs, popups and toasts; each kind in the order opened
         // (a window pressed last is last: on top).
         let order = self.overlays.iter().filter(|o| o.kind == OverlayKind::Window).chain(self.overlays.iter().filter(|o| o.kind != OverlayKind::Window));
@@ -4032,22 +4921,136 @@ impl AppWindow {
                             .into_any_element(),
                     );
                 }
-                OverlayKind::Toast => {
-                    out.push(div().absolute().right(settings::z(16.0)).bottom(settings::z(toast_y)).child(body).into_any_element());
-                    toast_y += o.size.height + 8.0;
-                }
+                OverlayKind::Toast => toast_cards.push((o, body)),
             }
         }
-        if let Some(error) = crate::update::core().error {
-            out.push(div().absolute().right(settings::z(16.0)).bottom(settings::z(toast_y))
+        let error = crate::update::core().error.map(|error| {
+            div()
                 .max_w(settings::z(540.0)).p(settings::z(12.0)).rounded_lg().bg(c("popover"))
                 .border_1().border_color(c("border")).text_size(settings::z(13.0)).text_color(c("foreground"))
                 .id("core-update-error").cursor_pointer()
                 .on_click(cx.listener(|this, _, w, cx| this.run("app.settings", json!({ "section": "updates" }), w, cx)))
-                .child(format!("herdr-core update failed: {error} · Open Updates")).into_any_element());
-        }
-        out.extend(pill);
+                .child(format!("herdr-core update failed: {error} · Open Updates")).into_any_element()
+        });
+        out.push(self.render_toast_deck(pill, error, toast_cards, cx));
         out
+    }
+
+    /// HERDR: toasts as a Sonner-style deck in the `toast_corner` (toasts.rs has the arithmetic).
+    /// The update pill and a core update error are pinned in front of it and never time out.
+    fn render_toast_deck(&self, pill: Option<AnyElement>, error: Option<AnyElement>, mut cards: Vec<(&Overlay, Stateful<Div>)>, cx: &mut Context<Self>) -> AnyElement {
+        let z = settings::z;
+        let top = settings::get().toast_corner == settings::ToastCorner::TopRight;
+        let edge = toasts::edge_bars(&self.chrome, top) + 8.0;
+        let at = move |d: Div, y: f32| if top { d.top(z(y)) } else { d.bottom(z(y)) };
+        let mut head = 0.0;
+        let mut pinned = Vec::new();
+        for (el, h) in [(pill, UPDATE_PILL_HEIGHT), (error, 44.0)] {
+            if let Some(el) = el {
+                pinned.push(at(div().absolute().right(z(0.0)), head).child(el).into_any_element());
+                head += h + toasts::GAP;
+            }
+        }
+        // Newest first: the overlays list is in the order opened.
+        cards.reverse();
+        let heights: Vec<f32> = cards.iter().map(|(o, _)| o.size.height).collect();
+        let expanded = self.deck_hover.is_some();
+        let slots = toasts::deck(&heights, expanded);
+        let mut moves = self.deck_moves.borrow_mut();
+        moves.retain(|id, _| cards.iter().any(|(o, _)| &o.id == id));
+        let mut placed: Vec<(usize, AnyElement)> = Vec::new();
+        for ((o, body), slot) in cards.into_iter().zip(slots.iter().copied()) {
+            if !slot.shown {
+                continue;
+            }
+            let to = head + slot.y;
+            let fresh = !moves.contains_key(&o.id);
+            let entry = moves.entry(o.id.clone()).or_insert((to, to));
+            if entry.1 != to {
+                *entry = (entry.1, to);
+            }
+            let from = entry.0;
+            let id = o.id.clone();
+            let close = div()
+                .id(SharedString::from(format!("toast-x-{id}")))
+                .absolute()
+                .top(z(4.0))
+                .right(z(6.0))
+                .px(z(4.0))
+                .cursor_pointer()
+                .text_size(z(12.0))
+                // The same grey as the toast's body line (the toast mod's `theme().muted`).
+                .text_color(c("muted"))
+                .child("×")
+                .on_click(cx.listener(move |this, _, w, cx| this.close_overlay(&id, w, cx)));
+            let card = div()
+                .absolute()
+                .right(z(0.0))
+                .w(z(o.size.width * slot.width))
+                .h(z(slot.height))
+                .overflow_hidden()
+                .rounded(z(8.0))
+                // A narrower card behind keeps its right edge; the overflow goes on the left.
+                .flex()
+                .justify_end()
+                .child(body)
+                .when(expanded, |d| d.child(close));
+            let anim = Animation::new(Duration::from_millis(toasts::ANIM_MS)).with_easing(ease_out_quint());
+            let key = SharedString::from(format!("toast-{}-{}-{}", o.id, (to * 10.0) as i64, o.leaving.is_some()));
+            let leaving = o.leaving.is_some();
+            // A hidden window (HERDR_APP_HEADLESS, shots) never ticks animation frames: draw where it ends.
+            if crate::control::headless() {
+                let card = if o.leaving.is_some() { at(card, to).opacity(0.0) } else { at(card, to) };
+                placed.push((slot.z, card.into_any_element()));
+                continue;
+            }
+            let card = card.with_animation(key, anim, move |d, t| {
+                let y = from + (to - from) * t;
+                let d = at(d, y);
+                if leaving {
+                    d.opacity(1.0 - t)
+                } else if fresh {
+                    // Slides in from the corner's side and fades in.
+                    d.opacity(t).right(z(24.0 * (1.0 - t)))
+                } else {
+                    d
+                }
+            });
+            placed.push((slot.z, card.into_any_element()));
+        }
+        drop(moves);
+        // Lower z first: the front card is drawn last, on top.
+        placed.sort_by_key(|(z, _)| *z);
+        let extent = head + toasts::extent(&slots);
+        at(div(), edge)
+            .id("toast-deck")
+            .absolute()
+            .right(z(16.0))
+            .w(z(340.0))
+            .h(z(extent))
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| this.deck_hovered(*hovered, cx)))
+            .children(pinned)
+            .children(placed.into_iter().map(|(_, e)| e))
+            .into_any_element()
+    }
+
+    /// HERDR: the pointer entered or left the toast deck. While it's over the deck, the deck is
+    /// a list and no toast times out; on leave each toast gets back the time it waited.
+    fn deck_hovered(&mut self, hovered: bool, cx: &mut Context<Self>) {
+        match (hovered, self.deck_hover) {
+            (true, None) => self.deck_hover = Some(Instant::now()),
+            (false, Some(since)) => {
+                let waited = since.elapsed();
+                for o in self.overlays.iter_mut().filter(|o| o.kind == OverlayKind::Toast) {
+                    if let Some(e) = o.expires.as_mut() {
+                        *e += waited;
+                    }
+                }
+                self.deck_hover = None;
+            }
+            _ => return,
+        }
+        cx.notify();
     }
 }
 
@@ -4074,10 +5077,8 @@ impl AppWindow {
         let label = self.update_ready.clone().or_else(|| success.then(|| format!("Updated to {}", env!("CARGO_PKG_VERSION"))))?;
         let dismissal = app_version.map(|v| format!("app:{v}")).unwrap_or_else(|| label.clone());
         if self.update_dismissed.as_ref() == Some(&dismissal) { return None; }
+        // Placed by the toast deck (pinned in front of it).
         let pill = div()
-            .absolute()
-            .right(settings::z(16.0))
-            .bottom(settings::z(16.0))
             .h(settings::z(UPDATE_PILL_HEIGHT))
             .pl(settings::z(14.0))
             .pr(settings::z(6.0))
@@ -4152,12 +5153,43 @@ fn agent_name(app: &str) -> String {
         "claude" | "claude-code" => "Claude Code".into(),
         "codex" => "Codex".into(),
         "pi" => "Pi".into(),
+        "pig" => "PiG".into(),
         "opencode" => "OpenCode".into(),
         "cursor" | "cursor-agent" => "Cursor".into(),
         "amp" => "Amp".into(),
         "grok" => "Grok".into(),
+        "dsh-tui" => "DeepSeek Harness".into(),
         other => other.to_owned(),
     }
+}
+
+fn remember_pane(history: &mut Vec<String>, id: &str) {
+    if history.last().is_some_and(|last| last == id) {
+        return;
+    }
+    history.retain(|pane| pane != id);
+    history.push(id.to_owned());
+}
+
+/// Prefer the most recently focused pane along the nearest edge. Unvisited
+/// panes fall back to overlap and layout order, ignoring subpixel split noise.
+fn nearest(cur: Bounds<Pixels>, dir: &str, candidates: impl IntoIterator<Item = (String, Bounds<Pixels>)>, history: &[String]) -> Option<String> {
+    let overlap = |a0: Pixels, a1: Pixels, b0: Pixels, b1: Pixels| f32::from(a1.min(b1) - a0.max(b0)).max(0.0);
+    let cmp = |a: f32, b: f32| if (a - b).abs() < 1.0 { std::cmp::Ordering::Equal } else { a.total_cmp(&b) };
+    candidates
+        .into_iter()
+        .filter_map(|(id, r)| {
+            let (gap, ov) = match dir {
+                "left" => (f32::from(cur.left() - r.right()), overlap(cur.top(), cur.bottom(), r.top(), r.bottom())),
+                "right" => (f32::from(r.left() - cur.right()), overlap(cur.top(), cur.bottom(), r.top(), r.bottom())),
+                "up" => (f32::from(cur.top() - r.bottom()), overlap(cur.left(), cur.right(), r.left(), r.right())),
+                _ => (f32::from(r.top() - cur.bottom()), overlap(cur.left(), cur.right(), r.left(), r.right())),
+            };
+            let recent = history.iter().position(|pane| pane == &id);
+            (gap > -2.0 && ov > 0.0).then_some((gap, recent, ov, id))
+        })
+        .reduce(|best, next| if cmp(next.0, best.0).then(best.1.cmp(&next.1)).then(cmp(best.2, next.2)).is_lt() { next } else { best })
+        .map(|(_, _, _, id)| id)
 }
 
 fn position_popup(at: Point<Pixels>, body: Stateful<Div>) -> Anchored {
@@ -4256,6 +5288,12 @@ fn needs_model_pane(name: &str, args: &Value) -> bool {
     }
 }
 
+fn new_space_machine(args: &Value, person: bool, model: &Model) -> Option<String> {
+    args.get("machine").and_then(Value::as_str)
+        .or_else(|| if person { model.active_space().and_then(|s| s.machine.as_deref()) } else { None })
+        .filter(|m| !m.is_empty()).map(str::to_owned)
+}
+
 fn home() -> String {
     mods::home().to_string_lossy().into_owned()
 }
@@ -4341,11 +5379,8 @@ fn sized(slot: Div, n: &Node, axis: Axis, total_weight: f32) -> Div {
             slot = slot.flex_none();
             slot = if row { slot.w(settings::z(v)).h_full() } else { slot.h(settings::z(v)).w_full() };
         }
-        other => {
-            let w = match other {
-                Some(Span::Weight { weight }) => weight,
-                _ => 1.0,
-            };
+        _ => {
+            let w = pane_size::weight(n);
             let s = slot.style();
             s.flex_grow = Some(w / total_weight);
             s.flex_shrink = Some(1.0);
@@ -4390,16 +5425,20 @@ fn apply_look(el: Div, n: &Node, focused: bool) -> Div {
     if let Some(bg) = focus.and_then(|f| f.background.as_ref()) {
         el = el.bg(c(bg));
     } else if let Some(bg) = &n.background {
-        el = paint(el, bg);
+        el = match bg {
+            // HERDR: glass: the layout's own colors let the blur through; panes keep theirs.
+            Paint::Color(name) if settings::get().glass => el.bg(c(name).opacity(GLASS_ALPHA)),
+            _ => paint(el, bg),
+        };
     }
-    if let Some(line) = focus.and_then(|f| f.border.as_ref()).or(n.border.as_ref()) {
+    if let Some(line) = pane_size::node_border(n, focused) {
         el = el.border(settings::z(line.width)).border_color(c(&line.color));
     }
     if let Some(r) = n.radius {
         el = el.rounded(settings::z(r));
     }
-    if let Some(p) = n.padding {
-        let (y, x) = p.axes();
+    if n.padding.is_some() {
+        let (y, x) = pane_size::padding(n);
         el = el.py(settings::z(y)).px(settings::z(x));
     }
     shadow(el, n.shadow.as_deref())
@@ -4443,6 +5482,9 @@ impl Render for AppWindow {
             .iter()
             .find(|(_, t)| t.focus.is_focused(window))
             .map(|(id, _)| id.clone());
+        if clicked.is_some() && self.focused_block.take().is_some() {
+            self.publish(cx);
+        }
         if let Some(id) = clicked
             && self.focused_pane.as_deref() != Some(id.as_str())
             && (self.model.tab_of(&id).is_some() || terminal_block(&self.chrome, Some(&id)).is_some())
@@ -4455,9 +5497,9 @@ impl Render for AppWindow {
         self.tick_floats(window);
         self.apply_titlebar(window);
         if mods::publish_window(self.window_json(window)) {
-            self.refresh_mods(cx);
+            self.refresh_snapshot_mods(cx);
         }
-        let focused = self.focused_path();
+        let focused = self.focused_path(window, cx);
         let tree = self.render_node(&self.chrome, &focused, None, cx);
         let tree = self.window_frame(tree, window, cx);
         let overlays = self.render_overlays(window.viewport_size(), cx);
@@ -4474,7 +5516,29 @@ impl Render for AppWindow {
             .bg(c("background"))
             .text_color(c("foreground"))
             .font_family(settings::get().ui_font_family.clone())
-            .on_action(cx.listener(|this, a: &ShellAction, w, cx| this.run_action(a.id(), w, cx)))
+            .on_action(cx.listener(|this, a: &ShellAction, w, cx| {
+                // Nothing selected: the copy chord goes to the program (#216).
+                if a.id() == "terminal.copy" {
+                    if !this.copy_key(w, cx) {
+                        cx.propagate();
+                    }
+                    return;
+                }
+                this.run_action(a.id(), w, cx);
+            }))
+            .on_action(cx.listener(|this, a: &crate::keys::CommandBinding, w, cx| {
+                match a.command() {
+                    Ok((name, args)) => {
+                        #[cfg(target_os = "macos")]
+                        if let Some(action) = crate::macos::action(&name) {
+                            w.dispatch_action(action, cx);
+                            return;
+                        }
+                        this.run(&name, args, w, cx);
+                    }
+                    Err(error) => this.command_error("Key binding", &error, w, cx),
+                }
+            }))
             // Ctrl (Cmd) alone shows links in the pane under the pointer, focused or not.
             .on_modifiers_changed(cx.listener(|this, _: &ModifiersChangedEvent, _, cx| {
                 for t in this.terms.values() {
@@ -4522,21 +5586,292 @@ impl Render for AppWindow {
     }
 }
 
+fn invalidate_asset(path: &std::path::Path, window: &mut Window, cx: &mut gpui::App) {
+    let key = gpui_shell::AppAssets::cache_key(&path.to_string_lossy());
+    invalidate_image(&gpui::Resource::Embedded(key.clone()), window, cx);
+    window.invalidate_svg(&key);
+}
+
+fn invalidate_image(resource: &gpui::Resource, window: &mut Window, cx: &mut gpui::App) {
+    if let Some(Ok(old)) = cx.cached_asset::<gpui::ImgResourceLoader>(resource) {
+        cx.drop_image(old, Some(window));
+    }
+    cx.remove_asset::<gpui::ImgResourceLoader>(resource);
+}
+
+/// The changed paths, plus the files inside changed mod folders (a folder
+/// renamed into place arrives as one event). Runs on the UI thread: skips what
+/// the watcher ignores (hidden, `node_modules`) and stops at a mod-sized limit.
+fn changed_asset_paths(home: &std::path::Path, changed: &[std::path::PathBuf]) -> Vec<std::path::PathBuf> {
+    const MAX_FILES: usize = 2000;
+    let mut paths: std::collections::BTreeSet<_> = changed.iter().cloned().collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut pending: Vec<_> = changed.iter().filter(|p| p.starts_with("mods")).cloned().collect();
+    while let Some(path) = pending.pop() {
+        // Do not follow symlinks out of the mod folder (or into a cycle).
+        if !seen.insert(path.clone()) || !home.join(&path).symlink_metadata().is_ok_and(|m| m.is_dir()) { continue; }
+        let Ok(entries) = std::fs::read_dir(home.join(&path)) else { continue };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') || name == "node_modules" { continue; }
+            let child = path.join(&*name);
+            let Ok(kind) = entry.file_type() else { continue };
+            if kind.is_dir() {
+                pending.push(child);
+            } else if paths.len() < MAX_FILES {
+                paths.insert(child);
+            } else {
+                return paths.into_iter().collect();
+            }
+        }
+    }
+    paths.into_iter().collect()
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_plain_local_http_counts_as_the_bridge_url() {
+        for ok in ["http://127.0.0.1:7123/?token=t&machine=box", "http://127.0.0.1:80", "http://127.0.0.1:65535/x#y"] {
+            assert!(super::is_local_http(ok), "{ok}");
+        }
+        for bad in [
+            "http://127.0.0.1:80@evil.example/",
+            "http://127.0.0.1:80@evil.example",
+            "https://127.0.0.1:7123/",
+            "http://127.0.0.1.evil.example:7123/",
+            "http://127.0.0.1:/",
+            "http://127.0.0.1:0/",
+            "http://127.0.0.1:99999/",
+            "http://127.0.0.1:12ab/",
+            "http://127.0.0.1:80\\@evil.example/",
+            "http://localhost:7123/",
+            " http://127.0.0.1:7123/",
+        ] {
+            assert!(!super::is_local_http(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_persons_browser_uses_their_profile_with_raw_chords_off() {
+        let b = super::new_browser(Some("https://example.test/"), super::Via::Person);
+        assert_eq!((b.url.as_str(), b.profile.as_str(), b.raw_chords, b.launch_url.is_none()), ("https://example.test/", "default", false, true));
+        assert_eq!(super::new_browser(None, super::Via::Person).url, "");
+    }
+
+    #[test]
+    fn the_control_socket_never_opens_the_persons_profile() {
+        // `herdr-app do browser.new` is reachable by any agent: it gets an agent-profile block.
+        let b = super::new_browser(Some("https://bank.test/"), super::Via::Control);
+        assert_eq!(b.profile, "agent");
+        assert_ne!(b.profile, crate::browser::agent::PERSON_PROFILE);
+    }
+
+    #[test]
+    fn a_split_keeps_both_minimums_or_is_refused() {
+        // Beside a 320 px notes pane: 500 px can't hold 320 + another 320; 1000 can.
+        assert!(super::split_share(320.0, 320.0, 500.0).unwrap_err().contains("640 px"));
+        assert_eq!(super::split_share(320.0, 320.0, 1000.0).unwrap(), 0.5);
+        // A terminal beside notes at 400: the new notes pane takes 320, not half.
+        assert_eq!(super::split_share(24.0, 320.0, 400.0).unwrap(), 0.8);
+        // And the other way round: notes keep 320, the new terminal gets the rest.
+        assert_eq!(super::split_share(320.0, 24.0, 400.0).unwrap(), 0.2);
+    }
+
+    #[test]
+    fn the_remote_desktop_bridge_url_is_read_and_its_token_never_reaches_an_error() {
+        let dir = std::env::temp_dir().join(format!("hrd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let token = "0123456789abcdef0123456789abcdef0123456789abcdef";
+        let bridge = |name: &str, body: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, body).unwrap();
+            p
+        };
+        // Prints its url (after a blank line); --machine reaches it.
+        let ok = bridge("ok.mjs", &format!("const m = process.argv.includes('--machine') ? process.argv[process.argv.indexOf('--machine') + 1] : '';\nconsole.log('');\nconsole.log(`http://127.0.0.1:7123/?token={token}&machine=${{m}}`);\n"));
+        assert_eq!(super::remote_desktop_url(&ok, Some("box")).unwrap(), format!("http://127.0.0.1:7123/?token={token}&machine=box"));
+        // Not a local url: refused, and the error doesn't repeat it.
+        let remote = bridge("remote.mjs", &format!("console.log('https://evil.test/?token={token}')\n"));
+        let e = super::remote_desktop_url(&remote, None).unwrap_err();
+        assert!(!e.contains(token), "{e}");
+        // A failing bridge: its last stderr line, the status, never stdout (where a url would be).
+        let fail = bridge("fail.mjs", &format!("console.log('http://127.0.0.1:1/?token={token}'); console.error('no machine named x'); process.exit(3)\n"));
+        let e = super::remote_desktop_url(&fail, Some("x")).unwrap_err();
+        assert!(e.contains("no machine named x") && !e.contains(token), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use gpui::{div, point, px, size, Context, IntoElement, Render, TestAppContext, Window};
     use gpui::prelude::*;
 
     #[test]
+    fn going_back_into_a_split_column_takes_its_top_pane_whatever_the_fractions() {
+        let r = |x: f32, y: f32, w: f32, h: f32| gpui::Bounds::new(point(px(x), px(y)), size(px(w), px(h)));
+        // An odd height splits into halves a fraction apart, the bottom one larger.
+        let column = || vec![("top".to_owned(), r(0.0, 0.0, 400.0, 300.4)), ("bottom".to_owned(), r(0.0, 300.4, 400.0, 300.6))];
+        assert_eq!(super::nearest(r(401.0, 0.0, 399.0, 601.0), "left", column(), &[]).as_deref(), Some("top"));
+        // More overlap by a pixel or more still decides.
+        assert_eq!(super::nearest(r(401.0, 250.0, 399.0, 351.0), "left", column(), &[]).as_deref(), Some("bottom"));
+        // A visited pane wins even when an unvisited pane has more overlap.
+        assert_eq!(super::nearest(r(401.0, 250.0, 399.0, 351.0), "left", column(), &["top".to_owned()]).as_deref(), Some("top"));
+    }
+
+    #[test]
+    fn directional_round_trips_return_to_the_recent_pane_in_either_split() {
+        let r = |x: f32, y: f32, w: f32, h: f32| gpui::Bounds::new(point(px(x), px(y)), size(px(w), px(h)));
+        for (a, b, other, out, back) in [
+            (r(0.0, 0.0, 400.0, 300.4), r(0.0, 300.4, 400.0, 300.6), r(401.0, 0.0, 399.0, 601.0), "right", "left"),
+            (r(0.0, 0.0, 300.4, 400.0), r(300.4, 0.0, 300.6, 400.0), r(0.0, 401.0, 601.0, 399.0), "down", "up"),
+        ] {
+            let split = || vec![("a".to_owned(), a), ("b".to_owned(), b)];
+            assert_eq!(super::nearest(other, back, split(), &[]).as_deref(), Some("a"));
+            let mut history = Vec::new();
+            for (id, bounds) in [("a", a), ("b", b), ("a", a)] {
+                super::remember_pane(&mut history, id);
+                assert_eq!(super::nearest(bounds, out, vec![("other".to_owned(), other)], &history).as_deref(), Some("other"));
+                super::remember_pane(&mut history, "other");
+                assert_eq!(super::nearest(other, back, split(), &history).as_deref(), Some(id));
+                super::remember_pane(&mut history, id);
+            }
+            assert_eq!(history.len(), 3);
+            // Recency cannot select a pane outside the requested direction.
+            assert_eq!(super::nearest(other, out, split(), &history), None);
+        }
+    }
+
+    #[test]
+    fn new_spaces_follow_the_persons_active_machine_but_keep_explicit_targets() {
+        use serde_json::json;
+        let mut model = crate::model::Model::default();
+        assert_eq!(super::new_space_machine(&json!({}), true, &model), None);
+        model.add_space("remote", "", "", crate::model::Tab::new("tab", "", "pane", "second/t1"));
+        model.space_mut("remote").unwrap().machine = Some("second".into());
+        for args in [json!({}), json!({"machine": null})] {
+            assert_eq!(super::new_space_machine(&args, true, &model).as_deref(), Some("second"));
+            assert_eq!(super::new_space_machine(&args, false, &model), None);
+        }
+        for person in [true, false] {
+            assert_eq!(super::new_space_machine(&json!({"machine": "other"}), person, &model).as_deref(), Some("other"));
+            assert_eq!(super::new_space_machine(&json!({"machine": ""}), person, &model), None);
+        }
+        model.add_space("local", "", "", crate::model::Tab::new("local-tab", "", "local-pane", "t1"));
+        assert_eq!(super::new_space_machine(&json!({}), true, &model), None);
+        model.active = Some("remote".into());
+        assert_eq!(super::new_space_machine(&json!({}), true, &model).as_deref(), Some("second"));
+    }
+
+    #[gpui::test]
+    fn image_invalidation_drops_cached_atlas_tiles_without_loading_missing_assets(cx: &mut TestAppContext) {
+        use gpui::{ImgResourceLoader, Resource};
+        let temp = if cfg!(target_os = "linux") { std::path::PathBuf::from("/var/tmp") } else { std::env::temp_dir() };
+        let home = temp.join(format!("herdr-image-atlas-test-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let file = home.join("image.gif");
+        let mut encoder = image::codecs::gif::GifEncoder::new(std::fs::File::create(&file).unwrap());
+        for color in [[255, 0, 0, 255], [0, 255, 0, 255]] {
+            encoder.encode_frame(image::Frame::new(image::RgbaImage::from_pixel(2, 2, image::Rgba(color)))).unwrap();
+        }
+        drop(encoder);
+        let resource = Resource::Path(file.into());
+        cx.update(|cx| { cx.fetch_asset::<ImgResourceLoader>(&resource); });
+        cx.background_executor.run_until_parked();
+        let old = cx.update(|cx| cx.cached_asset::<ImgResourceLoader>(&resource)).unwrap().unwrap();
+        let context = cx.add_empty_window();
+        let displayed = old.clone();
+        assert_eq!(old.frame_count(), 2);
+        context.draw(point(px(0.0), px(0.0)), size(px(20.0), px(20.0)), move |_, _| {
+            gpui::canvas(|_, _, _| (), move |bounds, _, window, _| {
+                for frame in 0..displayed.frame_count() {
+                    window.paint_image(bounds, bounds, gpui::Corners::default(), displayed.clone(), frame, false).unwrap();
+                }
+            }).size_full()
+        });
+        context.update(|window, cx| {
+            assert!(window.has_image_atlas_entry(&old));
+            super::invalidate_image(&resource, window, cx);
+            assert!(!window.has_image_atlas_entry(&old));
+            assert!(!cx.has_asset::<ImgResourceLoader>(&resource));
+            let missing = Resource::Embedded("mods/missing.png".into());
+            super::invalidate_image(&missing, window, cx);
+            assert!(!cx.has_asset::<ImgResourceLoader>(&missing));
+        });
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn directory_changes_include_nested_assets() {
+        let temp = if cfg!(target_os = "linux") { std::path::PathBuf::from("/var/tmp") } else { std::env::temp_dir() };
+        let home = temp.join(format!("herdr-image-directory-test-{}", std::process::id()));
+        std::fs::create_dir_all(home.join("mods/probe/nested")).unwrap();
+        std::fs::write(home.join("mods/probe/nested/icon.svg"), "svg").unwrap();
+        for ignored in ["node_modules/pkg", ".git"] {
+            std::fs::create_dir_all(home.join("mods/probe").join(ignored)).unwrap();
+            std::fs::write(home.join("mods/probe").join(ignored).join("logo.svg"), "svg").unwrap();
+        }
+        let changed = vec![std::path::PathBuf::from("mods/probe")];
+        // A repeated root and a covered child are walked once.
+        let events = [changed[0].clone(), changed[0].clone(), "mods/probe/nested".into()];
+        let paths = super::changed_asset_paths(&home, &events);
+        assert!(paths.contains(&std::path::PathBuf::from("mods/probe/nested/icon.svg")));
+        assert!(paths.contains(&changed[0]));
+        assert!(!paths.iter().any(|p| p.to_string_lossy().contains("node_modules") || p.to_string_lossy().contains(".git")));
+        assert_eq!(paths.iter().filter(|p| p.ends_with("icon.svg")).count(), 1);
+        std::fs::remove_dir_all(&home).unwrap();
+        assert_eq!(super::changed_asset_paths(&home, &changed), changed);
+    }
+
+    #[test]
+    fn asset_cache_keys_match_file_events_without_requiring_the_file() {
+        use gpui_shell::AppAssets;
+        let expected = AppAssets::cache_key("mods/probe/icon.svg");
+        for alias in ["./mods/probe/icon.svg", "/mods/probe/icon.svg", "mods//probe/./icon.svg"] {
+            assert_eq!(AppAssets::cache_key(alias), expected);
+        }
+        // Traversal remains invalid, rather than becoming a valid cache hit.
+        assert_eq!(AppAssets::cache_key("mods/probe/../icon.svg").as_ref(), "mods/probe/../icon.svg");
+        #[cfg(windows)]
+        assert_eq!(AppAssets::cache_key(r"mods\probe\icon.svg"), expected);
+    }
+
+    #[test]
+    fn svg_invalidation_removes_every_size_but_preserves_other_assets() {
+        use gpui::{AtlasKey, DevicePixels, HeadlessAtlas, PlatformAtlas, RenderSvgParams, Size};
+        let atlas = HeadlessAtlas::default();
+        let key = |path: &str, size| AtlasKey::Svg(RenderSvgParams {
+            path: path.to_owned().into(), size: Size::new(DevicePixels(size), DevicePixels(size)),
+        });
+        let keys = [key("icons/icon.svg", 16), key("icons/icon.svg", 32), key("icons/nested/icon.svg", 16), key("icons-other/icon.svg", 16), AtlasKey::Image(gpui::RenderImageParams { image_id: gpui::ImageId(1), frame_index: 0 })];
+        let mut build = || Ok(Some((Size::new(DevicePixels(1), DevicePixels(1)), std::borrow::Cow::Borrowed(&[255u8][..]))));
+        let tiles: Vec<_> = keys.iter().map(|key| atlas.get_or_insert_with(key.clone(), &mut build).unwrap().unwrap()).collect();
+        atlas.remove_svg("icons");
+        atlas.remove_svg("icons");
+        for (index, key) in keys.iter().enumerate() {
+            assert_eq!(atlas.contains(key), index >= 3);
+            let tile = atlas.get_or_insert_with(key.clone(), &mut build).unwrap().unwrap();
+            assert_eq!(tile == tiles[index], index >= 3);
+        }
+    }
+
+    #[test]
     fn agent_commands_keep_arguments_out_of_shell_source() {
         let cmd = vec!["agent".to_owned(), "a 'quoted' task; $(not-a-command)\nnext line".to_owned(), "".to_owned()];
-        for sh in ["/bin/bash", "/bin/zsh", "/bin/sh", "/bin/dash", "/bin/fish"] {
-            let run = super::unix_agent_argv(sh.into(), cmd.clone());
-            assert_eq!(run[0], sh);
-            assert_eq!(run[1], "-ic");
-            assert_eq!(run[3], sh);
-            assert_eq!(run[4..], cmd);
-            assert_eq!(run[2], if sh.ends_with("/fish") { "command $argv[2..]; exec $argv[1] -i" } else { "\"$@\"; exec \"$0\" -i" });
+        for login in [false, true] {
+            for sh in ["/bin/bash", "/bin/zsh", "/bin/sh", "/bin/dash", "/bin/fish"] {
+                let run = super::unix_agent_argv(sh.into(), cmd.clone(), login);
+                assert_eq!(run[0], sh);
+                assert_eq!(run[1], if login { "-lic" } else { "-ic" });
+                assert_eq!(run[3], sh);
+                assert_eq!(run[4..], cmd);
+                let expected = match (sh.ends_with("/fish"), login) {
+                    (true, true) => "command $argv[2..]; exec $argv[1] -li",
+                    (true, false) => "command $argv[2..]; exec $argv[1] -i",
+                    (false, true) => "\"$@\"; exec \"$0\" -li",
+                    (false, false) => "\"$@\"; exec \"$0\" -i",
+                };
+                assert_eq!(run[2], expected);
+            }
         }
     }
 
@@ -4647,6 +5982,218 @@ mod tests {
         assert_eq!(restored.terminal_menu.as_deref(), Some("personal-menu"));
     }
 
+    /// Runs `window::tests::<name>` alone in a test process of its own, on a
+    /// fresh app home: a window takes process-wide things (the app home, the
+    /// mods' request channel) that tests beside it would otherwise share.
+    fn in_own_process(name: &str) {
+        let home = std::path::PathBuf::from(format!("/var/tmp/herdr-window-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &format!("window::tests::{name}"), "--nocapture", "--test-threads=1"])
+            .env("HERDR_APP_HOME", &home)
+            .env("HERDR_TEST_WINDOW", name)
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&home);
+        let log = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success() && log.contains("1 passed"), "{log}");
+    }
+
+    /// In the process `in_own_process` started for `name`: whether to go on.
+    fn running_alone(name: &str) -> bool {
+        std::env::var("HERDR_TEST_WINDOW").as_deref() == Ok(name)
+    }
+
+    /// The window on a core that's never there (`hc::offline`), showing
+    /// `layout` with `mod_name` (its `main.js`) in the home, past the first-run
+    /// welcome (it lists machines through the core). No other mods: the
+    /// shipped ones run programs on threads of their own, which the test
+    /// executor refuses.
+    fn open_window<'a>(cx: &'a mut gpui::TestAppContext, mod_name: &str, main_js: &str, layout: serde_json::Value) -> (gpui::Entity<super::AppWindow>, &'a mut gpui::VisualTestContext) {
+        use serde_json::json;
+        let home = crate::mods::app_dir();
+        crate::mods::write_workspace().unwrap();
+        let folder = home.join("mods").join(mod_name);
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("mod.json"), r#"{ "place": "none" }"#).unwrap();
+        std::fs::write(folder.join("main.js"), main_js).unwrap();
+        std::fs::create_dir_all(home.join("layouts")).unwrap();
+        std::fs::write(home.join("layouts/test.json"), layout.to_string()).unwrap();
+        cx.update(crate::mods::init);
+        let requests = crate::mods::install_policy();
+        crate::mods::set_shared("layout".into(), json!("test"));
+        crate::mods::set_shared("frame.welcomed".into(), json!("test"));
+        let (view, cx) = cx.add_window_view(|window, cx| super::AppWindow::new(crate::hc::offline(), requests, window, cx));
+        assert_eq!(view.update(cx, |this, _| this.layout_name.clone()), "test");
+        (view, cx)
+    }
+
+    #[test]
+    fn showing_the_tab_again_gives_its_pane_the_keyboard() {
+        in_own_process("tab_shown_again");
+    }
+
+    /// A home page in a stack beside the tab: a space made while it shows
+    /// gets the keyboard once `layout.select` shows the tab again.
+    #[gpui::test]
+    fn tab_shown_again(cx: &mut gpui::TestAppContext) {
+        use serde_json::json;
+        if !running_alone("tab_shown_again") {
+            return;
+        }
+        let (view, cx) = open_window(cx, "home", "", json!({
+            "id": "center", "type": "stack", "active": "main", "children": [
+                { "id": "main", "type": "block", "content": { "tab": "active" } },
+                { "id": "home", "type": "block", "content": { "mod": "home" } }
+            ]
+        }));
+        let select = |child: &str, cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| view.update(cx, |this, cx| this.run("layout.select", json!({ "stack": "center", "child": child }), window, cx)));
+            cx.run_until_parked();
+        };
+        select("home", cx);
+        cx.update(|window, cx| view.update(cx, |this, cx| {
+            this.model.add_space("sp1", "", "/tmp", crate::model::Tab::new("tb1", "", "p1", "t1"));
+            this.sync(window, cx);
+        }));
+        cx.run_until_parked();
+        let pane_focused = |cx: &mut gpui::VisualTestContext| cx.update(|window, cx| view.read(cx).pane_focus("p1", cx).unwrap().is_focused(window));
+        assert!(!pane_focused(cx), "hidden, the pane can't hold the keyboard");
+        select("main", cx);
+        assert!(pane_focused(cx));
+    }
+
+    #[test]
+    fn pane_ring_follows_keyboard_focus() {
+        in_own_process("pane_ring_focus");
+    }
+
+    #[gpui::test]
+    fn pane_ring_focus(cx: &mut gpui::TestAppContext) {
+        if !running_alone("pane_ring_focus") {
+            return;
+        }
+        let (view, cx) = open_window(cx, "unused", "", serde_json::json!({
+            "id": "pane", "type": "block", "content": { "terminal": "t1" }
+        }));
+        cx.update(|window, cx| view.update(cx, |this, cx| {
+            this.focused_pane = Some("pane".into());
+            let pane = this.pane_focus("pane", cx).unwrap();
+            pane.focus(window, cx);
+            assert!(this.focused_path(window, cx).contains("pane"));
+            let input = cx.focus_handle();
+            input.focus(window, cx);
+            assert!(this.focused_path(window, cx).is_empty());
+            assert_eq!(this.focused_pane.as_deref(), Some("pane"));
+            pane.focus(window, cx);
+            assert!(this.focused_path(window, cx).contains("pane"));
+        }));
+        cx.deactivate_window();
+        cx.update(|window, cx| view.update(cx, |this, cx| {
+            assert!(this.focused_path(window, cx).contains("pane"));
+        }));
+    }
+
+    #[test]
+    fn find_focus_survives_tab_and_space_switches() {
+        in_own_process("find_focus_switches");
+    }
+
+    #[gpui::test]
+    fn find_focus_switches(cx: &mut gpui::TestAppContext) {
+        use serde_json::json;
+        if !running_alone("find_focus_switches") {
+            return;
+        }
+        cx.update(gpui_base::init);
+        let (view, cx) = open_window(cx, "unused", "", json!({
+            "id": "main", "type": "block", "content": { "tab": "active" }
+        }));
+        cx.update(|window, cx| view.update(cx, |this, cx| {
+            this.model.add_space("s1", "one", "", crate::model::Tab::new("a", "a", "pa", "t1"));
+            this.model.add_tab("s1", crate::model::Tab::new("b", "b", "pb", "t2"));
+            this.model.add_space("s2", "two", "", crate::model::Tab::new("c", "c", "pc", "t3"));
+            this.model.select_tab("a");
+            this.sync(window, cx);
+            this.dispatch("terminal.search", &json!({}), true, window, cx);
+        }));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("n e e d l e");
+        for (action, args) in [
+            ("tab.select", json!({"id": "b"})),
+            ("tab.select", json!({"id": "a"})),
+            ("space.select", json!({"id": "s2"})),
+            ("space.select", json!({"id": "s1"})),
+        ] {
+            cx.update(|window, cx| view.update(cx, |this, cx| {
+                this.dispatch(action, &args, true, window, cx);
+            }));
+            cx.run_until_parked();
+            if args["id"] == "a" || args["id"] == "s1" {
+                cx.update(|window, cx| view.update(cx, |this, cx| {
+                    let term = this.pane_term("pa").unwrap();
+                    assert!(!term.focus.is_focused(window), "returning must not send a find query to the program");
+                    assert!(this.pane_focus("pa", cx).unwrap().is_focused(window));
+                    assert!(this.focused_path(window, cx).contains("pa"), "Find focus must keep the pane ring");
+                }));
+                cx.simulate_keystrokes("x");
+            }
+        }
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.update(|window, cx| view.update(cx, |this, _| {
+            assert!(this.pane_term("pa").unwrap().focus.is_focused(window));
+        }));
+    }
+
+    /// Mods see window().active follow the focus, losing it too: a probe mod
+    /// notes every value it renders with while the window is focused and
+    /// blurred, and the poll that checks the focus runs in between.
+    #[test]
+    fn mods_see_the_window_lose_and_regain_focus() {
+        in_own_process("focus_window");
+    }
+
+    #[gpui::test]
+    fn focus_window(cx: &mut gpui::TestAppContext) {
+        use serde_json::json;
+        if !running_alone("focus_window") {
+            return;
+        }
+        let probe = r#"import { View, div } from "gpui-kit";
+import { window, shared, setShared } from "herdr";
+
+export default class Probe extends View {
+  render() {
+    const active = window().active;
+    if (active !== this.last) {
+      this.last = active;
+      setShared("probe.seen", [...(shared("probe.seen") ?? []), active]);
+    }
+    return div();
+  }
+}
+"#;
+        let layout = json!({ "id": "root", "type": "row", "children": [
+            { "id": "probe", "type": "block", "content": { "mod": "active-probe" } }
+        ] });
+        let (_view, cx) = open_window(cx, "active-probe", probe, layout);
+        // What the probe saw last, after the focus poll (every 400 ms) had its turn.
+        let seen = |cx: &mut gpui::VisualTestContext| {
+            cx.executor().advance_clock(std::time::Duration::from_secs(1));
+            cx.run_until_parked();
+            crate::mods::shared("probe.seen").and_then(|v| v.as_array()?.last().cloned())
+        };
+        for _ in 0..2 {
+            cx.update(|window, _| window.activate_window());
+            assert_eq!(seen(cx), Some(json!(true)), "focused: {:?}", crate::mods::shared("probe.seen"));
+            cx.deactivate_window();
+            assert_eq!(seen(cx), Some(json!(false)), "blurred: {:?}", crate::mods::shared("probe.seen"));
+        }
+    }
+
+    include!("window/pane_size_tests.rs");
+
     #[test]
     fn terminal_menu_preserves_clicked_target_and_uses_mod_dimensions() {
         use serde_json::json;
@@ -4750,4 +6297,59 @@ mod tests {
         assert!(!super::adoptable(&record("live"), "sp1", Some("tb2"), None));
     }
 
+}
+
+// HERDR: browser block. The person's own browser: their cookies and logins, keys as in any app.
+/// Who asked for a new browser: the person (menu, keys, pane menu) or the control socket (anyone).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Via {
+    Person,
+    Control,
+}
+
+/// A new browser block: the person's own profile only on the person's path.
+fn new_browser(url: Option<&str>, via: Via) -> crate::layout::BrowserBlock {
+    let profile = match via {
+        Via::Person => crate::browser::agent::PERSON_PROFILE,
+        Via::Control => crate::browser::agent::AGENT_PROFILE,
+    };
+    crate::layout::BrowserBlock { url: url.unwrap_or_default().to_owned(), profile: profile.into(), ..Default::default() }
+}
+
+/// The new pane's share of `room` when splitting beside a pane: half, moved so each side keeps
+/// its minimum; refused when both minimums don't fit (nothing moves).
+fn split_share(m_old: f32, m_new: f32, room: f32) -> Result<f32, String> {
+    if m_old + m_new > room {
+        return Err(format!("No room to split here: the panes need {} px, there are {}", (m_old + m_new).round(), room.round()));
+    }
+    Ok((room / 2.0).clamp(m_new, room - m_old) / room)
+}
+
+/// HERDR: browser block. The bridge's one url (`http://127.0.0.1:<port>/?token=..&machine=..`):
+/// only a local http url is accepted. Errors never include it (it carries the token).
+fn remote_desktop_url(bridge: &std::path::Path, machine: Option<&str>) -> Result<String, String> {
+    let mut cmd = std::process::Command::new("node");
+    cmd.arg(bridge).arg("--ensure").stdin(std::process::Stdio::null());
+    if let Some(m) = machine {
+        cmd.arg("--machine").arg(m);
+    }
+    let out = cmd.output().map_err(|e| format!("can't run node: {e}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("the bridge failed ({}): {}", out.status, err.lines().last().unwrap_or("").chars().take(200).collect::<String>()));
+    }
+    let url = String::from_utf8_lossy(&out.stdout).lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("").to_owned();
+    if !is_local_http(&url) {
+        return Err("the bridge printed no local url".into());
+    }
+    Ok(url)
+}
+
+/// Whether `url` is plain http to 127.0.0.1 on a numeric port, parsed rather than prefix-matched:
+/// no userinfo (`http://127.0.0.1:80@evil.example`), no other host, no backslash tricks.
+fn is_local_http(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("http://") else { return false };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let Some(port) = authority.strip_prefix("127.0.0.1:") else { return false };
+    !authority.contains(['@', '\\']) && !port.is_empty() && port.len() <= 5 && port.bytes().all(|b| b.is_ascii_digit()) && port.parse::<u16>().is_ok_and(|p| p > 0)
 }

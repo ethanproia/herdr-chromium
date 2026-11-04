@@ -28,12 +28,51 @@ pub fn listen(tx: async_channel::Sender<Request>) {
         Ok(l) => l,
         Err(e) => return tracing::warn!("cannot serve {}: {e}", path.display()),
     };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
     let _ = std::thread::Builder::new().name("herdr-app-control".into()).spawn(move || {
         for stream in listener.incoming().flatten() {
+            #[cfg(unix)]
+            if !same_user(&stream) {
+                tracing::warn!("control socket: refused a connection from another user");
+                continue;
+            }
             let tx = tx.clone();
             std::thread::spawn(move || serve(stream, tx));
         }
     });
+}
+
+/// HERDR: the socket drives the whole window (terminals, browsers): only this user may connect.
+#[cfg(unix)]
+fn same_user(stream: &UnixStream) -> bool {
+    peer_uid(stream).is_some_and(|uid| uid == unsafe { libc::geteuid() })
+}
+
+#[cfg(target_os = "macos")]
+fn peer_uid(stream: &UnixStream) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+    let (mut uid, mut gid) = (0, 0);
+    // SAFETY: a connected socket fd and two out-params.
+    (unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } == 0).then_some(uid)
+}
+
+#[cfg(target_os = "linux")]
+fn peer_uid(stream: &UnixStream) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+    let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: SO_PEERCRED fills a ucred of the given length on a connected unix socket.
+    let ok = unsafe { libc::getsockopt(stream.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED, (&mut cred as *mut libc::ucred).cast(), &mut len) } == 0;
+    ok.then_some(cred.uid)
+}
+
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+fn peer_uid(_: &UnixStream) -> Option<u32> {
+    None
 }
 
 fn serve(stream: UnixStream, tx: async_channel::Sender<Request>) {
@@ -43,7 +82,19 @@ fn serve(stream: UnixStream, tx: async_channel::Sender<Request>) {
     }
     let reply = match serde_json::from_str::<Value>(&line) {
         Ok(cmd) => {
-            let timeout = Duration::from_secs(if cmd.get("shot").is_some() { 30 } else { 5 });
+            // HERDR: browser block. Commands the browser host answers wait on it: a page
+            // screenshot or script gets the 30 s a window shot gets; a new page's first load 15 s.
+            let browser = cmd.get("do").and_then(Value::as_str).filter(|n| n.starts_with("browser."));
+            let waits_for_person = browser == Some("browser.pick")
+                || (browser == Some("browser.annotations") && cmd.pointer("/args/wait").and_then(Value::as_bool) == Some(true));
+            let timeout = Duration::from_secs(match browser {
+                // The person picks or sends when they're ready; the agent side drops the waiter at the same bound.
+                _ if waits_for_person => crate::browser::agent::PERSON_WAIT.as_secs(),
+                Some("browser.screenshot" | "browser.eval") => 30,
+                Some("browser.find" | "browser.open") => 15,
+                _ if cmd.get("shot").is_some() => 30,
+                _ => 5,
+            });
             let (reply_tx, reply_rx) = std::sync::mpsc::channel();
             let _ = tx.send_blocking(Request::Control { cmd, reply: reply_tx });
             reply_rx.recv_timeout(timeout).unwrap_or_else(|_| json!({ "error": "the window did not answer" }))
@@ -51,6 +102,16 @@ fn serve(stream: UnixStream, tx: async_channel::Sender<Request>) {
         Err(e) => json!({ "error": format!("bad request: {e}") }),
     };
     let _ = (&stream).write_all(format!("{reply}\n").as_bytes());
+}
+
+// HERDR: out-of-sight mode for forks and tests: no shown window, no focus, no activation.
+pub fn headless() -> bool {
+    std::env::var("HERDR_APP_HEADLESS").is_ok_and(|v| v == "1")
+}
+
+// HERDR: a window serves this home, without raising it.
+pub fn running() -> bool {
+    UnixStream::connect(socket()).is_ok()
 }
 
 /// One Herdr per home: a second launch brings the running window to the
@@ -75,6 +136,12 @@ pub fn client(args: &[String]) -> i32 {
         println!("{}", serde_json::to_string_pretty(&crate::commands::listing()).unwrap());
         return 0;
     }
+    // HERDR: `render --layout <file.json> --out <file.png>`: set the layout, then shoot.
+    if let [verb, a, layout, b, out] = args
+        && verb == "render" && a == "--layout" && b == "--out"
+    {
+        return render(layout, out);
+    }
     let cmd = match args {
         [verb, rest @ ..] if verb == "shot" && rest.len() <= 1 => {
             let path = PathBuf::from(rest.first().map(String::as_str).unwrap_or("herdr-shot.png"));
@@ -94,7 +161,7 @@ pub fn client(args: &[String]) -> i32 {
             Ok(a) => json!({ "do": command, "args": a }),
             Err(e) => return fail(&e),
         },
-        _ => return fail("usage: herdr-app ls | herdr-app commands | herdr-app status | herdr-app shot [file.png] | herdr-app do <command> [--arg value ... | json]"),
+        _ => return fail("usage: herdr-app ls | herdr-app commands | herdr-app status | herdr-app shot [file.png] | herdr-app render --layout <file.json> --out <file.png> | herdr-app do <command> [--arg value ... | json]"),
     };
     let mut stream = match UnixStream::connect(socket()) {
         Ok(s) => s,
@@ -126,6 +193,26 @@ pub fn client(args: &[String]) -> i32 {
     if reply.get("error").is_some() { 1 } else { 0 }
 }
 
+// HERDR: the render verb, against the (headless) window on this home.
+fn render(layout: &str, out: &str) -> i32 {
+    let tree: Value = match std::fs::read_to_string(layout).map_err(|e| e.to_string()).and_then(|t| serde_json::from_str(&t).map_err(|e| e.to_string())) {
+        Ok(v) => v,
+        Err(e) => return fail(&format!("cannot read layout {layout}: {e}")),
+    };
+    // A personal layout in this home, so its whole tree applies (layout.set keeps shipped structure).
+    let dir = mods::app_dir().join("layouts");
+    if let Err(e) = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(dir.join("render.json"), tree.to_string())) {
+        return fail(&format!("cannot write {}: {e}", dir.display()));
+    }
+    let shown = client(&["do".into(), "layout.switch".into(), "--name".into(), "render".into()]);
+    if shown != 0 {
+        return shown;
+    }
+    // Let the new layout paint before the shot.
+    std::thread::sleep(Duration::from_millis(500));
+    client(&["shot".into(), out.into()])
+}
+
 /// `--name api --argv '["pi"]'` (values that parse as JSON are JSON), or one JSON object.
 fn parse_args(rest: &[String]) -> Result<Value, String> {
     match rest {
@@ -145,7 +232,22 @@ fn parse_args(rest: &[String]) -> Result<Value, String> {
     }
 }
 
-/// Encode before opening the destination: GPU errors must not truncate a good shot.
+/// Draws the window with sensitive browser pages covered, saves it, then draws it normally again.
+pub fn masked_shot(window: &mut gpui::Window, cx: &mut gpui::App, path: &std::path::Path) -> anyhow::Result<()> {
+    use std::sync::atomic::Ordering::SeqCst;
+    crate::browser::view::SHOT_MASK.store(true, SeqCst);
+    window.refresh();
+    let started = std::time::Instant::now();
+    window.draw(cx).clear(cx);
+    crate::frame_stats::shot_draw(window.window_handle().window_id().as_u64(), started.elapsed().as_secs_f64() * 1e3);
+    let r = save_shot(window, path);
+    crate::browser::view::SHOT_MASK.store(false, SeqCst);
+    window.refresh();
+    r
+}
+
+/// Encode before opening the destination: GPU errors must not truncate a good shot. The file is
+/// new and private (0600, created exclusively): an existing file is never replaced.
 pub fn save_shot(window: &gpui::Window, path: &std::path::Path) -> anyhow::Result<()> {
     let image = window.render_to_image()?;
     let mut bytes = Vec::new();
@@ -156,18 +258,24 @@ pub fn save_shot(window: &gpui::Window, path: &std::path::Path) -> anyhow::Resul
         encoder.set_source_srgb(png::SrgbRenderingIntent::Perceptual);
         encoder.write_header()?.write_image_data(image.as_raw())?;
     }
-    // A sibling temporary file keeps publication on the same filesystem.
-    let temporary = path.with_file_name(format!(".herdr-shot-{}.png", std::process::id()));
-    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&temporary)?;
+    write_new_private(path, &bytes)
+}
+
+/// Writes `bytes` to a file that must not exist yet (O_EXCL, 0600); a failed write removes it.
+pub fn write_new_private(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(path).map_err(|e| anyhow::anyhow!("{}: {e} (shots never replace a file)", path.display()))?;
     let result = (|| -> anyhow::Result<()> {
-        file.write_all(&bytes)?;
+        file.write_all(bytes)?;
         file.sync_all()?;
-        drop(file);
-        std::fs::rename(&temporary, path)?;
         Ok(())
     })();
     if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
+        drop(file);
+        let _ = std::fs::remove_file(path);
     }
     result
 }
@@ -180,6 +288,27 @@ fn fail(message: &str) -> i32 {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_shot_never_replaces_a_file_and_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("herdr-app-shot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fresh = dir.join("new.png");
+        write_new_private(&fresh, b"png").unwrap();
+        assert_eq!(std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777, 0o600);
+        let precious = dir.join("notes.txt");
+        std::fs::write(&precious, "keep me").unwrap();
+        assert!(write_new_private(&precious, b"png").is_err());
+        assert_eq!(std::fs::read_to_string(&precious).unwrap(), "keep me", "an existing file is untouched");
+        // A symlink at the destination is not followed.
+        let link = dir.join("link.png");
+        std::os::unix::fs::symlink(&precious, &link).unwrap();
+        assert!(write_new_private(&link, b"png").is_err());
+        assert_eq!(std::fs::read_to_string(&precious).unwrap(), "keep me");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_second_launch_raises_the_running_window() {

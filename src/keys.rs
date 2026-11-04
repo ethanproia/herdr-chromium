@@ -1,4 +1,4 @@
-//! ~/.config/herdr-app/keys.json: every key is a string action, reloaded live.
+//! ~/.config/herdr-app/keys.json: string or object actions, reloaded live.
 //!
 //! ```json
 //! {
@@ -10,7 +10,8 @@
 //! ```
 //!
 //! An action is a command (`pane.split:right`: the value fills its first
-//! argument), `send:<text>` (types into the focused terminal),
+//! argument), an object (`{"command":"layout.resize","args":{"id":"sidebar","px":240}}`),
+//! `send:<text>` (types into the focused terminal),
 //! `<mod>.<command>` (delivered to that mod's `nextCommand()`), or `terminal`
 //! (the program gets the key: the binding is switched off where this section
 //! applies).
@@ -31,20 +32,76 @@ pub const DEFAULTS: &str = include_str!("../defaults/keys.json");
 #[cfg(target_os = "macos")]
 pub const DEFAULTS: &str = include_str!("../defaults/keys.macos.json");
 
-fn defaults() -> BTreeMap<String, BTreeMap<String, String>> {
+// Exact originals from release tags, deduplicated across v0.1.4–v0.1.12.
+// Keep these when defaults change: only untouched shipped files may migrate.
+#[cfg(any(not(target_os = "macos"), test))]
+const SHIPPED_KEYS: &[&str] = &[
+    include_str!("keys/shipped/v0.1.4-keys.json"),
+    include_str!("keys/shipped/v0.1.5-keys.json"),
+    include_str!("keys/shipped/v0.1.12-keys.json"),
+];
+#[cfg(any(target_os = "macos", test))]
+const SHIPPED_MACOS_KEYS: &[&str] = &[
+    include_str!("keys/shipped/v0.1.4-keys.macos.json"),
+    include_str!("keys/shipped/v0.1.5-keys.macos.json"),
+    // HERDR: the fork's own last default (0.1.12 base), so untouched Labs keys get 0.1.13's cmd-f.
+    include_str!("keys/shipped/fork-labs-0.1.12-keys.macos.json"),
+];
+
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum Binding {
+    String(String),
+    Object(serde_json::Map<String, serde_json::Value>),
+}
+
+type Sections = BTreeMap<String, BTreeMap<String, Binding>>;
+
+/// Kept separate from string actions so colon payloads always stay literal.
+#[derive(Clone, PartialEq, gpui::Action, serde::Deserialize)]
+#[action(no_json)]
+pub struct CommandBinding {
+    pub value: serde_json::Map<String, serde_json::Value>,
+}
+
+impl CommandBinding {
+    pub fn command(&self) -> Result<(String, serde_json::Value), String> {
+        use serde_json::{Value, json};
+        if let Some(key) = self.value.keys().find(|k| !matches!(k.as_str(), "command" | "args")) {
+            return Err(format!("unknown key binding field {key:?}; use command and args"));
+        }
+        let name = self.value.get("command").and_then(Value::as_str)
+            .ok_or("key binding command must be a string")?;
+        let name = current(name);
+        let command = crate::commands::find(&name).ok_or_else(|| format!("unknown key binding command {name:?}"))?;
+        let args = self.value.get("args").cloned().unwrap_or_else(|| json!({}));
+        if !args.is_object() {
+            return Err(format!("{name}: key binding args must be an object"));
+        }
+        crate::commands::validate_args(command, &args)?;
+        Ok((name, args))
+    }
+}
+
+fn defaults() -> Sections {
     serde_json::from_str(DEFAULTS).expect("defaults/keys.json is valid")
 }
 
 /// Every binding as `(section, keys, action)`, for the keybind help.
 pub fn listing() -> Vec<(String, String, String)> {
     let text = std::fs::read_to_string(path()).unwrap_or_default();
-    let sections: BTreeMap<String, BTreeMap<String, String>> = serde_json::from_str(&text).unwrap_or_else(|_| defaults());
+    let sections: Sections = serde_json::from_str(&text).unwrap_or_else(|_| defaults());
     let mut out = Vec::new();
     for (s, keys) in sections {
         for (k, a) in keys {
-            let a = current(&a);
-            if !gone_mod(&a) {
-                out.push((s.clone(), k, a));
+            match a {
+                Binding::String(a) => {
+                    let a = current(&a);
+                    if !gone_mod(&a) {
+                        out.push((s.clone(), k, a));
+                    }
+                }
+                Binding::Object(a) => out.push((s.clone(), k, serde_json::Value::Object(a).to_string())),
             }
         }
     }
@@ -95,8 +152,34 @@ pub(crate) fn current(action: &str) -> String {
 /// A mod's command whose mod is gone (0.1.x's `ribbon.next`): bound to nothing.
 fn gone_mod(action: &str) -> bool {
     let name = action.split_once(':').map_or(action, |(n, _)| n);
+    // HERDR: keys of a mod turned off (settings mods_disabled) are skipped like a missing mod's.
+    let off = crate::mods::disabled();
+    if action.strip_prefix("mod.open:").is_some_and(|m| off.contains(m)) || name.split_once('.').is_some_and(|(m, _)| off.contains(m)) {
+        return true;
+    }
     crate::commands::find(name).is_none()
         && name.split_once('.').is_some_and(|(m, _)| !m.starts_with("frame-") && !crate::mods::mods_dir().join(m).is_dir())
+}
+
+// HERDR: fork-core's split commands open its New panel chooser and its sidebar toggle steps
+// rail/open/hidden; while fork-core is turned off or missing their keys fall back to the
+// built-in command instead of going dead.
+const FALLBACKS: &[(&str, &str)] = &[
+    ("fork-core.split-right", "pane.split:right"),
+    ("fork-core.split-down", "pane.split:down"),
+    ("fork-core.toggle-sidebar", "layout.toggle:sidebar"),
+];
+
+pub(crate) fn has_fallback(action: &str) -> bool {
+    FALLBACKS.iter().any(|(a, _)| *a == action)
+}
+
+/// The action a binding runs: itself, a gone mod's fallback, or None (bound to nothing).
+fn resolve(action: &str, gone: impl Fn(&str) -> bool) -> Option<String> {
+    if !gone(action) {
+        return Some(action.to_owned());
+    }
+    FALLBACKS.iter().find(|(a, _)| *a == action).map(|(_, b)| (*b).to_owned())
 }
 
 fn valid_action(action: &str) -> bool {
@@ -107,18 +190,33 @@ fn valid_action(action: &str) -> bool {
         || name.split_once('.').is_some_and(|(m, c)| !m.is_empty() && !c.is_empty())
 }
 
-/// Reads keys.json (writing the defaults if it's missing) into bindings, or says what's wrong.
+/// Reads keys.json, installing or updating untouched defaults, or says what's wrong.
 pub fn load() -> Result<Vec<KeyBinding>, String> {
-    let p = path();
-    if !p.exists() {
-        let _ = std::fs::write(&p, DEFAULTS);
+    #[cfg(not(target_os = "macos"))]
+    let originals = SHIPPED_KEYS;
+    #[cfg(target_os = "macos")]
+    let originals = SHIPPED_MACOS_KEYS;
+    parse(&load_text(&path(), DEFAULTS, originals)?)
+}
+
+fn load_text(path: &std::path::Path, defaults: &str, originals: &[&str]) -> Result<String, String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::write(path, defaults).map_err(|e| e.to_string())?;
+            return Ok(defaults.to_owned());
+        }
+        Err(e) => return Err(e.to_string()),
+    };
+    if text != defaults && originals.contains(&text.as_str()) {
+        std::fs::write(path, defaults).map_err(|e| e.to_string())?;
+        return Ok(defaults.to_owned());
     }
-    let text = std::fs::read_to_string(&p).map_err(|e| e.to_string())?;
-    parse(&text)
+    Ok(text)
 }
 
 pub fn parse(text: &str) -> Result<Vec<KeyBinding>, String> {
-    let sections: BTreeMap<String, BTreeMap<String, String>> = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    let sections: Sections = serde_json::from_str(text).map_err(|e| e.to_string())?;
     let mut out = Vec::new();
     let mut problems = Vec::new();
     for (section, keys) in &sections {
@@ -130,13 +228,19 @@ pub fn parse(text: &str) -> Result<Vec<KeyBinding>, String> {
             }
         };
         for (keys, action) in keys {
-            let action = &current(action);
-            if gone_mod(action) {
-                continue;
-            }
-            if !valid_action(action) {
-                problems.push(format!("{section}.{keys}: unknown action {action:?}"));
-                continue;
+            // HERDR: a gone fork mod's key falls back (`resolve`); keys with arguments (objects) are upstream's.
+            let string = match action {
+                Binding::String(action) => match resolve(&current(action), gone_mod) {
+                    Some(action) => Some(action),
+                    None => continue,
+                },
+                Binding::Object(_) => None,
+            };
+            if let Some(action) = &string {
+                if !valid_action(action) {
+                    problems.push(format!("{section}.{keys}: unknown action {action:?}"));
+                    continue;
+                }
             }
             if keys == ESCAPE_HATCH {
                 problems.push(format!("{ESCAPE_HATCH} is reserved for resetting Herdr"));
@@ -149,13 +253,16 @@ pub fn parse(text: &str) -> Result<Vec<KeyBinding>, String> {
                     continue;
                 }
             };
-            let action: Box<dyn gpui::Action> = if action == "terminal" {
+            let action: Box<dyn gpui::Action> = if let Binding::Object(value) = action {
+                Box::new(CommandBinding { value: value.clone() })
+            } else if string.as_deref() == Some("terminal") {
                 // Off where this section applies; globally, simply not bound.
                 if section == "global" {
                     continue;
                 }
                 Box::new(NoAction)
             } else {
+                let action = string.as_ref().expect("string binding");
                 #[cfg(target_os = "macos")]
                 let native = crate::macos::action(action);
                 #[cfg(not(target_os = "macos"))]
@@ -196,11 +303,198 @@ pub fn install(bindings: Vec<KeyBinding>, cx: &mut App) {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn only_byte_identical_shipped_keys_are_upgraded() {
+        let dir = std::env::temp_dir().join(format!("herdr-keys-migration-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("keys.json");
+        for (defaults, originals) in [
+            (include_str!("../defaults/keys.json"), super::SHIPPED_KEYS),
+            (include_str!("../defaults/keys.macos.json"), super::SHIPPED_MACOS_KEYS),
+        ] {
+            for original in originals {
+                std::fs::write(&path, original).unwrap();
+                assert_eq!(super::load_text(&path, defaults, originals).unwrap(), defaults);
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), defaults);
+
+                // Even a whitespace-only edit is personal, not an untouched original.
+                for edited in [format!("{original}\n"), original.replace("tab.new", "pane.zoom")] {
+                    std::fs::write(&path, &edited).unwrap();
+                    assert_eq!(super::load_text(&path, defaults, originals).unwrap(), edited);
+                    assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
+                }
+            }
+            std::fs::write(&path, defaults).unwrap();
+            assert_eq!(super::load_text(&path, defaults, originals).unwrap(), defaults);
+            std::fs::remove_file(&path).unwrap();
+            assert_eq!(super::load_text(&path, defaults, originals).unwrap(), defaults);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), defaults);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// HERDR: 0.1.13's cmd-f searches the terminal only where a terminal has the keys; a focused
+    /// browser block keeps cmd-f for its own find (its view handles it; tests/browser_find.rs).
+    #[test]
+    fn cmd_f_searches_a_terminal_and_leaves_a_browser_its_find() {
+        let keys = super::parse(include_str!("../defaults/keys.macos.json")).unwrap();
+        let cmd_f: Vec<_> = keys
+            .iter()
+            .filter(|b| b.keystrokes().len() == 1 && b.keystrokes()[0].inner().key == "f" && b.keystrokes()[0].inner().modifiers.platform && !b.keystrokes()[0].inner().modifiers.shift)
+            .collect();
+        assert_eq!(cmd_f.len(), 1, "one cmd-f binding");
+        let when = cmd_f[0].predicate().expect("a context");
+        let ctx = |names: &[&str]| names.iter().map(|n| gpui::KeyContext::parse(n).unwrap()).collect::<Vec<_>>();
+        assert!(when.eval(&ctx(&["Herdr", "Terminal"])), "a focused terminal searches");
+        assert!(!when.eval(&ctx(&["Herdr", "Browser"])), "a focused browser keeps cmd-f");
+        assert!(!when.eval(&ctx(&["Herdr", "Mod mod = fork-board"])), "a mod keeps it too");
+    }
+
+    #[test]
     fn keys_from_0_1_0_mean_the_same_now() {
         assert_eq!(super::current("project.select:2"), "space.select:2");
         assert_eq!(super::current("context.new"), "tab.new");
         assert_eq!(super::current("mod.open:start"), "tab.new");
         assert_eq!(super::current("pane.zoom"), "pane.zoom");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_shifted_punctuation_matches_existing_keys_files() {
+        use gpui::{KeybindingKeystroke, Keystroke};
+        let bindings = super::parse(include_str!("../defaults/keys.macos.json")).unwrap();
+        for (base, shifted) in [("]", "}"), ("[", "{")] {
+            let event = Keystroke {
+                unshifted_key: Some(base.into()),
+                ..Keystroke::parse(&format!("cmd-{shifted}")).unwrap()
+            };
+            assert!(bindings.iter().any(|binding| binding.match_keystrokes(&[event.clone()]) == Some(false)));
+        }
+        // Layout-derived aliases, not a US punctuation lookup table.
+        for (base, shifted) in [("=", "+"), ("-", "_"), ("ö", "Ö"), ("č", "Č"), ("7", "/")] {
+            let event = Keystroke {
+                unshifted_key: Some(base.into()),
+                ..Keystroke::parse(&format!("cmd-{shifted}")).unwrap()
+            };
+            for keys in [format!("cmd-shift-{base}"), format!("cmd-{shifted}")] {
+                let target = KeybindingKeystroke::from_keystroke(Keystroke::parse(&keys).unwrap());
+                assert!(event.should_match(&target), "{keys}");
+            }
+        }
+        assert!(Keystroke::parse("cmd-shift-]").unwrap().unshifted_key.is_none());
+        assert!(Keystroke::default().unshifted_key.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_help_binding_matches_shifted_slash() {
+        // Linux reports Ctrl+Shift+/ as Ctrl+? without the Shift modifier.
+        let event = gpui::Keystroke::parse("ctrl-?").unwrap();
+        let defaults: serde_json::Value = serde_json::from_str(super::DEFAULTS).unwrap();
+        let help = defaults["global"].as_object().unwrap().iter()
+            .filter(|(_, action)| action.as_str() == Some("app.help"))
+            .map(|(keys, action)| (keys.clone(), action.clone()))
+            .collect::<serde_json::Map<_, _>>();
+        let bindings = super::parse(&serde_json::json!({ "global": help }).to_string()).unwrap();
+        assert!(bindings.iter().any(|binding| binding.match_keystrokes(&[event.clone()]) == Some(false)));
+    }
+
+    #[test]
+    fn object_bindings_pass_named_typed_arguments() {
+        use serde_json::json;
+        for (name, args) in [
+            ("layout.resize", json!({"id":"sidebar", "px":240})),
+            ("tab.new", json!({"mod":"editor", "props":{"enabled":true, "items":[1,null,"a:b"]}})),
+            ("app.help", json!({})),
+        ] {
+            let bindings = super::parse(&json!({"global":{"f6":{"command":name,"args":args}}}).to_string()).unwrap();
+            assert_eq!(bindings.len(), 1);
+            let action = bindings[0].action().as_any().downcast_ref::<super::CommandBinding>().unwrap();
+            assert_eq!(action.command().unwrap(), (name.into(), args));
+        }
+        let bindings = super::parse(r#"{"global":{"f6":{"command":"app.help"}}}"#).unwrap();
+        let action = bindings[0].action().as_any().downcast_ref::<super::CommandBinding>().unwrap();
+        assert_eq!(action.command().unwrap(), ("app.help".into(), json!({})));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn object_bindings_resolve_native_app_actions_after_validation() {
+        use serde_json::json;
+        for name in ["app.quit", "app.hide", "app.hide_others", "app.show_all", "app.settings"] {
+            let bindings = super::parse(&json!({"global":{"f6":{"command":name}}}).to_string()).unwrap();
+            let action = bindings[0].action().as_any().downcast_ref::<super::CommandBinding>().unwrap();
+            let (command, args) = action.command().unwrap();
+            assert_eq!(args, json!({}));
+            let native = crate::macos::action(&command).unwrap();
+            let expected = crate::macos::action(name).unwrap();
+            assert!(native.partial_eq(expected.as_ref()));
+            let bad = super::CommandBinding { value: json!({"command":name,"args":{"typo":true}}).as_object().unwrap().clone() };
+            assert!(bad.command().is_err());
+        }
+    }
+
+    #[test]
+    fn bad_object_bindings_stay_bound_for_error_toasts() {
+        use serde_json::json;
+        for value in [
+            json!({}), json!({"command":3}), json!({"command":"unknown"}),
+            json!({"command":"space.new:{work}"}),
+            json!({"command":"app.help","extra":true}),
+            json!({"command":"app.help","args":null}),
+            json!({"command":"app.help","args":[]}),
+            json!({"command":"app.help","args":"{}"}),
+            json!({"command":"layout.resize","args":{"typo":240}}),
+            json!({"command":"layout.resize","args":{"id":123,"px":240}}),
+        ] {
+            let bindings = super::parse(&json!({"terminal":{"f6":value}}).to_string()).unwrap();
+            assert_eq!(bindings.len(), 1, "{value}");
+            assert_eq!(bindings[0].match_keystrokes(&[gpui::Keystroke::parse("f6").unwrap()]), Some(false));
+            let action = bindings[0].action().as_any().downcast_ref::<super::CommandBinding>().unwrap();
+            assert!(action.command().is_err(), "{value}");
+        }
+    }
+
+    #[test]
+    fn colon_payloads_stay_literal_including_valid_and_invalid_json() {
+        use serde_json::json;
+        for value in ["{work}", "{}", "{", "  {bad}", r#"{"name":"work"}"#,
+            r#"{"name":"work",}"#, r#"{"name":"work"} trailing"#,
+            "hello:world", "", "3", "-1", "true", "null", "[]", "[broken", r#""name""#] {
+            let action = format!("space.new:{value}");
+            let bindings = super::parse(&json!({"global":{"f6":action}}).to_string()).unwrap();
+            let bound = bindings[0].action().as_any().downcast_ref::<gpui_shell::action::ShellAction>().unwrap();
+            assert_eq!(bound.id(), action);
+            let (name, payload) = bound.id().split_once(':').unwrap();
+            assert_eq!(crate::commands::shorthand(crate::commands::find(name).unwrap(), payload), json!({"name":value}));
+        }
+        assert_eq!(crate::commands::shorthand(crate::commands::find("tab.select").unwrap(), "3"), json!({"index":3}));
+    }
+
+    #[test]
+    fn core_split_keys_fall_back_while_core_is_off_or_missing() {
+        use super::resolve;
+        // fork-core on: its command.
+        assert_eq!(resolve("fork-core.split-right", |_| false).as_deref(), Some("fork-core.split-right"));
+        // Turned off (mods_disabled) or folder missing: gone_mod is true either way.
+        assert_eq!(resolve("fork-core.split-right", |_| true).as_deref(), Some("pane.split:right"));
+        assert_eq!(resolve("fork-core.split-down", |_| true).as_deref(), Some("pane.split:down"));
+        assert_eq!(resolve("fork-core.toggle-sidebar", |_| false).as_deref(), Some("fork-core.toggle-sidebar"));
+        assert_eq!(resolve("fork-core.toggle-sidebar", |_| true).as_deref(), Some("layout.toggle:sidebar"));
+        // Any other gone mod's key stays unbound.
+        assert_eq!(resolve("ribbon.next", |_| true), None);
+    }
+
+    #[test]
+    fn own_cmd_d_is_never_replaced() {
+        // A person's own action on the key is kept as written: no fallback applies to it.
+        assert_eq!(super::resolve("pane.zoom", |_| false).as_deref(), Some("pane.zoom"));
+        assert_eq!(super::parse(r#"{ "global": { "cmd-d": "pane.zoom" } }"#).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn own_cmd_b_is_never_replaced() {
+        assert_eq!(super::resolve("tab.new", |_| false).as_deref(), Some("tab.new"));
+        assert_eq!(super::parse(r#"{ "global": { "cmd-b": "tab.new" } }"#).unwrap().len(), 1);
     }
 
     #[test]

@@ -20,16 +20,17 @@ export function home(): string;
 /** The app's folder (`~/.config/herdr-app`, or `$HERDR_APP_HOME`): settings.json, keys.json, layouts/. */
 export function appHome(): string;
 
-/** Reads UTF-8 text (up to 1 MiB), or null if absent. Runs off the UI thread.
+/** Reads UTF-8 text (up to 16 MiB), or null if absent. Runs off the UI thread.
  *  `on`: from that machine (a space's `machine`). */
 export function readTextFile(path: string, options?: { on?: string | null }): Promise<string | null>;
 /** Writes UTF-8 text only if it still matches expected (null creates a new file).
- * Rejects on a stale snapshot; existing files are replaced atomically. */
+ * Rejects on a stale snapshot; existing files are replaced atomically. Up to 16 MiB. */
 export function writeTextFile(path: string, text: string, expected: string | null): Promise<null>;
 
 /** The agents people can start from a menu (entries with `run` in programs.json), most picked
  *  first, and whether each is installed: asked of the shell agents start in (on another machine,
- *  `on`, its `sh`), at most once a minute per machine. Start one with its `run` as `argv`. */
+ *  `on`, its login/interactive shell when supported), at most once a minute per machine.
+ *  Start one with its `run` as `argv`. */
 export function knownAgents(options?: { on?: string | null }): Promise<(Program & { run: string[]; installed: boolean })[]>;
 
 /** Opens the system's folder picker (this machine). Resolves with the chosen folder, or null
@@ -61,6 +62,7 @@ export function playSound(sound: string): null;
  *   terminal.peek {terminal} (peek over the tab, with keep-as-tab and close),
  *   terminal.show {terminal?, pane?} (shown in the pane for now, in place of its own), terminal.copy, terminal.paste,
  *   terminal.right_click {to: "program" | "menu", terminal?} (right-clicks to a program that takes the mouse; Shift: the menu).
+ *   terminal.scroll {lines | pages | to: "top" | "bottom", terminal?} (Herdr's view of the history: negative goes up; pages may be fractional).
  * Agents: agent.next, agent.prev (the agents list's order), agent.focus {terminal} (sub-agents too).
  * Layout (the shown layout's nodes by id): layout.toggle|show|hide {id}, layout.resize {id, px | weight},
  *   layout.select {stack, child}, layout.set {layout} (personal trees; shipped layouts: click/look fields only), layout.switch {name?} (no name: the next one).
@@ -160,7 +162,8 @@ export interface AgentInfo {
   tab: string;
   tab_index: number;
   tab_name: string;
-  /** "done" means it finished while you weren't looking; it becomes "idle" once you look. */
+  /** "done" means it finished while you weren't looking; it becomes "idle" once you look
+   *  (here or on another Herdr client). */
   status: Status;
   /** What the agent reported (OSC 7501 `app`), e.g. "claude-code", "pi", "codex". */
   app: string | null;
@@ -169,6 +172,8 @@ export interface AgentInfo {
   title: string;
   /** Higher = changed more recently. */
   seq: number;
+  /** Pinned with `terminal.pin`, on any Herdr client. */
+  pinned: boolean;
   focused: boolean;
 }
 
@@ -273,7 +278,8 @@ export function fonts(): string[];
 
 /** Herdr's and herdr-core's versions and what's waiting. `app.updates`: false for a build from
  *  source (it never updates). `core.managed`: the package manager that owns the core (homebrew,
- *  nix, mise), which the app never updates. `checked`: unix seconds of the last look.
+ *  nix, mise), which the app never updates. `checked`: unix seconds of the last successful
+ *  check; null before success or after a failed check.
  *  `checks`: anything is checked at all (not in a build from source); `checking`: looking now
  *  (`app.check_updates` starts a look). */
 export function updates(): {
@@ -361,8 +367,11 @@ export function openOverlay(spec: OverlaySpec): string;
  *  dialog or popup. A kept window closed this way stays closed. */
 export function closeOverlay(id: string): null;
 
-/** Posts a notification. Shown by the `toast` mod (replaceable), which runs `action` when clicked.
- *  Herdr posts one itself when an agent needs you or finished while you weren't looking. Returns its id. */
+/** Posts a notification. Shown by the `toast` mod (replaceable), which runs `action` when clicked,
+ *  and kept in the bell's history (source "mods", from this mod's folder). Herdr posts its own too
+ *  (an agent needs you, a download, a failure). `key`: a repeat bumps the same item. `keep`: stored
+ *  in the history (default: warnings, errors, and anything shown longer than 3 s). `private`: toast
+ *  only, never stored. Do Not Disturb or a muted source shows no toast. Returns the toast's id. */
 export function notify(n: {
   title: string;
   body?: string;
@@ -370,7 +379,46 @@ export function notify(n: {
   timeout?: number;
   icon?: string;
   action?: { name: string; args?: Record<string, unknown> };
+  key?: string;
+  keep?: boolean;
+  private?: boolean;
 }): string;
+
+/** One entry of the bell's history, newest first. `stale`: its action points at a terminal or agent
+ *  from before a restart, so it can't run. */
+export interface Notification {
+  id: string;
+  ts: number;
+  source: "agents" | "machines" | "browser" | "updates" | "mods" | "app";
+  from: string;
+  title: string;
+  body: string;
+  level: "info" | "success" | "warning" | "error";
+  icon?: string;
+  action?: { name: string; args?: Record<string, unknown> };
+  key?: string;
+  count: number;
+  read: boolean;
+  stale: boolean;
+}
+
+/** The bell's history; reading it in render re-renders on change. A mod sees only its own items
+ *  unless its mod.json has `"permissions": { "notifications": "all" }`; only such a mod gets
+ *  `settings`. */
+export function notifications(): {
+  unread: number;
+  items: Notification[];
+  settings?: { dnd: boolean; muted_sources: string[] };
+};
+
+/** Marks notifications read: an id, "all", or { source }. Own items only without the permission. */
+export function markRead(target: string | { source: string }): null;
+
+/** Deletes notifications: an id, "all", or { source }. Own items only without the permission. */
+export function clearNotifications(target: string | { source: string }): null;
+
+/** Do Not Disturb (`dnd`) or one source muted. Needs `"permissions": { "notifications": "all" }`. */
+export function setNotificationMute(m: { dnd?: boolean; source?: string; muted?: boolean }): null;
 
 /** The props this copy of the mod was given in the layout (or overlay).
  *  A layout's terminal_menu mod gets {tab: "pane", target: {pane: string, terminal: string}, overlay: string}.
@@ -388,15 +436,40 @@ export function setShared(key: string, value: unknown): null;
 
 /**
  * Waits for the next key command for this mod ("alt-s": "<mod>:<command>" in keys.json).
+ * With "focusable": true in mod.json, pane.go can move onto this copy and send "focus".
+ * Focus your own handle then (this.handle.focus()) and handle keys with on_key_down.
+ * The copy gets "focus" again when a popup over it closes. Leave with pane.go.
  *   cx.spawn(async (cx) => { for (;;) { const c = await nextCommand(); ...; cx.notify(); } });
  */
 export function nextCommand(): Promise<string>;
 
 /**
- * Waits for the next changes under a folder (recursive) and returns the changed paths
- * (absolute). Changes that came since the last call return at once, so none are missed;
- * a save's events come as one batch. One OS watcher per folder, shared by every mod.
+ * Waits for changes under a folder and returns absolute paths in batches.
+ * On Linux, Git-ignored directories and Git's object database are skipped; trees
+ * above 4096 non-ignored directories reject the watch, so use a timer fallback.
+ * macOS and Windows watch recursively, including ignored directories.
+ * Pending paths are bounded: a batch containing the root means refresh everything.
+ * Shared by every mod. Files also refreshes on its 10-second timer.
  *   cx.spawn(async (cx) => { for (;;) { await watchFolder(dir); this.reload(); cx.notify(); } });
  * Watch what you show, not a whole home folder (node_modules is a lot of events).
  */
 export function watchFolder(path: string): Promise<string[]>;
+
+/**
+ * Plays this mod copy's video element with this `.id()` (macOS; another copy's same id is a
+ * different clip). A clip shows a still until played; at most 4 play at once (the one playing
+ * longest pauses), and one outside its window's visible area for a second pauses. Throws when no
+ * such video is on screen.
+ */
+export function videoPlay(id: string): null;
+/** Pauses it: the player is released and the last frame stays. */
+export function videoPause(id: string): null;
+/** Moves it to `seconds` (a paused clip shows that frame). */
+export function videoSeek(id: string, seconds: number): null;
+/**
+ * The next event of that video: `{id, type, time, duration, error?}`, type `ready`, `time`
+ * (4 a second while playing), `paused`, `ended` or `error`. Throws when no such video is on screen;
+ * rejects when the video goes away (its element left, or its path changed).
+ *   cx.spawn(async (cx) => { for (;;) { const e = await nextVideoEvent("board-clip-1"); ...; cx.notify(); } });
+ */
+export function nextVideoEvent(id: string): Promise<{ id: string; type: "ready" | "time" | "paused" | "ended" | "error"; time: number; duration: number | null; error?: string }>;

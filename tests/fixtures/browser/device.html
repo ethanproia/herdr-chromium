@@ -1,0 +1,8 @@
+<!doctype html><title>device</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<div id="tap" style="position:absolute;left:0;top:0;width:100%;height:100%"></div>
+<script>
+window.__touched = false;
+document.addEventListener("touchstart", () => { window.__touched = true; }, { passive: true });
+window.__report = () => JSON.stringify({ w: innerWidth, dpr: devicePixelRatio, coarse: matchMedia("(pointer: coarse)").matches, mobile: /Mobile/.test(navigator.userAgent), touched: window.__touched });
+</script>

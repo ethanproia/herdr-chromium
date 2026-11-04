@@ -1,0 +1,19 @@
+{
+  "place": "none",
+  "title": "Core",
+  "focusable": true,
+  "permissions": {
+    "notifications": "all"
+  },
+  "overlay": {
+    "width": 260,
+    "height": 272
+  },
+  "version": "0.1.0",
+  "source": {
+    "repo": "essexlabs/labs",
+    "branch": "ethan/herdr-core-retire",
+    "commit": "f3ab809ed6c5aaffa42ca54f4e5bc14bc5f936a4",
+    "path": "projects/herdr-mods/core"
+  }
+}

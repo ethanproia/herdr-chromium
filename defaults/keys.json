@@ -1,5 +1,6 @@
 {
   "global": {
+    "ctrl-shift-y": "mod.open:fork-board",
     "alt-1": "space.select:1",
     "alt-2": "space.select:2",
     "alt-3": "space.select:3",
@@ -42,16 +43,17 @@
     "ctrl-shift-pageup": "space.prev",
     "alt-down": "agent.next",
     "alt-up": "agent.prev",
+    "ctrl-?": "app.help",
     "ctrl-shift-/": "app.help",
     "ctrl-shift-?": "app.help",
-    "ctrl-shift-b": "layout.toggle:sidebar",
+    "ctrl-shift-b": "fork-core.toggle-sidebar",
     "ctrl-shift-n": "space.new",
     "ctrl-shift-t": "tab.new",
     "ctrl-shift-k": "mod.open:picker",
     "ctrl-shift-p": "app.palette",
     "ctrl-,": "app.settings",
-    "ctrl-shift-o": "pane.split:right",
-    "ctrl-shift-e": "pane.split:down",
+    "ctrl-shift-o": "fork-core.split-right",
+    "ctrl-shift-e": "fork-core.split-down",
     "ctrl-shift-w": "tab.close",
     "ctrl-shift-x": "pane.close",
     "ctrl-shift-z": "pane.zoom",
@@ -60,11 +62,15 @@
     "shift-f2": "space.rename"
   },
   "terminal": {
+    "ctrl-shift-y": "mod.open:fork-board",
     "ctrl-backspace": "send:\u0017",
     "ctrl-left": "send:\u001bb",
     "ctrl-right": "send:\u001bf",
     "ctrl-shift-c": "terminal.copy",
     "ctrl-shift-v": "terminal.paste",
-    "ctrl-v": "terminal.paste_image"
+    "ctrl-shift-f": "terminal.search",
+    "ctrl-v": "terminal.paste_image",
+    "ctrl-insert": "terminal.copy",
+    "shift-insert": "terminal.paste"
   }
 }

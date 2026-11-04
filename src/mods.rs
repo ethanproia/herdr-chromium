@@ -7,8 +7,10 @@ use gpui_shell::{Capabilities, ExecuteGrant, HostError, HostModule, HostObject, 
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::rc::{Rc, Weak};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 
@@ -76,7 +78,9 @@ pub fn write_workspace() -> std::io::Result<()> {
         std::fs::create_dir_all(file.parent().unwrap())?;
         std::fs::write(&file, bytes)?;
     }
-    sync_defaults(&mods_dir(), &dir.join("installed.json"), DEFAULT_MODS)
+    sync_defaults(&mods_dir(), &dir.join("installed.json"), DEFAULT_MODS)?;
+    // HERDR: each mod's own keys.json joins the home's (src/mod_keys.rs).
+    crate::mod_keys::merge(&dir)
 }
 
 static SYNC_NOTES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
@@ -338,6 +342,15 @@ pub struct Hint {
     pub place: Option<String>,
     #[serde(default)]
     pub size: Option<f32>,
+    /// The narrowest and shortest its pane should get (DIPs): splits and divider drags keep it;
+    /// a window too small for every minimum squeezes it, down to 24.
+    #[serde(default)]
+    pub min_width: Option<f32>,
+    #[serde(default)]
+    pub min_height: Option<f32>,
+    /// `pane.go` can give it the keyboard.
+    #[serde(default)]
+    pub focusable: bool,
 }
 
 #[derive(Clone)]
@@ -349,8 +362,24 @@ pub struct Found {
 }
 
 /// Every mod folder that has a main.js.
+// HERDR: settings `mods_disabled`: names the app treats as not installed.
+pub fn disabled() -> std::collections::BTreeSet<String> {
+    crate::settings::load_person().map(|p| p.mods_disabled.into_iter().collect()).unwrap_or_default()
+}
+
+// HERDR: why a mod name isn't available, for errors.
+pub fn missing(name: &str) -> String {
+    if disabled().contains(name) {
+        format!("mod {name:?} is turned off (settings mods_disabled)")
+    } else {
+        format!("no mod {name:?} in mods/")
+    }
+}
+
 pub fn scan() -> Vec<Found> {
+    let off = disabled();
     let mut found = scan_dir(&mods_dir(), "");
+    found.retain(|f| !off.contains(&f.id));
     found.extend(scan_dir(&frame_dir(), "frame-"));
     found.sort_by(|a, b| a.id.cmp(&b.id));
     found
@@ -386,6 +415,9 @@ pub enum Request {
     OpenOverlay { id: String, spec: Value },
     CloseOverlay { id: String },
     Refresh,
+    /// HERDR: a mod's notification call (`post`, `read`, `clear`, `mute`). `owner`: the mod's
+    /// folder when it lacks `"permissions": { "notifications": "all" }` (its own items only).
+    Notes { op: &'static str, arg: Value, folder: String, owner: Option<String> },
     /// From `herdr-app do` / `herdr-app status` (control.rs); answer on `reply`.
     Control { cmd: Value, reply: std::sync::mpsc::Sender<Value> },
 }
@@ -545,6 +577,8 @@ thread_local! {
     /// The copies on screen: only they get commands (a hidden copy kept alive must
     /// not act on the person's keys).
     static SHOWN_COPIES: RefCell<std::collections::HashSet<u64>> = RefCell::new(std::collections::HashSet::new());
+    static LIVE_READS: RefCell<HashMap<u64, Weak<RefCell<LiveReads>>>> = RefCell::new(HashMap::new());
+    static REVISIONS: RefCell<HashMap<&'static str, u64>> = RefCell::new(HashMap::new());
     static COPY_SEQ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static OVERLAY_SEQ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
@@ -562,42 +596,47 @@ pub struct Snapshot {
     pub floats: Value,
     /// { platform, titlebar, buttons, maximized, fullscreen, active }.
     pub window: Value,
+    /// HERDR: the bell's history, `{ unread, items, settings }` (src/notifications.rs `view`).
+    pub notifications: Value,
 }
 
 impl Default for Snapshot {
     /// Lists start empty, never null, so mods can map over them right away.
     fn default() -> Self {
-        Snapshot { layout: Value::Null, spaces: json!([]), machines: json!([]), agents: json!([]), panes: json!([]), terminals: json!([]), focused: Value::Null, floats: json!({}), window: Value::Null }
+        Snapshot { layout: Value::Null, spaces: json!([]), machines: json!([]), agents: json!([]), panes: json!([]), terminals: json!([]), focused: Value::Null, floats: json!({}), window: Value::Null, notifications: json!({ "unread": 0, "items": [], "settings": null }) }
     }
 }
 
 /// Replaces one part of the snapshot; returns whether it changed.
-pub fn publish(set: impl FnOnce(&mut Snapshot) -> (Value, Value)) -> bool {
-    SNAPSHOT.with(|s| {
-        let mut s = s.borrow_mut();
-        let (old, new) = set(&mut s);
+fn publish(key: &'static str, set: impl FnOnce(&mut Snapshot) -> (Value, Value)) -> bool {
+    let changed = SNAPSHOT.with(|s| {
+        let (old, new) = set(&mut s.borrow_mut());
         old != new
-    })
+    });
+    if changed {
+        REVISIONS.with_borrow_mut(|r| *r.entry(key).or_default() += 1);
+    }
+    changed
 }
 
 pub fn publish_layout(layout: &Node) -> bool {
     let v = serde_json::to_value(layout).unwrap_or(Value::Null);
-    publish(|s| (std::mem::replace(&mut s.layout, v.clone()), v))
+    publish("layout", |s| (std::mem::replace(&mut s.layout, v.clone()), v))
 }
 pub fn publish_machines(v: Value) -> bool {
-    publish(|s| (std::mem::replace(&mut s.machines, v.clone()), v))
+    publish("machines", |s| (std::mem::replace(&mut s.machines, v.clone()), v))
 }
 pub fn publish_spaces(v: Value) -> bool {
-    publish(|s| (std::mem::replace(&mut s.spaces, v.clone()), v))
+    publish("spaces", |s| (std::mem::replace(&mut s.spaces, v.clone()), v))
 }
 pub fn publish_agents(v: Value) -> bool {
-    publish(|s| (std::mem::replace(&mut s.agents, v.clone()), v))
+    publish("agents", |s| (std::mem::replace(&mut s.agents, v.clone()), v))
 }
 pub fn publish_panes(v: Value) -> bool {
-    publish(|s| (std::mem::replace(&mut s.panes, v.clone()), v))
+    publish("panes", |s| (std::mem::replace(&mut s.panes, v.clone()), v))
 }
 pub fn publish_terminals(v: Value) -> bool {
-    publish(|s| (std::mem::replace(&mut s.terminals, v.clone()), v))
+    publish("terminals", |s| (std::mem::replace(&mut s.terminals, v.clone()), v))
 }
 pub fn terminal_address(word: &str, source: &str) -> Option<String> {
     SNAPSHOT.with(|s| {
@@ -608,17 +647,53 @@ pub fn terminal_address(word: &str, source: &str) -> Option<String> {
 }
 
 pub fn publish_floats(v: Value) -> bool {
-    publish(|s| (std::mem::replace(&mut s.floats, v.clone()), v))
+    publish("floats", |s| (std::mem::replace(&mut s.floats, v.clone()), v))
 }
 pub fn publish_window(v: Value) -> bool {
-    publish(|s| (std::mem::replace(&mut s.window, v.clone()), v))
+    publish("window", |s| (std::mem::replace(&mut s.window, v.clone()), v))
+}
+pub fn publish_notifications(v: Value) -> bool {
+    publish("notifications", |s| (std::mem::replace(&mut s.notifications, v.clone()), v))
 }
 pub fn publish_focused(v: Value) -> bool {
-    publish(|s| (std::mem::replace(&mut s.focused, v.clone()), v))
+    publish("focused", |s| (std::mem::replace(&mut s.focused, v.clone()), v))
 }
 
-fn read(f: impl FnOnce(&Snapshot) -> &Value) -> HostValue {
+#[derive(Default)]
+struct LiveReads(HashMap<&'static str, u64>);
+
+impl LiveReads {
+    fn record(&mut self, key: &'static str, revisions: &HashMap<&'static str, u64>) {
+        self.0.entry(key).or_insert_with(|| revisions.get(key).copied().unwrap_or(0));
+    }
+
+    fn changed(&mut self, revisions: &HashMap<&'static str, u64>) -> bool {
+        let mut changed = false;
+        for (key, seen) in &mut self.0 {
+            let revision = revisions.get(key).copied().unwrap_or(0);
+            changed |= *seen != revision;
+            *seen = revision;
+        }
+        changed
+    }
+}
+
+fn read(reads: &RefCell<LiveReads>, key: &'static str, f: impl FnOnce(&Snapshot) -> &Value) -> HostValue {
+    REVISIONS.with_borrow(|r| reads.borrow_mut().record(key, r));
     SNAPSHOT.with(|s| to_host(f(&s.borrow())))
+}
+
+fn reader(reads: Rc<RefCell<LiveReads>>, key: &'static str, f: fn(&Snapshot) -> &Value) -> impl Fn(&gpui_shell::HostArguments) -> gpui_shell::HostResult {
+    move |_| Ok(read(&reads, key, f))
+}
+
+/// Reads in callbacks and child views count too: keep their dependencies until the copy unloads.
+pub fn snapshot_changed(copy: u64) -> bool {
+    LIVE_READS.with_borrow(|copies| {
+        copies.get(&copy).and_then(Weak::upgrade).is_some_and(|reads| {
+            REVISIONS.with_borrow(|r| reads.borrow_mut().changed(r))
+        })
+    })
 }
 
 /// Delivers `command` to every shown copy of `mod`. Returns whether any listens.
@@ -634,6 +709,19 @@ pub fn send_command(name: &str, command: &str) -> bool {
             }
         }
         any
+    })
+}
+
+/// Delivers `command` to one shown copy (the block given the keyboard, not
+/// every copy of its mod).
+pub fn send_command_to(copy: u64, command: &str) -> bool {
+    if !SHOWN_COPIES.with(|s| s.borrow().contains(&copy)) {
+        return false;
+    }
+    COMMANDS.with(|c| {
+        let mut c = c.borrow_mut();
+        c.retain(|(_, _, tx)| !tx.is_closed());
+        c.iter().any(|(id, _, tx)| *id == copy && tx.try_send(command.to_owned()).is_ok())
     })
 }
 
@@ -764,11 +852,6 @@ pub fn run_here(command: &str, args: &[String]) -> Option<String> {
     run_blocking(command, args, None).ok().map(|(_, out, _)| out)
 }
 
-/// A program's output on another machine, if it ran.
-pub fn run_on(machine: &str, command: &str, args: &[String]) -> Option<String> {
-    run_remote(machine, command, args, None).ok().map(|(_, out, _)| String::from_utf8_lossy(&out).into_owned())
-}
-
 /// The agents a machine can start (`knownAgents()`), asked at most once a minute.
 fn known_agents(on: Option<String>, list: Vec<Value>) -> Value {
     type InstalledCache = std::collections::HashMap<Option<String>, (std::time::Instant, Vec<String>, Vec<String>)>;
@@ -803,7 +886,7 @@ fn read_remote(machine: &str, path: &str) -> Result<Option<String>, String> {
         return Ok(None);
     }
     if out.len() as u64 > crate::mod_files::LIMIT {
-        return Err("Text file exceeds 1 MiB".into());
+        return Err(format!("Text file exceeds {} MiB", crate::mod_files::LIMIT >> 20));
     }
     Ok(Some(String::from_utf8_lossy(&out).into_owned()))
 }
@@ -823,14 +906,35 @@ fn exec_future(command: String, args: Vec<String>, cwd: Option<String>, on: Opti
     }
 }
 
+/// HERDR: `"permissions": { "notifications": "all" }` in the mod's own mod.json.
+fn notes_all(name: &str) -> bool {
+    let dir = match name.strip_prefix("frame-") {
+        Some(f) => frame_dir().join(f),
+        None => mods_dir().join(name),
+    };
+    std::fs::read_to_string(dir.join("mod.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .is_some_and(|m| m["permissions"]["notifications"] == "all")
+}
+
 fn module(inst: Instance, copy: u64) -> HostModule {
+    let reads = Rc::new(RefCell::new(LiveReads::default()));
+    LIVE_READS.with_borrow_mut(|copies| {
+        copies.retain(|_, reads| reads.strong_count() > 0);
+        copies.insert(copy, Rc::downgrade(&reads));
+    });
     let props = inst.props.clone();
     let feedback_frame = inst.name == "frame-feedback";
     let feedback_from = inst.props.get("from").and_then(Value::as_str).unwrap_or("person").to_owned();
     let feedback_layout = inst.props.get("layout").and_then(Value::as_str).unwrap_or("other").to_owned();
+    // HERDR: only a mod whose mod.json says `"permissions": { "notifications": "all" }` (the bell
+    // panel) sees and changes every notification; any other sees only its own.
+    let note_owner = (!notes_all(&inst.name)).then(|| inst.name.clone());
     let (cmd_tx, commands) = async_channel::unbounded::<String>();
     COMMANDS.with(|c| c.borrow_mut().push((copy, inst.name.clone(), cmd_tx)));
-    HostModule::new("herdr")
+    // HERDR: video (`src/video.rs`).
+    crate::video::functions(HostModule::new("herdr"))
         .declarations(DECLARATIONS)
         .async_function("exec", |a| {
             let command = a.string(0)?.to_owned();
@@ -936,8 +1040,15 @@ fn module(inst: Instance, copy: u64) -> HostModule {
             crate::sound::play(a.string(0)?);
             Ok(HostValue::Null)
         })
-        .function("run", |a| {
+        .function("run", {
+            // HERDR: the bell's global commands (read all, clear all, DND) are the person's, or the
+            // bell panel's (`"permissions": { "notifications": "all" }`), never any other mod's.
+            let notes_all = note_owner.is_none();
+            move |a| {
             let name = a.string(0)?.to_owned();
+            if name.starts_with("notifications.") && !notes_all {
+                return Err(HostError::new(format!("{name} needs \"permissions\": {{ \"notifications\": \"all\" }} in mod.json")));
+            }
             let args = a.get(1).map(from_host).unwrap_or(Value::Null);
             if let Some(command) = crate::commands::find(&name) {
                 crate::commands::validate_args(command, &args).map_err(HostError::new)?;
@@ -951,18 +1062,19 @@ fn module(inst: Instance, copy: u64) -> HostModule {
                 request(Request::Run { name, args });
             }
             Ok(HostValue::Null)
+            }
         })
-        .function("spaces", |_| Ok(read(|s| &s.spaces)))
-        .function("machines", |_| Ok(read(|s| &s.machines)))
-        .function("agents", |_| Ok(read(|s| &s.agents)))
-        .function("panes", |_| Ok(read(|s| &s.panes)))
+        .function("spaces", reader(reads.clone(), "spaces", |s| &s.spaces))
+        .function("machines", reader(reads.clone(), "machines", |s| &s.machines))
+        .function("agents", reader(reads.clone(), "agents", |s| &s.agents))
+        .function("panes", reader(reads.clone(), "panes", |s| &s.panes))
         .function("setAgentOrder", |a| {
             AGENT_ORDER.with(|s| *s.borrow_mut() = strings(a.get(0)));
             Ok(HostValue::Null)
         })
-        .function("terminals", |_| Ok(read(|s| &s.terminals)))
-        .function("focused", |_| Ok(read(|s| &s.focused)))
-        .function("layout", |_| Ok(read(|s| &s.layout)))
+        .function("terminals", reader(reads.clone(), "terminals", |s| &s.terminals))
+        .function("focused", reader(reads.clone(), "focused", |s| &s.focused))
+        .function("layout", reader(reads.clone(), "layout", |s| &s.layout))
         .function("layouts", |_| Ok(to_host(&json!(crate::window::layout_names()))))
         .function("commands", |_| {
             let list: Vec<Value> = crate::commands::COMMANDS
@@ -974,7 +1086,7 @@ fn module(inst: Instance, copy: u64) -> HostModule {
                 .collect();
             Ok(to_host(&Value::Array(list)))
         })
-        .function("window", |_| Ok(read(|s| &s.window)))
+        .function("window", reader(reads.clone(), "window", |s| &s.window))
         .function("theme", |_| Ok(to_host(&serde_json::to_value(&*crate::settings::theme()).unwrap_or(Value::Null))))
         .function("settings", |_| Ok(to_host(&serde_json::to_value(&*crate::settings::get()).unwrap_or(Value::Null))))
         .function("keys", |_| {
@@ -999,15 +1111,56 @@ fn module(inst: Instance, copy: u64) -> HostModule {
             request(Request::CloseOverlay { id: a.string(0)?.to_owned() });
             Ok(HostValue::Null)
         })
-        .function("notify", |a| {
-            let id = new_overlay_id();
-            let n = from_host(a.value(0)?);
-            request(Request::OpenOverlay { id: id.clone(), spec: json!({ "kind": "toast", "notification": n }) });
-            Ok(id.into())
+        // HERDR: notify posts through the bell's history (the window decides on the toast);
+        // a mod always posts as source "mods", from its own folder.
+        .function("notify", {
+            let folder = inst.name.clone();
+            move |a| {
+                let id = new_overlay_id();
+                let mut n = from_host(a.value(0)?);
+                // HERDR: an object or nothing (indexing a string or list would panic).
+                let Some(fields) = n.as_object_mut() else { return Err(HostError::new("notify needs an object: { title, body, ... }")) };
+                fields.insert("toast_id".into(), json!(id));
+                request(Request::Notes { op: "post", arg: n, folder: folder.clone(), owner: None });
+                Ok(id.into())
+            }
+        })
+        .function("notifications", {
+            let reads = reads.clone();
+            let owner = note_owner.clone();
+            move |_| {
+                REVISIONS.with_borrow(|r| reads.borrow_mut().record("notifications", r));
+                Ok(SNAPSHOT.with(|s| to_host(&crate::notifications::scope(&s.borrow().notifications, owner.as_deref()))))
+            }
+        })
+        .function("markRead", {
+            let (folder, owner) = (inst.name.clone(), note_owner.clone());
+            move |a| {
+                request(Request::Notes { op: "read", arg: from_host(a.value(0)?), folder: folder.clone(), owner: owner.clone() });
+                Ok(HostValue::Null)
+            }
+        })
+        .function("clearNotifications", {
+            let (folder, owner) = (inst.name.clone(), note_owner.clone());
+            move |a| {
+                request(Request::Notes { op: "clear", arg: from_host(a.value(0)?), folder: folder.clone(), owner: owner.clone() });
+                Ok(HostValue::Null)
+            }
+        })
+        .function("setNotificationMute", {
+            let (folder, owner) = (inst.name.clone(), note_owner.clone());
+            move |a| {
+                if owner.is_some() {
+                    return Err(HostError::new("setNotificationMute needs \"permissions\": { \"notifications\": \"all\" } in mod.json"));
+                }
+                request(Request::Notes { op: "mute", arg: from_host(a.value(0)?), folder: folder.clone(), owner: None });
+                Ok(HostValue::Null)
+            }
         })
         .function("placement", {
             let float = props.get("float").and_then(Value::as_str).map(str::to_owned);
-            move |_| Ok(float.as_ref().map_or(HostValue::Null, |id| read(|s| s.floats.get(id).unwrap_or(&Value::Null))))
+            let reads = reads.clone();
+            move |_| Ok(float.as_ref().map_or(HostValue::Null, |id| read(&reads, "floats", |s| s.floats.get(id).unwrap_or(&Value::Null))))
         })
         .function("props", move |_| Ok(to_host(&props)))
         .function("shared", |a| {
@@ -1115,6 +1268,80 @@ pub fn prepare_load(inst: &Instance) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_reads_ignore_unread_inputs_and_keep_pending_changes() {
+        let mut revisions = HashMap::new();
+        let mut list = LiveReads::default();
+        let mut chrome = LiveReads::default();
+        list.record("agents", &revisions);
+        chrome.record("layout", &revisions);
+        revisions.insert("terminals", 1);
+        assert!(!list.changed(&revisions));
+        assert!(!chrome.changed(&revisions));
+        revisions.insert("agents", 1);
+        // A callback reading the new snapshot must not swallow a pending redraw.
+        list.record("agents", &revisions);
+        assert!(list.changed(&revisions));
+        assert!(!chrome.changed(&revisions));
+        assert!(!list.changed(&revisions));
+        // Dependencies first read by a child or a callback remain subscribed.
+        list.record("focused", &revisions);
+        revisions.insert("focused", 1);
+        assert!(list.changed(&revisions));
+    }
+
+    #[test]
+    fn equal_snapshots_do_not_refresh_readers() {
+        std::thread::spawn(|| {
+            let reads = Rc::new(RefCell::new(LiveReads::default()));
+            LIVE_READS.with_borrow_mut(|copies| { copies.insert(1, Rc::downgrade(&reads)); });
+            read(&reads, "agents", |s| &s.agents);
+            assert!(!snapshot_changed(1));
+            assert!(!publish_agents(json!([])));
+            assert!(!snapshot_changed(1));
+            assert!(publish_terminals(json!([{"address":"t1"}])));
+            assert!(!snapshot_changed(1));
+            assert!(publish_agents(json!([{"address":"t1","status":"working"}])));
+            assert!(snapshot_changed(1));
+            assert!(!snapshot_changed(1));
+            assert!(!publish_agents(json!([{"address":"t1","status":"working"}])));
+            assert!(!snapshot_changed(1));
+            drop(reads);
+            assert!(!snapshot_changed(1));
+        }).join().unwrap();
+    }
+
+    #[test]
+    fn keyboard_focus_is_opt_in_and_commands_only_reach_the_shown_copy() {
+        for metadata in [json!({}), json!({"focusable": false})] {
+            assert!(!serde_json::from_value::<Hint>(metadata).unwrap().focusable);
+        }
+        assert!(serde_json::from_value::<Hint>(json!({"focusable": true})).unwrap().focusable);
+
+        let (first_tx, first) = async_channel::unbounded();
+        let (second_tx, second) = async_channel::unbounded();
+        let (hidden_tx, hidden) = async_channel::unbounded();
+        COMMANDS.with_borrow_mut(|c| *c = vec![
+            (1, "same-mod".into(), first_tx),
+            (2, "same-mod".into(), second_tx),
+            (3, "same-mod".into(), hidden_tx),
+        ]);
+        set_shown_copies([1, 2].into());
+        assert!(send_command_to(2, "focus"));
+        assert_eq!(second.try_recv().unwrap(), "focus");
+        assert!(first.is_empty());
+        assert!(hidden.is_empty());
+        assert!(!send_command_to(3, "focus"));
+        assert!(!send_command_to(99, "focus"));
+        // Existing mod key bindings still broadcast to every shown copy.
+        assert!(send_command("same-mod", "existing-key"));
+        assert_eq!(first.try_recv().unwrap(), "existing-key");
+        assert_eq!(second.try_recv().unwrap(), "existing-key");
+        assert!(hidden.is_empty());
+        COMMANDS.with_borrow_mut(Vec::clear);
+        set_shown_copies(Default::default());
+    }
 
     #[cfg(unix)]
     #[test]

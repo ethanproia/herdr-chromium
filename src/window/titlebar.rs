@@ -40,6 +40,13 @@ impl AppWindow {
 
     /// Makes the window match the shown layout's title bar. Cheap; runs on every render.
     pub(super) fn apply_titlebar(&mut self, window: &mut Window) {
+        // HERDR: glass blurs what's behind the window (macOS); off, the window is opaque.
+        let glass = cfg!(target_os = "macos") && crate::settings::get().glass;
+        // Off from the start leaves the window as it opened (opaque), untouched.
+        if self.glass_applied.unwrap_or(false) != glass {
+            self.glass_applied = Some(glass);
+            window.set_background_appearance(if glass { WindowBackgroundAppearance::Blurred } else { WindowBackgroundAppearance::Opaque });
+        }
         let want = (self.titlebar(), self.chrome.traffic_lights);
         if self.titlebar_applied == Some(want) {
             return;
@@ -193,6 +200,21 @@ impl AppWindow {
             }
             div().size_full().relative().flex().child(tree).children(grips).into_any_element()
         }
+    }
+
+    /// `window.native`: the title bar flags as AppKit sees them (macOS only).
+    pub(super) fn window_native(window: &Window) -> Result<Value, String> {
+        #[cfg(target_os = "macos")]
+        if let Some(f) = super::native_titlebar::titlebar_flags(window) {
+            return Ok(json!({
+                "titlebar_transparent": f.transparent,
+                "full_size_content": f.full_size_content,
+                "title_hidden": f.title_hidden,
+                "fullscreen": f.fullscreen,
+            }));
+        }
+        let _ = window;
+        Err("window.native: macOS only".into())
     }
 
     pub(super) fn window_command(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {

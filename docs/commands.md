@@ -19,7 +19,7 @@ Mods can add their own actions, which are not listed here.
 
 ## `space.new`
 
-Make a space: its name (default: none, so it's called after where its first terminal is), the folder its terminals start in (default: the focused terminal's), its first tab's name (default: none, so it's called by its number), optionally an agent (argv) and its first message (task), and the machine it lives on (`hc machine ls`; default this one; its terminals start in that machine's home unless folder).
+Make a space: its name (default: none, so it's called after where its first terminal is), the folder its terminals start in (default: the focused terminal's), its first tab's name (default: none, so it's called by its number), optionally an agent (argv) and its first message (task), and the machine it lives on (`hc machine ls`; default the focused space's machine for keys and clicks, this computer for scripts; empty string: this computer; its terminals start in that machine's home unless folder).
 
 | Argument | Required |
 |---|---|
@@ -59,7 +59,7 @@ Move a space to a position (1 = first).
 
 ## `tab.new`
 
-Make a tab in a space (default: the selected one; name default: none, so it's called by its number) with a terminal in folder (default: the focused terminal's), optionally an agent (argv) and its first message (task); or with a mod as its only pane (`mod`, its `props`: a file, a board).
+Make a tab in a space (default: the selected one; name default: none, so it's called by its number) with a terminal in folder (default: the focused terminal's), optionally an agent (argv) and its first message (task); or with a mod as its only pane (`mod`, its `props`: a file, a board). With no space open, a person's new tab starts a space (as space.new).
 
 | Argument | Required |
 |---|---|
@@ -155,6 +155,15 @@ Where right-clicks in a terminal (default: the focused one) go when its program 
 | `to` | yes |
 | `terminal` | no |
 
+## `terminal.pin`
+
+Pin an agent to the top of the agent lists (pinned true) or unpin it (false). Pins are kept with the terminal, so every Herdr client shows them, and end with it.
+
+| Argument | Required |
+|---|---|
+| `terminal` | yes |
+| `pinned` | yes |
+
 ## `terminal.kill`
 
 End a terminal and its sub-agents.
@@ -240,7 +249,7 @@ Focus a pane (or the pane showing a terminal).
 
 ## `pane.go`
 
-Focus the pane to the "left", "right", "up" or "down".
+Focus the pane or focusable mod to the "left", "right", "up" or "down".
 
 | Argument | Required |
 |---|---|
@@ -273,9 +282,20 @@ Show a terminal in a pane for now, in place of its own (no terminal: back).
 
 ## `terminal.copy`
 
-Copy the focused terminal's selection.
+Copy the focused terminal's selection. With nothing selected, that key goes to the program.
 
 No arguments.
+
+## `terminal.scroll`
+
+Scroll a terminal's view of its history (default: the focused one). Give exactly one of: lines (a whole number; negative goes up, toward history), pages (a number, fractions allowed; one page is the terminal's rows), to: "top" (oldest history) or "bottom" (the live screen). This scrolls Herdr's view, not the program.
+
+| Argument | Required |
+|---|---|
+| `lines` | no |
+| `pages` | no |
+| `to` | no |
+| `terminal` | no |
 
 ## `terminal.paste`
 
@@ -286,6 +306,12 @@ No arguments.
 ## `terminal.paste_image`
 
 Ctrl+V: the clipboard's image as a file on the focused terminal's machine, when that's another one; on Windows, paste clipboard text; otherwise Ctrl+V goes to the terminal.
+
+No arguments.
+
+## `terminal.search`
+
+Search the focused terminal's screen and scrollback; the find bar and query stay with that terminal.
 
 No arguments.
 
@@ -396,7 +422,7 @@ Reset a shipped layout and its clicks (the old file is kept aside).
 
 ## `mod.open`
 
-Open a mod as the overlay its mod.json describes.
+Toggle a mod as the overlay its mod.json describes; calling again closes it.
 
 | Argument | Required |
 |---|---|
@@ -410,9 +436,182 @@ Close an overlay (default: the top dialog or popup).
 |---|---|
 | `id` | no |
 
+## `browser.open`
+
+Open a browser block at url (place "tab", default, or "right"/"down" of the focused pane) with its own cookies and logins (profile, default "agent"; "default" is the person's); answers its id.
+
+| Argument | Required |
+|---|---|
+| `url` | no |
+| `place` | no |
+| `profile` | no |
+
+## `browser.navigate`
+
+Load url in a browser (id, or the one in pane; default: the focused browser).
+
+| Argument | Required |
+|---|---|
+| `url` | yes |
+| `id` | no |
+| `pane` | no |
+
+## `browser.back`
+
+Go back in a browser's history.
+
+| Argument | Required |
+|---|---|
+| `id` | no |
+| `pane` | no |
+
+## `browser.forward`
+
+Go forward in a browser's history.
+
+| Argument | Required |
+|---|---|
+| `id` | no |
+| `pane` | no |
+
+## `browser.device`
+
+Preview a browser as a device (responsive mode): name "iPhone 15", "Pixel 8" or "iPad Air", or a custom w and h (scale optional); off: true goes back. The page gets that real viewport; named devices also get their mobile user agent and touch.
+
+| Argument | Required |
+|---|---|
+| `id` | no |
+| `pane` | no |
+| `name` | no |
+| `w` | no |
+| `h` | no |
+| `scale` | no |
+| `off` | no |
+
+## `browser.reload`
+
+Reload a browser's page (ignore_cache: true skips the cache).
+
+| Argument | Required |
+|---|---|
+| `id` | no |
+| `pane` | no |
+| `ignore_cache` | no |
+
+## `browser.stop`
+
+Stop loading a browser's page.
+
+| Argument | Required |
+|---|---|
+| `id` | no |
+| `pane` | no |
+
+## `browser.screenshot`
+
+Save a full-resolution PNG of a browser's page to path (default: browser/shots/ in the app's home); answers the path.
+
+| Argument | Required |
+|---|---|
+| `id` | no |
+| `pane` | no |
+| `path` | no |
+
+## `browser.eval`
+
+Run JavaScript in a browser's page; answers its value.
+
+| Argument | Required |
+|---|---|
+| `expr` | yes |
+| `id` | no |
+| `pane` | no |
+
+## `browser.find`
+
+Find text in a browser's page (answers the match count); no text ends the find.
+
+| Argument | Required |
+|---|---|
+| `text` | no |
+| `id` | no |
+| `pane` | no |
+| `forward` | no |
+| `match_case` | no |
+| `next` | no |
+
+## `browser.close`
+
+Close a browser block (default: the focused browser).
+
+| Argument | Required |
+|---|---|
+| `id` | no |
+| `pane` | no |
+
+## `browser.pick`
+
+Ask the person to pick an element in a browser (it enters pick mode); answers when they click: its selector, trimmed HTML, box, text, key styles and a cropped screenshot. With x and y (page DIPs), captures the element there at once.
+
+| Argument | Required |
+|---|---|
+| `id` | no |
+| `pane` | no |
+| `x` | no |
+| `y` | no |
+
+## `browser.annotations`
+
+What the person sent from a browser (Send: comments, markup, a picture; default: from any block): the newest batch, or with wait the next one. Page fields are listed as untrusted.
+
+| Argument | Required |
+|---|---|
+| `id` | no |
+| `pane` | no |
+| `wait` | no |
+
+## `browser.lock`
+
+An agent takes a browser (on, default true): the person's input there is refused with a visible "<agent> is driving · Take Control" strip until the agent unlocks (on: false) or the person takes control.
+
+| Argument | Required |
+|---|---|
+| `id` | no |
+| `pane` | no |
+| `agent` | no |
+| `on` | no |
+
+## `browser.new`
+
+Open a browser. From the + menu, cmd-shift-b or the pane menu it is the person's own (profile "default", their logins); through `herdr-app do` it is an agent-profile browser (never their logins). A new tab (place "tab", default) or "right"/"down" of pane (else the focused pane).
+
+| Argument | Required |
+|---|---|
+| `url` | no |
+| `place` | no |
+| `pane` | no |
+
+## `browser.remote`
+
+Open a remote desktop: the person's + menu only (not `herdr-app do`, where browser.* goes to the agent and an agent must not start the bridge). Starts the labs bridge (labs_checkout in settings.json) and opens its page in a new browser block with raw chords (Cmd+A/Z go to the remote machine). No machine: the page asks.
+
+| Argument | Required |
+|---|---|
+| `machine` | no |
+
+## `browser.devtools`
+
+Open a browser's DevTools (open: false closes them).
+
+| Argument | Required |
+|---|---|
+| `id` | no |
+| `pane` | no |
+| `open` | no |
+
 ## `app.help`
 
-Show the keys.
+Toggle the keys dialog.
 
 No arguments.
 
@@ -439,7 +638,25 @@ Draft feedback for the person to review and send (from: person or agent).
 
 ## `app.palette`
 
-Open the command palette: every command by name, with its key.
+Toggle the command palette: every command by name, with its key; calling again closes it.
+
+No arguments.
+
+## `notifications.read_all`
+
+Mark every notification in the bell read.
+
+No arguments.
+
+## `notifications.clear_all`
+
+Delete every notification in the bell's history.
+
+No arguments.
+
+## `notifications.toggle_dnd`
+
+Turn Do Not Disturb on or off: no toasts or sounds; the bell still counts.
 
 No arguments.
 
@@ -540,6 +757,12 @@ No arguments.
 ## `window.maximize`
 
 Maximize the window, or back.
+
+No arguments.
+
+## `window.native`
+
+macOS: the title bar as the system sees it (see-through, full-size content, title hidden, fullscreen), for checking it.
 
 No arguments.
 

@@ -1455,6 +1455,10 @@ const ELEMENT_METHODS: &str = r#"    /**
     on_mouse_down_out<Self extends Element>(this: Self, handler: (event: MouseButtonEvent, cx: Context) => void): Self;
     /** Files dropped from outside the app, as absolute paths. Use on a plain layout element. */
     on_drop<Self extends Element>(this: Self, handler: (event: { paths: string[] }, cx: Context) => void): Self;
+    /** An OS file drag moved over this element (once per crossing): window position and how many files. Plain layout elements only. */
+    on_drag_enter<Self extends Element>(this: Self, handler: (event: { x: number; y: number; count: number }, cx: Context) => void): Self;
+    /** The drag moved off this element, was dropped, or left the window. */
+    on_drag_leave<Self extends Element>(this: Self, handler: (event: {}, cx: Context) => void): Self;
     /**
      * GPUI `InteractiveElement::on_scroll_wheel`: wheel and trackpad scrolling
      * over this element.
@@ -2086,6 +2090,17 @@ const ELEMENTS: &str = r#"
    * are supported by the host image loader.
    */
   export function image(path: string): NativeElement;
+
+  /**
+   * HERDR: a video from the application's own directory (the same rule as `image`). The host
+   * plays it (macOS: .mp4 / .mov). Give it `.id(...)` to drive it with herdr's `videoPlay`,
+   * `videoPause` and `videoSeek`, and read `nextVideoEvent()`. Without `autoplay` it shows its
+   * first frame as a still until played.
+   */
+  export function video(
+    path: string,
+    options?: { autoplay?: boolean; loop?: boolean; muted?: boolean; controls?: boolean },
+  ): NativeElement;
 
   /** The visible items, as a half-open `[start, end)` interval. */
   export interface ItemRange {
@@ -3984,6 +3999,8 @@ mod tests {
         "on_mouse_up",
         "on_mouse_down_out",
         "on_drop",
+        "on_drag_enter",
+        "on_drag_leave",
         "on_scroll_wheel",
         "on_action",
         "key_context",

@@ -125,7 +125,8 @@ fn module(values: BTreeMap<String, Value>, calls: Rc<RefCell<Calls>>) -> HostMod
         shared.borrow_mut().shared.insert(a.string(0)?.into(), from_host(a.value(1)?));
         Ok(HostValue::Null)
     });
-    for name in ["run", "playSound", "setAgentOrder", "openOverlay", "closeOverlay", "notify", "presentUpdateNotes"] {
+    module = module.function("notifications", |_| Ok(to_host(&json!({ "unread": 0, "items": [] }))));
+    for name in ["run", "playSound", "setAgentOrder", "openOverlay", "closeOverlay", "notify", "presentUpdateNotes", "markRead", "clearNotifications", "setNotificationMute"] {
         let calls = calls.clone();
         module = module.function(name, move |a| {
             if name == "run" {
@@ -151,8 +152,11 @@ fn module(values: BTreeMap<String, Value>, calls: Rc<RefCell<Calls>>) -> HostMod
     module = module.async_function("feedbackPickImages", |_| Ok(async { Ok(HostValue::Array(vec![])) }));
     module = module.async_function("knownAgents", |_| Ok(async { Ok(HostValue::Array(vec![])) }));
     module = module.async_function("pickFolder", |_| Ok(async { Ok(HostValue::Null) }));
-    for name in ["nextCommand", "watchFolder"] {
+    for name in ["nextCommand", "watchFolder", "nextVideoEvent"] {
         module = module.async_function(name, |_| Ok(std::future::pending::<gpui_shell::HostResult>()));
+    }
+    for name in ["videoPlay", "videoPause", "videoSeek"] {
+        module = module.function(name, |_| Ok(HostValue::Null));
     }
     for name in ["exec", "hc", "readTextFile", "writeTextFile", "sendFeedback"] {
         let calls = calls.clone();
@@ -160,6 +164,8 @@ fn module(values: BTreeMap<String, Value>, calls: Rc<RefCell<Calls>>) -> HostMod
             let first = a.get(0).map(from_host).unwrap_or(Value::Null);
             let reply = match name {
                 "readTextFile" if first == "/fixture/app/settings.json" || first == "/fixture/.ssh/config" => Some(Value::Null),
+                // HERDR: the bundled fork-notepad-view, opened with no file to show, reads "" (empty).
+                "readTextFile" if first == "" => Some(json!("")),
                 "readTextFile" => first
                     .as_str()
                     .and_then(|p| p.strip_prefix("/fixture/app/layouts/"))
@@ -175,6 +181,10 @@ fn module(values: BTreeMap<String, Value>, calls: Rc<RefCell<Calls>>) -> HostMod
                 // The files panel lists a folder with sh: kind and name pairs.
                 "exec" if first == "sh" && a.get(1).map(from_host).and_then(|v| v.get(2).cloned()) == Some(json!("files")) => {
                     Some(json!({"code":0,"stdout":"d\u{0}src\u{0}f\u{0}README.md\u{0}","stderr":""}))
+                }
+                // HERDR: the bundled fork-notepad makes its notes folder on start.
+                "exec" if first == "mkdir" && a.get(1).map(from_host).and_then(|v| v.get(0).cloned()) == Some(json!("-p")) => {
+                    Some(json!({"code":0,"stdout":"","stderr":""}))
                 }
                 "exec"
                     if first == "git"
@@ -277,6 +287,37 @@ fn shipped_initial_descriptions(cx: &mut TestAppContext) {
     );
 }
 
+/// HERDR: `video(path, options)` is an element like `image`; its options are checked strictly.
+#[gpui::test]
+fn a_mod_can_place_a_video_and_bad_options_are_refused(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+    let write = |name: &str, body: &str| {
+        let dir = staged.0.join("mods").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("main.js"), format!("import {{ View, video }} from \"gpui-kit\";\nexport default class V extends View {{ render() {{ return {body}; }} }}\n")).unwrap();
+    };
+    write("vtest", r#"video("mods/vtest/clip.mp4", { autoplay: true, loop: true, muted: true }).id("clip").absolute().w(320).h(180)"#);
+    let tree = describe_with_values(cx, &staged, "mods/vtest", fixture(true, props(), updates("current", "current")), None).unwrap();
+    assert!(tree.contains(r#"video "mods/vtest/clip.mp4" autoplay loop muted"#), "{tree}");
+    write("vbad", r#"video("mods/vbad/clip.mp4", { autoplya: true })"#);
+    let err = describe_with_values(cx, &staged, "mods/vbad", fixture(true, props(), updates("current", "current")), None).unwrap_err();
+    assert!(format!("{err:#}").contains("unknown video option `autoplya`"), "{err:#}");
+}
+
+#[gpui::test]
+fn brand_leaves_room_for_macos_traffic_lights_only_outside_full_screen(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+    for (fullscreen, inset) in [(false, true), (true, false)] {
+        let mut values = fixture(true, props(), updates("current", "current"));
+        values.insert("window".into(), json!({"platform":"macos","titlebar":"none","fullscreen":fullscreen,"buttons":false}));
+        let tree = describe_with_values(cx, &staged, "mods/workspace-chrome", values, None).unwrap();
+        let root = tree.lines().next().unwrap();
+        assert_eq!(root.contains(".pl[Number(76.0)]"), inset, "fullscreen={fullscreen}: {tree}");
+    }
+}
+
 #[gpui::test]
 fn tabs_leave_room_for_macos_traffic_lights(cx: &mut TestAppContext) {
     cx.update(gpui_shell::init);
@@ -372,6 +413,28 @@ fn check_materializes_retained_elements_in_a_rendered_view(cx: &mut TestAppConte
 }
 
 #[gpui::test]
+fn rebuilt_machine_offers_connect_only_for_identity_mismatch(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+    for (state, why, offered) in [
+        ("unreachable", "a different core answers there (\"new-id\")", true),
+        ("unreachable", "connection refused", false),
+        ("unreachable", "a different core answers there", false),
+        ("connected", "a different core answers there (\"new-id\")", false),
+    ] {
+        let setup = format!(
+            "this.machines = [{{name:'cloud', state:{}, why:{}, target:'host'}}]; this.folded.add('cloud');",
+            json!(state), json!(why)
+        );
+        let tree = describe(cx, &staged, "mods/spaces", false, props(), updates("current", "current"), Some(&setup)).unwrap();
+        assert_eq!(tree.contains("machine-connect-cloud"), offered, "{state}/{why}: {tree}");
+        assert_eq!(tree.contains("rebuilt ·"), offered, "{tree}");
+        assert_eq!(tree.contains("This machine was rebuilt or replaced. Click to connect to the new one."), offered, "{tree}");
+        assert!(!tree.contains("machine-reconnect-"), "reconnect belongs in the machine row: {tree}");
+    }
+}
+
+#[gpui::test]
 fn machine_picker_keeps_long_lists_scrollable(cx: &mut TestAppContext) {
     cx.update(gpui_shell::init);
     let staged = Staged::new();
@@ -411,6 +474,23 @@ fn machine_setup_prompt_stacks_above_the_picker(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn option_key_settings_are_only_shown_on_macos(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+    for platform in ["linux", "windows", "macos"] {
+        let mut p = props();
+        p["section"] = json!("keyboard");
+        let mut values = fixture(true, p, updates("current", "current"));
+        values.insert("window".into(), json!({"platform":platform}));
+        let tree = describe_with_values(cx, &staged, "frame/settings", values, None).unwrap();
+        for value in ["auto", "on", "off", "left", "right"] {
+            assert_eq!(tree.contains(&format!("st-option-{value}")), platform == "macos", "{platform}: {tree}");
+        }
+        assert_eq!(tree.contains("st-s-keyboard"), platform == "macos", "{platform}: {tree}");
+    }
+}
+
+#[gpui::test]
 fn settings_sections_and_updates(cx: &mut TestAppContext) {
     cx.update(gpui_shell::init);
     let start = Instant::now();
@@ -434,7 +514,27 @@ fn settings_sections_and_updates(cx: &mut TestAppContext) {
             }
         }
     }
-    eprintln!("19 settings cases, each twice: {:?}", start.elapsed());
+    for (checking, checked, asked) in [
+        (false, None, false), (false, None, true),
+        (true, None, false), (true, None, true),
+        (true, Some(1700000000u64), false), (true, Some(1700000000), true),
+        (false, Some(1700000000), false), (false, Some(1700000000), true),
+    ] {
+        let mut p = props();
+        p["section"] = json!("updates");
+        let mut u = updates("current", "current");
+        u["checked"] = json!(checked);
+        u["checking"] = json!(checking);
+        let setup = asked.then_some("this.asked = Date.now();");
+        let tree = describe(cx, &staged, "frame/settings", true, p, u, setup).unwrap();
+        let succeeded = !checking && checked.is_some();
+        assert_eq!(tree.contains("Up to date"), succeeded, "success requires a completed, successful check: {tree}");
+        if !checking && checked.is_none() {
+            assert!(tree.contains("check-app") && tree.contains("check-core"), "failed checks must remain retryable: {tree}");
+        }
+        assert!(tree.contains(if checking { "Checking" } else if succeeded { "Up to date" } else { "Check your connection" }), "check status missing: {tree}");
+    }
+    eprintln!("27 settings cases, each twice: {:?}", start.elapsed());
 }
 
 #[gpui::test]
@@ -647,7 +747,8 @@ fn shipped_layouts_and_keys() {
         layouts.insert(path.file_stem().unwrap().to_str().unwrap().to_owned());
     }
     assert_eq!(layouts, crate::window::shipped_layouts().into_iter().map(str::to_owned).collect());
-    let mod_commands = ["ribbon.next"];
+    // HERDR: the bundled notepad's own command (defaults/keys.macos.json).
+    let mod_commands = ["ribbon.next", "fork-notepad.select-all"];
     for text in [
         include_str!("../../defaults/keys.json"),
         include_str!("../../defaults/keys.macos.json"),
@@ -672,10 +773,49 @@ fn shipped_layouts_and_keys() {
                     action == "terminal"
                         || action.starts_with("send:")
                         || crate::commands::COMMANDS.iter().any(|c| c.name == name)
-                        || (mod_commands.contains(&name) && mods.contains(name.split('.').next().unwrap())),
+                        || (mod_commands.contains(&name) && mods.contains(name.split('.').next().unwrap()))
+                        // HERDR: a bundled mod's key with a built-in fallback (keys.rs) is never dead.
+                        || crate::keys::has_fallback(action),
                     "unknown shipped key action {action}"
                 );
             }
         }
     }
+}
+
+#[gpui::test]
+fn picker_scrolls_the_selection_into_view(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+    let mut values = fixture(true, props(), updates("current", "current"));
+    let tabs: Vec<Value> = (1..=12)
+        .map(|i| json!({"id":format!("tab{i}"),"index":i,"name":format!("Task {i}"),"active":i==1,"status":"done","panes":1,"zoomed":false,"settled":false,"settled_at":null,"changed_at":null,"working_since":null}))
+        .collect();
+    values.insert("spaces".into(), json!([
+        {"id":"s1","index":1,"name":"Local","folder":"/fixture/project","machine":null,"branch":"main","active":true,"status":"working","tabs":tabs}
+    ]));
+    // Selecting the last row (with the arrows) must scroll it into the visible 320px.
+    let tree = describe_with_values(cx, &staged, "mods/picker", values, Some("this.at = 999; cx.notify();")).unwrap();
+    let top = tree.lines()
+        .find(|l| l.contains("pk-space-here"))
+        .unwrap_or_else(|| panic!("selected row missing: {tree}"));
+    let px: f64 = top.split(".top[Number(").nth(1).unwrap_or_else(|| panic!("selected row must be placed inside the scrolled list: {tree}")).split(")").next().unwrap().parse().unwrap();
+    assert!(px <= 320.0 - 32.0, "selected row at {px}px is below the visible list: {tree}");
+}
+
+#[gpui::test]
+fn status_bar_shows_the_real_palette_key(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+    let mut bound = fixture(true, props(), updates("current", "current"));
+    bound.insert("keys".into(), json!([{"section":"global","keys":"ctrl-p","action":"app.palette"}]));
+    let tree = describe_with_values(cx, &staged, "mods/workspace-status", bound, None).unwrap();
+    assert!(tree.contains("Ctrl+P"), "hint must show the real binding: {tree}");
+    assert!(!tree.contains("Shift P"), "stale hardcoded hint: {tree}");
+
+    let mut unbound = fixture(true, props(), updates("current", "current"));
+    unbound.insert("keys".into(), json!([{"section":"global","keys":"ctrl-k","action":"app.help"}]));
+    let tree = describe_with_values(cx, &staged, "mods/workspace-status", unbound, None).unwrap();
+    assert!(tree.contains("commands"), "unbound hint still offers commands: {tree}");
+    assert!(!tree.contains("Shift P"), "unbound hint must not invent a key: {tree}");
 }

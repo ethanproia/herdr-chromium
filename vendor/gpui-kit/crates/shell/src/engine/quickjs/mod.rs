@@ -31,7 +31,9 @@ use rquickjs::{
     module::Declared,
     module::{Declarations, Exports, Module, ModuleDef},
 };
-use rquickjs_jit::{JitConfig, JitRuntime};
+#[cfg(test)]
+use rquickjs_jit::JitConfig;
+use rquickjs_jit::JitRuntime;
 use smallvec::SmallVec;
 
 use crate::{
@@ -248,7 +250,7 @@ mod jit_suspension_tests {
 
     #[test]
     fn nested_suspension_preserves_the_outer_state() {
-        let runtime = ShellRuntime::new_isolated().unwrap();
+        let runtime = ShellRuntime::new_isolated_jit().unwrap();
 
         runtime
             .with_jit_suspended(|| {
@@ -1120,6 +1122,8 @@ pub(crate) mod exports {
         "div",
         "svg",
         "image",
+        // HERDR: a video the host plays.
+        "video",
         // GPUI's own lazy lists. Base's virtual lists live in `gpui-base`;
         // these are GPUI's, and are exported where `div` is.
         "list",
@@ -1600,7 +1604,21 @@ impl ShellRuntime {
         Self::new_isolated_with_components_and_dependency_store(
             FrozenComponentRegistry::default(),
             GitDependencyStore::for_user()?,
-            shell_jit_config()?,
+        )
+    }
+
+    /// A runtime with the JIT attached, for the tests and benchmarks that
+    /// compare against it.
+    #[cfg(test)]
+    pub(crate) fn new_isolated_jit() -> Result<Rc<Self>> {
+        let js_runtime = JitRuntime::builder()
+            .config(shell_jit_config()?)
+            .build()
+            .map_err(|error| anyhow!("failed to start the JavaScript JIT runtime: {error}"))?;
+        Self::new_isolated_with_components_dependency_store_and_runtime(
+            FrozenComponentRegistry::default(),
+            GitDependencyStore::for_user()?,
+            js_runtime,
         )
     }
 
@@ -1620,7 +1638,6 @@ impl ShellRuntime {
         Self::new_isolated_with_components_and_dependency_store(
             components,
             GitDependencyStore::for_user()?,
-            shell_jit_config()?,
         )
     }
 
@@ -1631,19 +1648,20 @@ impl ShellRuntime {
         Self::new_isolated_with_components_and_dependency_store(
             FrozenComponentRegistry::default(),
             dependency_store,
-            shell_jit_config()?,
         )
     }
 
+    // HERDR: the plain interpreter. In a long-lived window the JIT's upkeep ran
+    // on the main thread and grew with every loaded mod copy (module
+    // generations are never freed), freezing the window for seconds; mod JS
+    // ran no faster with it outside tight numeric loops.
     fn new_isolated_with_components_and_dependency_store(
         components: FrozenComponentRegistry,
         dependency_store: GitDependencyStore,
-        jit_config: JitConfig,
     ) -> Result<Rc<Self>> {
         let js_runtime = JitRuntime::builder()
-            .config(jit_config)
-            .build()
-            .map_err(|error| anyhow!("failed to start the JavaScript JIT runtime: {error}"))?;
+            .build_interpreter()
+            .map_err(|error| anyhow!("failed to start the JavaScript interpreter: {error}"))?;
         Self::new_isolated_with_components_dependency_store_and_runtime(
             components,
             dependency_store,
@@ -4170,6 +4188,23 @@ impl ShellRuntime {
         });
     }
 
+    // HERDR: an OS file drag entered an element: where (window px) and how many paths.
+    pub(crate) fn dispatch_drag_enter(self: &Rc<Self>, id: CallbackId, position: gpui::Point<gpui::Pixels>, count: usize, window: &mut Window, cx: &mut App) {
+        let (x, y) = (f32::from(position.x) as f64, f32::from(position.y) as f64);
+        self.dispatch_simple_event(id, "drag enter", window, cx, move |ctx| {
+            let payload = Object::new(ctx.clone())?;
+            payload.set("x", x)?;
+            payload.set("y", y)?;
+            payload.set("count", count as f64)?;
+            Ok(payload)
+        });
+    }
+
+    // HERDR: the drag left the element, was dropped on it, or left the window.
+    pub(crate) fn dispatch_drag_leave(self: &Rc<Self>, id: CallbackId, window: &mut Window, cx: &mut App) {
+        self.dispatch_simple_event(id, "drag leave", window, cx, |ctx| Object::new(ctx.clone()));
+    }
+
     /// Delivers one dispatched action to a script handler.
     ///
     /// The id is handed over even though the handler was registered for one
@@ -5203,6 +5238,7 @@ impl ShellRuntime {
     }
 }
 
+#[cfg(test)]
 fn shell_jit_config() -> Result<JitConfig> {
     let builder = JitConfig::builder();
 
@@ -6840,6 +6876,8 @@ globalThis.__gpui = (() => {
     v_flex: () => element(__v_flex()),
     svg: (path) => element(__svg(String(path))),
     image: (path) => element(__image(String(path))),
+    // HERDR: video(path, {autoplay, loop, muted, controls}).
+    video: (path, options) => element(__video(String(path), JSON.stringify(options ?? {}))),
     PathBuilder: {
       fill: () => pathBuilder(true, 0),
       stroke: (width) => pathBuilder(false, finitePositive(width, "stroke width")),
@@ -7167,6 +7205,8 @@ impl ShellRuntime {
                 "on_mouse_up",
                 "on_mouse_down_out",
                 "on_drop",
+                "on_drag_enter",
+                "on_drag_leave",
                 "on_scroll_wheel",
                 "on_action",
                 "key_context",
@@ -7290,6 +7330,17 @@ impl ShellRuntime {
             )?;
             text_constructor(&globals, "__svg", runtime.clone(), Component::Svg)?;
             text_constructor(&globals, "__image", runtime.clone(), Component::Image)?;
+            // HERDR: video.
+            {
+                let runtime = runtime.clone();
+                globals.set(
+                    "__video",
+                    Func::from(move |ctx: Ctx<'_>, path: String, options: String| -> JsResult<SpecId> {
+                        let spec = crate::video::VideoSpec::parse(path, &options).map_err(|e| rquickjs::Exception::throw_type(&ctx, &e))?;
+                        Ok(upgrade(&runtime, &ctx)?.push_node(Component::Video(spec)))
+                    }),
+                )?;
+            }
             text_constructor(
                 &globals,
                 "__accordion",
@@ -8172,6 +8223,8 @@ impl ShellRuntime {
             | "on_modifiers_changed"
             | "on_mouse_down_out"
             | "on_drop"
+            | "on_drag_enter"
+            | "on_drag_leave"
             | "on_scroll_wheel"
             | "tab_bar"
             | "empty_group"
@@ -9054,9 +9107,10 @@ fn virtual_list_constructor(
                     // other is inferred by measuring one item. Writing zero
                     // there says so, rather than inventing a number base would
                     // ignore.
+                    let extent = crate::value::scaled_px(value as f32);
                     Ok(match axis {
-                        gpui::Axis::Vertical => gpui::size(gpui::px(0.), gpui::px(value as f32)),
-                        gpui::Axis::Horizontal => gpui::size(gpui::px(value as f32), gpui::px(0.)),
+                        gpui::Axis::Vertical => gpui::size(gpui::px(0.), extent),
+                        gpui::Axis::Horizontal => gpui::size(extent, gpui::px(0.)),
                     })
                 };
 
@@ -10147,6 +10201,8 @@ fn callback_op_name(method: &str) -> Option<&'static str> {
         "on_modifiers_changed" => "on_modifiers_changed",
         "on_mouse_down_out" => "on_mouse_down_out",
         "on_drop" => "on_drop",
+        "on_drag_enter" => "on_drag_enter",
+        "on_drag_leave" => "on_drag_leave",
         "on_scroll_wheel" => "on_scroll_wheel",
         "on_item_click" => "on_item_click",
         "on_item_secondary_click" => "on_item_secondary_click",
@@ -10323,6 +10379,7 @@ mod keystroke_tests {
                 modifiers,
                 key: key.to_owned(),
                 key_char: None,
+                ..Default::default()
             })
         };
 

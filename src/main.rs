@@ -2,6 +2,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod bench;
+mod browser;
 mod commands;
 mod control;
 mod core_bin;
@@ -12,6 +13,8 @@ mod layout;
 mod layout_sync;
 mod links;
 mod model;
+// HERDR: the notification history behind the bell.
+mod notifications;
 mod mirror;
 mod mirror_sync;
 mod place;
@@ -20,8 +23,10 @@ mod persist;
 mod macos;
 mod mods;
 mod mod_files;
+mod mod_keys;
 mod process_cwd;
 mod programs;
+mod remote_shell;
 mod settings;
 mod setup;
 mod sound;
@@ -29,9 +34,12 @@ mod spawn;
 mod sprites;
 mod telemetry;
 mod feedback;
+// HERDR: HERDR_APP_FRAME_STATS (frame timing of the app window).
+mod frame_stats;
 mod terminal;
 mod update;
 mod update_notes;
+mod video;
 mod vt;
 mod win32_keys;
 mod window;
@@ -49,6 +57,7 @@ Usage:
   herdr-app commands               every command, its arguments, what it does
   herdr-app status                 what the window shows, and any errors
   herdr-app shot [file.png]        save the last window frame (default: herdr-shot.png)
+  herdr-app render --layout <file.json> --out <file.png>   render a layout headless to a PNG
   herdr-app check <mod folder>     load a mod once and report what's wrong
   herdr-app --skill                Agent Skill: driving the window, and where hc fits
   herdr-app --version
@@ -85,12 +94,14 @@ fn main() {
         gpui_shell::host::main_with_components(gpui_shell::FrozenComponentRegistry::default());
         return;
     }
-    if matches!(args.get(1).map(String::as_str), Some("do" | "status" | "ls" | "commands" | "feedback" | "shot")) {
+    if matches!(args.get(1).map(String::as_str), Some("do" | "status" | "ls" | "commands" | "feedback" | "shot" | "render")) {
         std::process::exit(control::client(&args[1..]));
     }
     // Anything else from a shell answers in the shell; only a bare launch opens the window.
     match args.get(1).map(String::as_str) {
         // Already open on this home: that window comes to the front.
+        // HERDR: headless never raises the running window (that would take focus).
+        None if control::headless() && control::running() => return,
         None if control::raise_running() => return,
         None => {}
         Some("-h" | "--help" | "help") => return print!("{HELP}"),
@@ -143,6 +154,8 @@ fn main() {
     update::start();
     telemetry::start(settings::telemetry_setting(&person));
     bench::start();
+    frame_stats::start(); // HERDR: off unless HERDR_APP_FRAME_STATS=1 or 2
+    video::install(); // HERDR: mods' video(path) element
     if let Err(e) = mods::write_workspace() {
         eprintln!("herdr-app: cannot write {}: {e}", mods::app_dir().display());
     }
@@ -178,6 +191,11 @@ fn main() {
             .detach();
             #[cfg(target_os = "macos")]
             macos::init(cx);
+            // HERDR: headless has no Dock icon and can never come to the front.
+            #[cfg(target_os = "macos")]
+            if control::headless() {
+                hide_from_dock();
+            }
             if fresh {
                 let width = cx.primary_display().map(|d| f32::from(d.bounds().size.width));
                 let zoom = settings::first_zoom(width);
@@ -191,9 +209,34 @@ fn main() {
             }
             match core {
                 Ok(core) => open_main(core, requests, cx),
+                // HERDR: headless never shows the setup screen.
+                Err(_) if control::headless() => {
+                    eprintln!("herdr-app: headless needs a working core");
+                    cx.quit();
+                }
                 Err(need) => setup::open(need, requests, cx),
             }
         });
+}
+
+// HERDR: NSApp.setActivationPolicy(.prohibited) through the Objective-C runtime.
+#[cfg(target_os = "macos")]
+fn hide_from_dock() {
+    use std::ffi::{c_char, c_void};
+    #[link(name = "objc")]
+    unsafe extern "C" {
+        fn objc_getClass(name: *const c_char) -> *mut c_void;
+        fn sel_registerName(name: *const c_char) -> *mut c_void;
+        fn objc_msgSend();
+    }
+    // SAFETY: AppKit is loaded and NSApp exists once gpui runs; each call
+    // casts objc_msgSend to the signature of the selector it sends.
+    unsafe {
+        let get: extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        let set: extern "C" fn(*mut c_void, *mut c_void, isize) -> bool = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        let app = get(objc_getClass(c"NSApplication".as_ptr()), sel_registerName(c"sharedApplication".as_ptr()));
+        set(app, sel_registerName(c"setActivationPolicy:".as_ptr()), 2);
+    }
 }
 
 /// The main window, on a connected core.
@@ -212,10 +255,16 @@ pub fn open_main(core: std::sync::Arc<hc::Core>, requests: async_channel::Receiv
                 }),
                 app_owns_titlebar_drag: cfg!(target_os = "macos"),
                 // Herdr Dev and other side-by-side builds get their own dock icon.
+                // HERDR: HERDR_APP_HEADLESS=1 keeps the window hidden and unfocused.
+                show: !control::headless(),
+                focus: !control::headless(),
                 app_id: Some(std::env::var("HERDR_APP_ID").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "herdr-app".into())),
                 ..Default::default()
             };
             cx.open_window(options, |window, cx| cx.new(|cx| window::AppWindow::new(core, requests, window, cx)))
                 .expect("cannot open the Herdr window");
-            cx.activate(true);
+            // HERDR: headless never activates the app.
+            if !control::headless() {
+                cx.activate(true);
+            }
 }

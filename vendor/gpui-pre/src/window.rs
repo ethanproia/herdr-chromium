@@ -1172,6 +1172,7 @@ pub struct Window {
     is_resizable: bool,
     is_minimizable: bool,
     sprite_atlas: Arc<dyn PlatformAtlas>,
+    foreground_glyph_tiles: FxHashMap<RenderGlyphParams, (AtlasTile, Bounds<DevicePixels>)>,
     text_system: Arc<WindowTextSystem>,
     text_rendering_mode: Rc<Cell<TextRenderingMode>>,
     rem_size: Pixels,
@@ -1785,6 +1786,10 @@ impl Window {
                     {
                         // Don't lose a pending forced render to throttling.
                         deferred_force_render |= force_render;
+                        if crate::frame_stats::enabled() {
+                            // HERDR: frame stats.
+                            crate::frame_stats::record(crate::frame_stats::FrameSample::Throttled { window: window_id.as_u64() });
+                        }
                         // Deferred by throttling: ask demand-driven platforms to retry.
                         handle
                             .update(&mut cx, |_, window, _| {
@@ -1842,16 +1847,37 @@ impl Window {
                                     // atlas tile references after a GPU device recovery.
                                     window.refresh();
                                 }
+                                // HERDR: frame stats (one atomic load when off).
+                                let stats = crate::frame_stats::enabled().then(std::time::Instant::now);
                                 let arena_clear_needed = window.draw(cx);
+                                let drawn = stats.map(|_| std::time::Instant::now());
                                 window.present();
+                                if let (Some(t0), Some(t1)) = (stats, drawn) {
+                                    let at = std::time::Instant::now();
+                                    crate::frame_stats::record(crate::frame_stats::FrameSample::Frame {
+                                        window: window_id.as_u64(),
+                                        draw_ms: (t1 - t0).as_secs_f64() * 1e3,
+                                        present_ms: (at - t1).as_secs_f64() * 1e3,
+                                        at,
+                                    });
+                                }
                                 arena_clear_needed.clear(cx);
                             })
                             .log_err();
                     })
                 } else if needs_present {
+                    // HERDR: frame stats.
+                    let t0 = crate::frame_stats::enabled().then(std::time::Instant::now);
                     handle
                         .update(&mut cx, |_, window, _| window.present())
                         .log_err();
+                    if let Some(t0) = t0 {
+                        let at = std::time::Instant::now();
+                        crate::frame_stats::record(crate::frame_stats::FrameSample::PresentOnly { window: window_id.as_u64(), present_ms: (at - t0).as_secs_f64() * 1e3, at });
+                    }
+                } else if crate::frame_stats::enabled() {
+                    // HERDR: frame stats.
+                    crate::frame_stats::record(crate::frame_stats::FrameSample::Skipped { window: window_id.as_u64() });
                 }
 
                 handle
@@ -2073,6 +2099,7 @@ impl Window {
             is_resizable,
             is_minimizable,
             sprite_atlas,
+            foreground_glyph_tiles: FxHashMap::default(),
             text_system,
             text_rendering_mode: cx.text_rendering_mode.clone(),
             rem_size: px(16.),
@@ -3398,6 +3425,26 @@ impl Window {
         self.layout_engine.as_mut().unwrap().clear();
         self.text_system().finish_frame();
         self.next_frame.finish(&mut self.rendered_frame);
+        if !self.foreground_glyph_tiles.is_empty() {
+            // Cached paint ranges can reuse sprites without calling paint_emoji.
+            // Keep both live scenes; retire only variants neither scene references.
+            let live: FxHashSet<_> = self
+                .next_frame
+                .scene
+                .polychrome_sprites
+                .iter()
+                .chain(&self.rendered_frame.scene.polychrome_sprites)
+                .map(|sprite| (sprite.tile.texture_id, sprite.tile.tile_id.0))
+                .collect();
+            self.foreground_glyph_tiles.retain(|params, (tile, _)| {
+                if live.contains(&(tile.texture_id, tile.tile_id.0)) {
+                    true
+                } else {
+                    self.sprite_atlas.remove(&params.clone().into());
+                    false
+                }
+            });
+        }
 
         self.invalidator.set_phase(DrawPhase::Focus);
         let previous_focus_path = self.rendered_frame.focus_path();
@@ -4731,6 +4778,7 @@ impl Window {
             is_emoji: false,
             subpixel_rendering,
             dilation,
+            foreground: [0, 0, 0, 255],
         };
 
         let raster_bounds = self.text_system().raster_bounds(&params)?;
@@ -4738,7 +4786,7 @@ impl Window {
             let tile = self
                 .sprite_atlas
                 .get_or_insert_with(params.clone().into(), &mut || {
-                    let (size, bytes) = self.text_system().rasterize_glyph(&params)?;
+                    let (size, bytes) = self.text_system().rasterize_glyph(&params, raster_bounds)?;
                     Ok(Some((size, Cow::Owned(bytes))))
                 })?
                 .expect("Callback above only errors or returns Some");
@@ -4807,6 +4855,18 @@ impl Window {
         glyph_id: GlyphId,
         font_size: Pixels,
     ) -> Result<()> {
+        self.paint_emoji_with_color(origin, font_id, glyph_id, font_size, Hsla::black())
+    }
+
+    /// Paints a color glyph using the run color for foreground palette entries.
+    pub fn paint_emoji_with_color(
+        &mut self,
+        origin: Point<Pixels>,
+        font_id: FontId,
+        glyph_id: GlyphId,
+        font_size: Pixels,
+        color: Hsla,
+    ) -> Result<()> {
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.scale_factor();
@@ -4821,14 +4881,23 @@ impl Window {
             is_emoji: true,
             subpixel_rendering: false,
             dilation: 0,
+            foreground: u32::from(color.to_rgb()).to_be_bytes(),
         };
+        let uses_foreground = self.text_system().glyph_uses_foreground(&params);
+        let mut params = params;
+        if !uses_foreground {
+            params.foreground = [0, 0, 0, 255];
+        }
 
-        let raster_bounds = self.text_system().raster_bounds(&params)?;
+        let raster_bounds = match self.foreground_glyph_tiles.get(&params) {
+            Some((_, bounds)) => *bounds,
+            None => self.text_system().raster_bounds(&params)?,
+        };
         if !raster_bounds.is_zero() {
             let tile = self
                 .sprite_atlas
                 .get_or_insert_with(params.clone().into(), &mut || {
-                    let (size, bytes) = self.text_system().rasterize_glyph(&params)?;
+                    let (size, bytes) = self.text_system().rasterize_glyph(&params, raster_bounds)?;
                     Ok(Some((size, Cow::Owned(bytes))))
                 })?
                 .expect("Callback above only errors or returns Some");
@@ -4837,6 +4906,10 @@ impl Window {
                 origin: integer_origin + raster_bounds.origin.map(Into::into),
                 size: tile.bounds.size.map(Into::into),
             };
+            if uses_foreground {
+                self.foreground_glyph_tiles
+                    .insert(params, (tile, raster_bounds));
+            }
             let content_mask = self.snapped_content_mask();
             let opacity = self.element_opacity();
 
@@ -4852,6 +4925,12 @@ impl Window {
             });
         }
         Ok(())
+    }
+
+    /// Invalidate SVG assets at or beneath this path and redraw their consumers.
+    pub fn invalidate_svg(&mut self, path: &str) {
+        self.sprite_atlas.remove_svg(path);
+        self.refresh();
     }
 
     /// Paint a monochrome SVG into the scene for the next frame at the current stacking context.
@@ -5907,6 +5986,7 @@ impl Window {
                         key: key.to_string(),
                         key_char: None,
                         modifiers: Modifiers::default(),
+                        ..Default::default()
                     });
                 }
             }

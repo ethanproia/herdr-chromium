@@ -1,0 +1,3606 @@
+//! Part 1 (LAB-419): `BrowserView`, the GPUI entity for one browser block.
+//! Owns the host connection (`HostLink`), `BrowserState`, resize and focus.
+//!
+//! One `HostClient` per app: it starts `herdr-browser-host` on the first send, talks JSON lines
+//! over `$HERDR_APP_HOME/browser/host.sock`, and after the host dies starts it again on the next
+//! send, replaying every open browser. Each block gets a `BrowserView` that turns host events into
+//! `BrowserState`, sizes the page to the block, hands frames to a `FrameSink` and shows a reload
+//! card after a crash. `Browsers` keeps one view per browser block in the layouts.
+use super::agent::{Agent, Focus, Grant, Reply, Step};
+use super::cdp::CdpPipe;
+
+/// CDP on a pipe only the app holds, served to agents by the broker (the default). A dev-only TCP port
+/// (`HERDR_BROWSER_CDP_PORT`, which any local process can attach to) or `HERDR_BROWSER_CDP_PIPE=0` turns it off.
+fn cdp_pipe_wanted() -> bool {
+    std::env::var("HERDR_BROWSER_CDP_PIPE").map_or(true, |v| v != "0") && std::env::var("HERDR_BROWSER_CDP_PORT").map_or(true, |v| v.is_empty())
+}
+
+/// Start the host with CDP on fds 3/4 (macOS; elsewhere no pipe yet).
+#[cfg(target_os = "macos")]
+fn spawn_cdp(cmd: &mut Command) -> std::io::Result<(Child, Arc<CdpPipe>)> {
+    super::cdp::spawn_with_pipe(cmd)
+}
+#[cfg(not(target_os = "macos"))]
+fn spawn_cdp(_: &mut Command) -> std::io::Result<(Child, Arc<CdpPipe>)> {
+    Err(std::io::Error::other("no CDP pipe on this platform"))
+}
+use super::geometry::{Change, Epoch, Geometry, HoverSend, OverlayAnswer, OverlayState, Pt, Rect, zoom_factor};
+use super::input::{self, BrowserInput, OverlayEvent, Owner};
+use super::dialogs::{DialogsEvent, Downloads, PageDialogs};
+use super::markup::{self, Markup, Tool};
+use super::zoom;
+use super::styles::StylePanelView;
+use super::{annotate, design_bar, region, send_to};
+use super::handoff::Recipient;
+
+/// `url` without its `token` query parameter (what a document may keep of a launch url).
+pub fn without_token(url: &str) -> String {
+    let Some((base, query)) = url.split_once('?') else { return url.to_owned() };
+    let (query, frag) = query.split_once('#').map_or((query, None), |(q, f)| (q, Some(f)));
+    let kept: Vec<&str> = query.split('&').filter(|kv| !kv.is_empty() && kv.split('=').next() != Some("token")).collect();
+    let mut out = base.to_owned();
+    if !kept.is_empty() {
+        out.push('?');
+        out.push_str(&kept.join("&"));
+    }
+    if let Some(f) = frag {
+        out.push('#');
+        out.push_str(f);
+    }
+    out
+}
+
+/// What Send hands the agent side (fork-agent's S8): one batch, one picture.
+///
+/// Coordinates: `annotations[].target.rect` and `region.rect` are page DIPs in the *viewport*
+/// (from the page area's top-left, as the element sat when it was picked or the region was
+/// drawn; the region is moved by the scroll since); `scroll` is the document's scroll at Send in
+/// page DIPs; `picture` is the viewport at Send at `scale` pixels per DIP (cropped to `region`
+/// when there is one, markup burned in). Fields named in `untrusted` come from the page.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AnnotationBatch {
+    pub version: u32,
+    pub id: u64,
+    pub sent_at_ms: u64,
+    pub block: BrowserId,
+    pub url: String,
+    pub title: String,
+    pub scroll: (f32, f32),
+    pub annotations: Vec<annotate::Annotation>,
+    /// The style panel's edits line ("CSS edits — padding: 8px → 16px"), the person's own.
+    pub css_edits: Option<String>,
+    /// The values those edits replaced, `(prop, was)`: read from the page, so untrusted.
+    #[serde(default)]
+    pub css_was: Vec<(String, String)>,
+    /// A PNG under `<app home>/browser/attach/`; agent.rs keeps the last 20.
+    pub picture: Option<std::path::PathBuf>,
+    pub region: Option<RegionInfo>,
+    pub scale: f32,
+    pub untrusted: Vec<String>,
+}
+
+/// A Send waiting for its screenshot: the batch, the page shot's path and the recipient.
+struct Attach {
+    batch: AnnotationBatch,
+    page: std::path::PathBuf,
+    to: Option<Recipient>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct RegionInfo {
+    pub anchor: Option<String>,
+    pub rect: (f32, f32, f32, f32),
+    /// Off the page now: `rect` is meaningless and the picture is the whole viewport.
+    pub detached: bool,
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+/// Request ids the view uses for its own `PickInfo` questions (agents count from 1; style
+/// panels from 1 << 40).
+pub const VIEW_REQ_BASE: u64 = 1 << 41;
+
+/// What a view-owned page question was for.
+#[derive(Clone, Copy, Debug)]
+enum PageAsk {
+    /// The element under a pick click, for the comment field (S7).
+    CommentTarget,
+    /// The element under a pick click, for the style panel (S10).
+    StyleTarget,
+    /// The element under a region's corner, to anchor it (S6).
+    RegionAnchor(region::Rect),
+    /// A2: the hovered element's label, for the chip on the hover box.
+    Hover,
+    /// A3: an arrow key's step from the current pick (PickRelative).
+    Step,
+    /// HERDR: S13. The element under a double-click, to edit its text in place.
+    TextEdit,
+}
+
+use super::{BrowserRegistry, BrowserState, FrameSink, FrameView, HostLink};
+use crate::layout::BrowserBlock;
+use gpui::prelude::FluentBuilder as _;
+use gpui::*;
+use gpui_base::input::{Input, InputEvent, InputState};
+use herdr_browser_protocol::{self as protocol, PickStep, DownloadState, MouseKind, OverlayQuery, AppToHost, BrowserId, HostToApp, PixelSize, Size as Dips};
+use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, Instant};
+
+/// Console lines a block keeps.
+const CONSOLE_KEEP: usize = 200;
+
+/// How long a fresh host gets to open its socket.
+const HOST_START: Duration = Duration::from_secs(10);
+
+/// Where the host lives and how to start it.
+#[derive(Clone, Debug)]
+pub struct HostConfig {
+    /// `$HERDR_APP_HOME/browser`: `host.sock` and the shared `profile` cache.
+    pub dir: PathBuf,
+    /// `herdr-browser-host`: `$HERDR_BROWSER_HOST`, else beside the app's binary.
+    pub program: PathBuf,
+    /// Extra arguments (`--stub` from `$HERDR_BROWSER_HOST_ARGS`, for tests).
+    pub args: Vec<String>,
+    /// A TCP CDP port (0 picks one; any local process can attach): dev only, from `HERDR_BROWSER_CDP_PORT`.
+    /// By default there is none: CDP is on a pipe only the app holds (docs/browser-cdp-pipe.md).
+    pub cdp_port: Option<u16>,
+}
+
+/// HERDR_BROWSER_CDP_PORT: no TCP port unless a developer build asks for one with a number
+/// (`0`: any free port). Anything else, a misspelled `off` included, keeps CDP on the app's pipe,
+/// and release builds never open one (an open port is unauthenticated; agents use the broker).
+fn cdp_port(value: Option<&str>, developer_build: bool) -> Option<u16> {
+    let value = value?.trim();
+    match value.parse::<u16>() {
+        Ok(port) if developer_build => Some(port),
+        Ok(_) => {
+            tracing::warn!("HERDR_BROWSER_CDP_PORT ignored: release builds keep CDP on the app's pipe");
+            None
+        }
+        Err(_) if value.is_empty() || value == "off" => None,
+        Err(_) => {
+            tracing::warn!("HERDR_BROWSER_CDP_PORT={value:?} is not a port number; CDP stays on the app's pipe");
+            None
+        }
+    }
+}
+
+impl HostConfig {
+    pub fn from_env() -> Self {
+        let program = std::env::var_os("HERDR_BROWSER_HOST").filter(|v| !v.is_empty()).map(PathBuf::from).unwrap_or_else(|| {
+            std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("herdr-browser-host"))).unwrap_or_else(|| "herdr-browser-host".into())
+        });
+        let args = std::env::var("HERDR_BROWSER_HOST_ARGS").map(|a| a.split_whitespace().map(str::to_owned).collect()).unwrap_or_default();
+        let cdp_port = cdp_port(std::env::var("HERDR_BROWSER_CDP_PORT").ok().as_deref(), cfg!(debug_assertions));
+        Self { dir: crate::mods::app_dir().join("browser"), program, args, cdp_port }
+    }
+
+    pub fn socket(&self) -> PathBuf {
+        self.dir.join("host.sock")
+    }
+}
+
+/// What a browser needs to be made again after the host restarts.
+#[derive(Clone, Debug, PartialEq)]
+struct Open {
+    url: Option<String>,
+    profile: Option<String>,
+    size: Dips,
+    scale: f32,
+    /// Responsive mode's UA and touch, replayed after a host restart with the page.
+    device: Option<protocol::Device>,
+}
+
+type Subscriber = async_channel::Sender<HostToApp>;
+
+#[derive(Default)]
+struct Shared {
+    open: HashMap<BrowserId, Open>,
+    subs: HashMap<BrowserId, Subscriber>,
+    /// Bumped each time a host connection ends; readers of an older one stay quiet.
+    generation: u64,
+    /// Hears every host message (the agent commands, part 5).
+    tap: Option<Tap>,
+    /// The current host's CDP pipe (None: a host the app didn't start, or a port was asked for).
+    cdp: Option<Arc<CdpPipe>>,
+}
+
+pub type Tap = Arc<dyn Fn(&HostToApp) + Send + Sync>;
+
+/// Hand `msg` to the tap, outside the lock.
+fn tell_tap(shared: &Mutex<Shared>, msg: &HostToApp) {
+    let tap = shared.lock().unwrap().tap.clone();
+    if let Some(tap) = tap {
+        tap(msg);
+    }
+}
+
+/// The app's one connection to `herdr-browser-host` (the `HostLink` every part sends through).
+pub struct HostClient {
+    config: HostConfig,
+    shared: Arc<Mutex<Shared>>,
+    queue: mpsc::Sender<AppToHost>,
+}
+
+impl HostClient {
+    pub fn new(config: HostConfig) -> Arc<Self> {
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        let (queue, rx) = mpsc::channel();
+        let (cfg, sh) = (config.clone(), shared.clone());
+        std::thread::Builder::new()
+            .name("browser-host".into())
+            .spawn(move || Writer { config: cfg, shared: sh, conn: None, replayed: HashSet::new() }.run(rx))
+            .expect("browser host thread");
+        Arc::new(Self { config, shared, queue })
+    }
+
+    pub fn config(&self) -> &HostConfig {
+        &self.config
+    }
+
+    /// Host events for browser `id` (and the app-wide ones: a crash, an error without an id).
+    pub fn subscribe(&self, id: &str) -> async_channel::Receiver<HostToApp> {
+        let (tx, rx) = async_channel::unbounded();
+        self.shared.lock().unwrap().subs.insert(id.to_owned(), tx);
+        rx
+    }
+
+    /// The block is gone: close its page and stop its events.
+    pub fn close(&self, id: &str) {
+        let was_open = {
+            let mut s = self.shared.lock().unwrap();
+            s.subs.remove(id);
+            s.open.contains_key(id)
+        };
+        if was_open {
+            self.send(AppToHost::Close { id: id.to_owned() });
+        }
+    }
+
+    /// The current host's CDP pipe, for the broker (fork-agent); None when there is none or it is over.
+    pub fn cdp(&self) -> Option<Arc<CdpPipe>> {
+        self.shared.lock().unwrap().cdp.clone().filter(|p| !p.is_dead())
+    }
+
+    /// Every host message also goes to `tap` (after the views get theirs).
+    pub fn set_tap(&self, tap: Tap) {
+        self.shared.lock().unwrap().tap = Some(tap);
+    }
+
+    /// Browsers the host should have open now.
+    pub fn open_ids(&self) -> Vec<BrowserId> {
+        let mut ids: Vec<_> = self.shared.lock().unwrap().open.keys().cloned().collect();
+        ids.sort();
+        ids
+    }
+}
+
+impl HostLink for HostClient {
+    fn send(&self, msg: AppToHost) {
+        {
+            let mut s = self.shared.lock().unwrap();
+            match &msg {
+                AppToHost::Create { id, url, size, scale, profile } => {
+                    s.open.insert(id.clone(), Open { url: url.clone(), profile: profile.clone(), size: *size, scale: *scale, device: None });
+                }
+                AppToHost::Resize { id, size, scale } => {
+                    if let Some(o) = s.open.get_mut(id) {
+                        (o.size, o.scale) = (*size, *scale);
+                    }
+                }
+                AppToHost::Navigate { id, url } => {
+                    if let Some(o) = s.open.get_mut(id) {
+                        o.url = Some(url.clone());
+                    }
+                }
+                AppToHost::Close { id } => {
+                    s.open.remove(id);
+                }
+                AppToHost::SetDevice { id, device } => {
+                    if let Some(o) = s.open.get_mut(id) {
+                        o.device = device.clone();
+                    }
+                }
+                _ => {}
+            }
+        }
+        let _ = self.queue.send(msg);
+    }
+}
+
+impl Drop for HostClient {
+    fn drop(&mut self) {
+        let _ = self.queue.send(AppToHost::Shutdown);
+    }
+}
+
+struct Conn {
+    stream: UnixStream,
+    child: Option<Child>,
+    generation: u64,
+}
+
+/// The thread that owns the socket: starts the host when there is none, writes in order.
+struct Writer {
+    config: HostConfig,
+    shared: Arc<Mutex<Shared>>,
+    conn: Option<Conn>,
+    /// Pages made again at connect whose own queued `Create` is still to come: it is skipped.
+    replayed: HashSet<BrowserId>,
+}
+
+impl Writer {
+    fn run(mut self, rx: mpsc::Receiver<AppToHost>) {
+        while let Ok(msg) = rx.recv() {
+            if matches!(msg, AppToHost::Shutdown) {
+                self.shutdown();
+                return;
+            }
+            // Closing a page on a host that isn't running needs no host.
+            let dead = self.conn.as_ref().is_none_or(|c| c.generation != self.shared.lock().unwrap().generation);
+            if dead && matches!(msg, AppToHost::Close { .. } | AppToHost::FrameAck { .. } | AppToHost::Focus { .. }) {
+                continue;
+            }
+            if dead {
+                self.drop_conn(None);
+                match self.connect() {
+                    Ok(c) => {
+                        self.conn = Some(c);
+                        // The host forgot everything: make every open page again, at its newest
+                        // url and size. Creates already queued behind this are then skipped.
+                        let mut open: Vec<_> = self.shared.lock().unwrap().open.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                        open.sort_by(|a, b| a.0.cmp(&b.0));
+                        self.replayed = open.iter().map(|(id, _)| id.clone()).collect();
+                        for (id, o) in open {
+                            self.write(&AppToHost::Create { id: id.clone(), url: o.url, size: o.size, scale: o.scale, profile: o.profile });
+                            if o.device.is_some() {
+                                self.write(&AppToHost::SetDevice { id, device: o.device });
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("browser host: {e:#}");
+                        self.broadcast_crash(format!("{e:#}"));
+                        continue;
+                    }
+                }
+            }
+            match &msg {
+                AppToHost::Create { id, .. } if self.replayed.remove(id) => continue,
+                AppToHost::Close { id } => {
+                    self.replayed.remove(id);
+                }
+                _ => {}
+            }
+            self.write(&msg);
+        }
+        self.shutdown();
+    }
+
+    fn write(&mut self, msg: &AppToHost) {
+        let Some(c) = &mut self.conn else { return };
+        let mut line = protocol::encode(msg);
+        line.push('\n');
+        if let Err(e) = c.stream.write_all(line.as_bytes()) {
+            self.drop_conn(Some(format!("host went away: {e}")));
+        }
+    }
+
+    fn connect(&mut self) -> anyhow::Result<Conn> {
+        std::fs::create_dir_all(&self.config.dir)?;
+        let sock = self.config.socket();
+        // A host left from an earlier run of this app is reused; otherwise start one.
+        let (stream, child) = match UnixStream::connect(&sock) {
+            Ok(s) => (s, None),
+            Err(_) => {
+                let _ = std::fs::remove_file(&sock);
+                let mut cmd = Command::new(&self.config.program);
+                cmd.arg("--socket").arg(&sock).args(&self.config.args).stdin(Stdio::null());
+                let spawned = if self.config.cdp_port.is_none() && cdp_pipe_wanted() && cfg!(target_os = "macos") {
+                    spawn_cdp(&mut cmd).map(|(c, p)| (c, Some(p)))
+                } else {
+                    cmd.spawn().map(|c| (c, None))
+                };
+                let (mut child, cdp) = spawned.map_err(|e| anyhow::anyhow!("can't start {}: {e}", self.config.program.display()))?;
+                // A new host, a new pipe: calls on the old one fail now ("restarted").
+                if let Some(old) = std::mem::replace(&mut self.shared.lock().unwrap().cdp, cdp) {
+                    old.fail("the browser host restarted");
+                }
+                let deadline = Instant::now() + HOST_START;
+                loop {
+                    if let Ok(s) = UnixStream::connect(&sock) {
+                        break (s, Some(child));
+                    }
+                    if let Ok(Some(status)) = child.try_wait() {
+                        anyhow::bail!("browser host exited at start ({status})");
+                    }
+                    if Instant::now() > deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        anyhow::bail!("browser host didn't open {} in time", sock.display());
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        };
+        let generation = self.shared.lock().unwrap().generation;
+        let reader = stream.try_clone()?;
+        let shared = self.shared.clone();
+        std::thread::Builder::new().name("browser-host-read".into()).spawn(move || read(reader, shared, generation))?;
+        let mut conn = Conn { stream, child, generation };
+        let hello = AppToHost::Hello {
+            version: protocol::PROTOCOL_VERSION,
+            // Resolved (/tmp is /private/tmp on macOS): CEF wants its cache under this exact path.
+            profile_dir: std::fs::canonicalize(&self.config.dir).unwrap_or_else(|_| self.config.dir.clone()).join("profile").to_string_lossy().into_owned(),
+            cdp_port: self.config.cdp_port,
+            cdp_pipe: self.shared.lock().unwrap().cdp.as_ref().is_some_and(|p| !p.is_dead()),
+        };
+        conn.stream.write_all(format!("{}\n", protocol::encode(&hello)).as_bytes())?;
+        Ok(conn)
+    }
+
+    /// The connection is over (an error, or the host died): kill what we started.
+    fn drop_conn(&mut self, why: Option<String>) {
+        if let Some(mut c) = self.conn.take() {
+            let _ = c.stream.shutdown(std::net::Shutdown::Both);
+            if let Some(child) = &mut c.child {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            let current = {
+                let mut s = self.shared.lock().unwrap();
+                let current = s.generation == c.generation;
+                if current {
+                    s.generation += 1;
+                }
+                current
+            };
+            if let (true, Some(why)) = (current, why) {
+                self.broadcast_crash(why);
+            }
+        }
+    }
+
+    fn broadcast_crash(&self, reason: String) {
+        let crash = HostToApp::Crashed { id: None, reason };
+        for tx in self.shared.lock().unwrap().subs.values() {
+            let _ = tx.try_send(crash.clone());
+        }
+        tell_tap(&self.shared, &crash);
+    }
+
+    fn shutdown(&mut self) {
+        if self.conn.is_some() {
+            self.write(&AppToHost::Shutdown);
+        }
+        if let Some(c) = &mut self.conn
+            && let Some(child) = &mut c.child
+        {
+            // A moment to close cleanly, then it goes.
+            let deadline = Instant::now() + Duration::from_millis(500);
+            while Instant::now() < deadline && matches!(child.try_wait(), Ok(None)) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        self.drop_conn(None);
+    }
+}
+
+/// Host lines to the views. At the end (the host died) every view hears `Crashed`.
+fn read(stream: UnixStream, shared: Arc<Mutex<Shared>>, generation: u64) {
+    for line in BufReader::new(stream).lines() {
+        let Ok(line) = line else { break };
+        let msg = match protocol::decode::<HostToApp>(&line) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!("browser host sent {line:?}: {e}");
+                continue;
+            }
+        };
+        let mut s = shared.lock().unwrap();
+        if s.generation != generation {
+            return;
+        }
+        if let HostToApp::Url { id, url } = &msg
+            && let Some(o) = s.open.get_mut(id)
+        {
+            o.url = Some(url.clone());
+        }
+        match target(&msg) {
+            Some(id) => {
+                if let Some(tx) = s.subs.get(id) {
+                    let _ = tx.try_send(msg.clone());
+                }
+            }
+            None => {
+                for tx in s.subs.values() {
+                    let _ = tx.try_send(msg.clone());
+                }
+            }
+        }
+        drop(s);
+        tell_tap(&shared, &msg);
+    }
+    let mut s = shared.lock().unwrap();
+    if s.generation == generation {
+        s.generation += 1;
+        let crash = HostToApp::Crashed { id: None, reason: "the browser host stopped".into() };
+        for tx in s.subs.values() {
+            let _ = tx.try_send(crash.clone());
+        }
+        drop(s);
+        tell_tap(&shared, &crash);
+    }
+}
+
+fn target(msg: &HostToApp) -> Option<&BrowserId> {
+    use HostToApp as H;
+    match msg {
+        H::Ready { .. } => None,
+        H::Crashed { id, .. } | H::Error { id, .. } => id.as_ref(),
+        H::Frame { id, .. }
+        | H::Title { id, .. }
+        | H::ContextMenu { id, .. }
+        | H::StylesResult { id, .. }
+        | H::PickInfoResult { id, .. }
+        // HERDR: S13 inline text edit.
+        | H::TextEditResult { id, .. }
+        | H::Url { id, .. }
+        | H::Loading { id, .. }
+        | H::Cursor { id, .. }
+        | H::Favicon { id, .. }
+        | H::LoadError { id, .. }
+        | H::NewWindow { id, .. }
+        | H::Download { id, .. }
+        | H::FileChooser { id, .. }
+        | H::Dialog { id, .. }
+        | H::Permission { id, .. }
+        | H::PopupClosed { id, .. }
+        | H::PopupBlocked { id, .. }
+        | H::PopupOpened { opener: id, .. }
+        | H::ImeCaret { id, .. }
+        | H::FindResult { id, .. }
+        | H::Console { id, .. }
+        | H::EvalResult { id, .. }
+        | H::ScreenshotDone { id, .. }
+        | H::CdpTarget { id, .. }
+        | H::OverlayRects { id, .. }
+        | H::Viewport { id, .. } => Some(id),
+    }
+}
+
+actions!(browser, [FocusAddress, OpenFind, ZoomIn, ZoomOut, ZoomReset]);
+
+/// What was typed into the address bar, as a page to open: a url as it is, a bare host
+/// (`example.com/x`, `localhost:3000`) over https, anything else searched. None: nothing typed.
+pub fn address_to_url(typed: &str, engine: crate::settings::SearchEngine) -> Option<String> {
+    let t = typed.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let scheme = t.split_once(':').is_some_and(|(s, rest)| {
+        !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c)) && (rest.starts_with("//") || ["about", "data", "file", "javascript", "mailto", "chrome", "view-source"].contains(&s.to_ascii_lowercase().as_str()))
+    });
+    if scheme {
+        return Some(t.to_owned());
+    }
+    let host = t.split(['/', '?', '#']).next().unwrap_or("");
+    let name = host.rsplit_once(':').filter(|(_, port)| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit())).map_or(host, |(h, _)| h);
+    let hostlike = !t.contains(char::is_whitespace)
+        && !name.is_empty()
+        && (name.eq_ignore_ascii_case("localhost") || (name.contains('.') && !name.starts_with('.') && !name.ends_with('.')))
+        && name.chars().all(|c| c.is_alphanumeric() || "-.[]:".contains(c));
+    if hostlike {
+        let local = name.eq_ignore_ascii_case("localhost") || name.split('.').all(|p| p.parse::<u8>().is_ok());
+        return Some(format!("{}://{t}", if local { "http" } else { "https" }));
+    }
+    Some(engine.url(t))
+}
+
+/// What the block tells its window: the page moved, so the layout document follows.
+#[derive(Clone, Debug, PartialEq)]
+pub enum BrowserEvent {
+    Url(String),
+    /// The page took the keyboard: it is the browser agent commands act on by default.
+    Focused,
+    /// A link or script asked for a new window or tab: the window opens a block beside this one.
+    NewWindow(String),
+    /// Pick mode: the user clicked an element at (x, y) page DIPs (its highlight is the overlay).
+    Picked { x: f32, y: f32 },
+    /// The page's title or favicon changed (`state` has them): the window republishes its tabs.
+    PageInfo,
+    /// S6: a region was drawn (page DIPs); `BrowserView::regions` keeps it anchored.
+    Region(region::Rect),
+    /// S7 Send: the annotation batch, with its picture, for the agent (S8, `Browsers::annotations`).
+    Annotations(AnnotationBatch),
+    /// Show a toast (a download finished or failed): `{"title","body","level"}`.
+    Notice(serde_json::Value),
+    /// S27: the Send badge was clicked; the window answers with `show_recipients`.
+    PickRecipient,
+}
+
+/// One browser block on screen.
+pub struct BrowserView {
+    id: BrowserId,
+    block: BrowserBlock,
+    link: Arc<HostClient>,
+    pub state: BrowserState,
+    /// The host or the page died; the block shows a reload card until clicked.
+    crashed: Option<String>,
+    /// Real popups this page opened (window.open), shown as cards over it; and ones the host
+    /// announced that the next render makes (a view needs the window): (id, url, w, h).
+    popups: Vec<(Entity<BrowserView>, (f32, f32))>,
+    popups_due: Vec<(BrowserId, String, f32, f32)>,
+    /// A popup the page asked for without a click (refused): its url, for "Open as tab".
+    blocked_popup: Option<String>,
+    /// This view is a popup: its opener, and whether it closed (window.close or the host).
+    opener: Option<BrowserId>,
+    popup_closed: bool,
+    /// Made by the host already (a popup): the first layout resizes it instead of creating it.
+    adopted: bool,
+    /// Responsive mode: the device the page is previewed as (its real viewport), and the page
+    /// area's own size (the device is letterboxed into it); the device menu while open.
+    device: Option<super::devices::Mode>,
+    measured: Option<(Dips, f32)>,
+    device_menu: bool,
+    /// Site permission requests waiting on the person, oldest first (req, origin, kinds); the bar
+    /// shows the first. The host denies any left after 60 s, on close and when the page changes.
+    prompts: std::collections::VecDeque<(u64, String, Vec<String>)>,
+    /// The bar's "Remember for this site" box (the person's profile only).
+    prompt_remember: bool,
+    /// The main frame's failed load (kind, code, url): an error card over the page until the next load.
+    load_error: Option<(String, i32, String)>,
+    /// Size and scale the host was last told; None: no page made yet.
+    sized: Option<(Dips, f32)>,
+    /// The newest frame from the host, painted into the page area (part 3).
+    frames: FrameView,
+    /// The last frame acked (each frame is acked once, however often it's painted).
+    acked: Option<u64>,
+    focus: FocusHandle,
+    input: Entity<BrowserInput>,
+    was_focused: bool,
+    /// The page's newest console lines (at most `CONSOLE_KEEP`), oldest first.
+    console: std::collections::VecDeque<String>,
+    /// The address bar; shows the page's url unless someone is typing in it.
+    address: Entity<InputState>,
+    address_stale: bool,
+    states: Arc<Mutex<HashMap<BrowserId, BrowserState>>>,
+    _events: Task<()>,
+    /// S27: the recipient popover and the last addressed send.
+    send_to: send_to::SendTo,
+    /// Re-checks the Send chip once a second while the batch is unread.
+    chip_poll: Option<Task<()>>,
+    _focus: [Subscription; 2],
+    _address: Subscription,
+    _visibility: Subscription,
+    probe: Option<FrameProbe>,
+    /// Page overlays (highlight, pick, find matches): epochs and hover coalescing (geometry.rs).
+    overlay: OverlayState,
+    /// Chrome zoom level: the one set here, or the page reported (`Viewport`).
+    zoom_level: f64,
+    /// Zoom per host (shared by every block through `Browsers`).
+    zoom_prefs: Arc<Mutex<zoom::ZoomPrefs>>,
+    /// The page's scroll offset the host last reported (CSS px).
+    scroll: (f32, f32),
+    /// The open context menu (the host asked; the app draws it).
+    menu: Option<Menu>,
+    /// The find bar, when open (I9).
+    find: Option<FindBar>,
+    /// Markup drawn over the page (markup.rs); shown while marking up or when shapes exist.
+    markup: Entity<Markup>,
+    /// When the user's input was last refused under an agent lease (the strip flashes).
+    refused_at: Option<std::time::Instant>,
+    /// Whether the mode strip (markup tools, the agent lease) was drawn last render.
+    strip_shown: bool,
+    /// S6: pick click or region drag; the rubber band while dragging (page DIPs); kept regions.
+    region_drag: region::RegionDrag,
+    rubber: Option<region::Rect>,
+    pub regions: Vec<region::Region>,
+    /// S7: the annotation queue; comment-on-pick; the target the comment field is open on.
+    annotations: annotate::Annotations,
+    comment_on_pick: bool,
+    comment_target: Option<annotate::Target>,
+    // HERDR: S13 inline text edit.
+    text_edit: super::text_edit::TextEdit,
+    /// A2/A3: the element the pick is on (its label for the chip). `stepped`: an arrow key chose it,
+    /// so the highlight and the next click use it, not the pointer's element.
+    hovered: Option<annotate::Target>,
+    stepped: bool,
+    /// A2: the hover label request in flight, and the newest point waiting behind it.
+    hover_ask: Option<u64>,
+    hover_next: Option<Pt>,
+    /// A9: each pin's scroll (page DIPs) when it was made, so pins follow the page; the pin whose
+    /// popover is open; the pin a reopened comment field edits.
+    pin_scroll: HashMap<u32, (f32, f32)>,
+    open_pin: Option<u32>,
+    editing_pin: Option<u32>,
+    /// Page questions in flight (view-owned PickInfo reqs >= VIEW_REQ_BASE).
+    asks: HashMap<u64, PageAsk>,
+    next_ask: u64,
+    /// S10: the style panel on the picked element (beside the page); its answers wait for render.
+    styles_on_pick: bool,
+    /// Regions anchored to the document (for the attach picture), with the anchor selector if any.
+    region_docs: Vec<(region::Region, Option<String>)>,
+    /// Sends waiting for their screenshot: the batch and the page picture's path.
+    attaching: HashMap<u64, Attach>,
+    style_panel: Option<Entity<StylePanelView>>,
+    style_results: Vec<(u64, bool, Vec<herdr_browser_protocol::StyleRow>)>,
+    /// JS dialogs, the file chooser and download notices (dialogs.rs, fork-host's).
+    dialogs: Entity<PageDialogs>,
+    /// The app's downloads (shared by every block); the bar's ⬇ opens the list.
+    downloads: Downloads,
+    downloads_open: bool,
+    /// S29: the shield popover (what agents may do here) is open.
+    shield_open: bool,
+    /// The agents' side (its grants); set by `Browsers` when it makes the view.
+    agent: Option<Arc<Mutex<Agent>>>,
+    _dialogs: Subscription,
+}
+
+/// The find bar: its input, what was last searched and the host's "active of count".
+pub struct FindBar {
+    pub input: Entity<InputState>,
+    pub text: String,
+    pub count: u32,
+    pub active: u32,
+    _typed: Subscription,
+}
+
+/// App-handled context menu commands (CEF's MENU_ID_USER_FIRST and up): the app does these itself.
+pub const MENU_OPEN_LINK_IN_NEW_TAB: i32 = 26500;
+pub const MENU_COPY_LINK_ADDRESS: i32 = 26501;
+pub const MENU_SAVE_IMAGE_AS: i32 = 26502;
+
+/// Height of one context menu row and the menu's width, in DIPs.
+pub const MENU_ROW: f32 = 24.0;
+pub const MENU_WIDTH: f32 = 220.0;
+
+/// A context menu the host asked for, as the app shows it.
+#[derive(Clone, Debug)]
+pub struct Menu {
+    pub req: u64,
+    /// Where it opens, page DIPs.
+    pub at: (f32, f32),
+    /// Rows, submenus flattened (their labels prefixed); command 0 is a separator.
+    pub rows: Vec<herdr_browser_protocol::MenuItem>,
+    pub link_url: Option<String>,
+    pub src_url: Option<String>,
+}
+
+impl Menu {
+    /// The host's items plus the app's own for a link or an image, in Chrome's order.
+    pub fn build(req: u64, x: f32, y: f32, link_url: Option<String>, src_url: Option<String>, items: Vec<herdr_browser_protocol::MenuItem>) -> Menu {
+        use herdr_browser_protocol::MenuItem;
+        let item = |command, label: &str| MenuItem { command, label: label.into(), enabled: true, checked: false, submenu: vec![] };
+        let sep = || MenuItem { command: 0, label: String::new(), enabled: false, checked: false, submenu: vec![] };
+        let mut rows = Vec::new();
+        if link_url.is_some() {
+            rows.push(item(MENU_OPEN_LINK_IN_NEW_TAB, "Open Link in New Tab"));
+            rows.push(item(MENU_COPY_LINK_ADDRESS, "Copy Link Address"));
+            rows.push(sep());
+        }
+        if src_url.is_some() {
+            rows.push(item(MENU_SAVE_IMAGE_AS, "Save Image As…"));
+            rows.push(sep());
+        }
+        fn flatten(out: &mut Vec<herdr_browser_protocol::MenuItem>, items: Vec<herdr_browser_protocol::MenuItem>, prefix: &str) {
+            for mut i in items {
+                let sub = std::mem::take(&mut i.submenu);
+                if sub.is_empty() {
+                    if !prefix.is_empty() && i.command != 0 {
+                        i.label = format!("{prefix} › {}", i.label);
+                    }
+                    out.push(i);
+                } else {
+                    flatten(out, sub, &i.label);
+                }
+            }
+        }
+        flatten(&mut rows, items, "");
+        // No leading, trailing or doubled separators.
+        let mut clean: Vec<MenuItem> = Vec::new();
+        for r in rows {
+            if r.command == 0 && clean.last().is_none_or(|l| l.command == 0) {
+                continue;
+            }
+            clean.push(r);
+        }
+        while clean.last().is_some_and(|l| l.command == 0) {
+            clean.pop();
+        }
+        Menu { req, at: (x, y), rows: clean, link_url, src_url }
+    }
+
+    /// The row at page point (x, y), if it's a command row.
+    pub fn row_at(&self, x: f32, y: f32) -> Option<usize> {
+        let (mx, my) = self.at;
+        if x < mx || x > mx + MENU_WIDTH || y < my + 4.0 {
+            return None;
+        }
+        let i = ((y - my - 4.0) / MENU_ROW) as usize;
+        self.rows.get(i).filter(|r| r.command != 0).map(|_| i)
+    }
+}
+
+/// What a frame probe hears (`BrowserView::set_frame_probe`). `Painted` comes with every draw
+/// that shows the frame, so the first one per `seq` is its paint time.
+#[derive(Clone, Debug)]
+pub enum FrameEvent {
+    Arrived { seq: u64, surface: herdr_browser_protocol::SurfaceRef, size: herdr_browser_protocol::PixelSize },
+    Painted { seq: u64 },
+    Acked { seq: u64 },
+}
+
+pub type FrameProbe = Arc<dyn Fn(&FrameEvent) + Send + Sync>;
+
+/// A tab (as mods see it, `model::space_json`) showing page `st`: unnamed, it takes the page's
+/// title; `page_title`, `favicon` and `url` go with it for tab strips that show them.
+pub fn annotate_tab(tab: &mut serde_json::Value, st: &BrowserState, named: bool) {
+    if !named && !st.title.is_empty() {
+        tab["name"] = serde_json::json!(st.title);
+    }
+    tab["page_title"] = serde_json::json!(st.title);
+    tab["favicon"] = serde_json::json!(st.favicon);
+    tab["url"] = serde_json::json!(st.url);
+}
+
+/// Height of the bar above the page (back, forward, reload, address), in DIPs.
+pub const CHROME_HEIGHT: f32 = 28.0;
+
+/// Height of the find bar under it, when open.
+pub const FIND_HEIGHT: f32 = 28.0;
+
+impl EventEmitter<BrowserEvent> for BrowserView {}
+
+impl BrowserView {
+    pub fn new(id: &str, block: BrowserBlock, link: Arc<HostClient>, states: Arc<Mutex<HashMap<BrowserId, BrowserState>>>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let rx = link.subscribe(id);
+        let events = cx.spawn(async move |this, cx| {
+            while let Ok(msg) = rx.recv().await {
+                if this.update(cx, |v, cx| v.on_host(msg, cx)).is_err() {
+                    break;
+                }
+            }
+        });
+        let focus = cx.focus_handle();
+        // Part 4: mouse, keys and IME for this page; it tells the host about focus too.
+        let raw = block.raw_chords;
+        let input = cx.new(|_| {
+            let mut i = BrowserInput::new(id.to_owned(), link.clone() as Arc<dyn HostLink>);
+            i.set_raw_chords(raw);
+            i
+        });
+        let on = cx.on_focus(&focus, window, |v, _, cx| {
+            v.input.update(cx, |i, _| i.set_focused(true));
+            cx.emit(BrowserEvent::Focused);
+        });
+        let off = cx.on_blur(&focus, window, |v, _, cx| v.input.update(cx, |i, _| i.set_focused(false)));
+        bind_keys(cx);
+        let downloads = Downloads::default();
+        let (dialogs, dialogs_sub) = Self::make_dialogs(id, &link, downloads.clone(), cx);
+        let address = cx.new(|cx| InputState::new(window, cx).placeholder("Search or enter address"));
+        let typed = cx.subscribe_in(&address, window, |v, input, ev: &InputEvent, window, cx| match ev {
+            InputEvent::PressEnter { .. } => {
+                let text = input.read(cx).value();
+                if let Some(url) = address_to_url(&text, crate::settings::get().search_engine) {
+                    v.navigate(url, cx);
+                    window.focus(&v.focus, cx);
+                }
+            }
+            // Left without Enter: back to the page's url.
+            InputEvent::Blur => {
+                v.address_stale = true;
+                cx.notify();
+            }
+            _ => {}
+        });
+        // Occluded, minimized, another Space, display asleep: the host stops painting until shown.
+        let visibility = cx.observe_window_visibility(window, |v, visibility, _, cx| {
+            let visible = visibility.is_visible();
+            if v.frames.set_visible(visible) {
+                v.link.send(AppToHost::SetVisible { id: v.id.clone(), visible });
+                if visible {
+                    v.acked = None;
+                }
+                cx.notify();
+            }
+        });
+        let state = BrowserState { url: block.url.clone(), profile: block.profile.clone(), ..Default::default() };
+        states.lock().unwrap().insert(id.to_owned(), state.clone());
+        Self {
+            id: id.to_owned(),
+            block,
+            link,
+            state,
+            crashed: None,
+            popups: Vec::new(),
+            popups_due: Vec::new(),
+            blocked_popup: None,
+            opener: None,
+            popup_closed: false,
+            adopted: false,
+            device: None,
+            measured: None,
+            device_menu: false,
+            prompts: Default::default(),
+            prompt_remember: false,
+            load_error: None,
+            sized: None,
+            frames: FrameView::new(),
+            acked: None,
+            focus,
+            input,
+            was_focused: false,
+            console: Default::default(),
+            address,
+            address_stale: true,
+            states,
+            _events: events,
+            send_to: send_to::SendTo::default(),
+            chip_poll: None,
+            _focus: [on, off],
+            _address: typed,
+            _visibility: visibility,
+            probe: None,
+            overlay: OverlayState::default(),
+            zoom_level: 0.0,
+            zoom_prefs: Default::default(),
+            scroll: (0.0, 0.0),
+            menu: None,
+            find: None,
+            markup: cx.new(|_| Markup::default()),
+            refused_at: None,
+            strip_shown: false,
+            region_drag: Default::default(),
+            rubber: None,
+            regions: Vec::new(),
+            annotations: Default::default(),
+            comment_on_pick: false,
+            comment_target: None,
+            text_edit: Default::default(),
+            hovered: None,
+            stepped: false,
+            hover_ask: None,
+            hover_next: None,
+            pin_scroll: HashMap::new(),
+            open_pin: None,
+            editing_pin: None,
+            asks: HashMap::new(),
+            next_ask: 0,
+            styles_on_pick: false,
+            region_docs: Vec::new(),
+            attaching: HashMap::new(),
+            style_panel: None,
+            style_results: Vec::new(),
+            dialogs,
+            downloads,
+            downloads_open: false,
+            shield_open: false,
+            agent: None,
+            _dialogs: dialogs_sub,
+        }
+    }
+
+    /// The page's input (part 4); the platform's text input reaches it as `EntityInputHandler`.
+    pub fn input(&self) -> &Entity<BrowserInput> {
+        &self.input
+    }
+
+    /// The page's newest console lines, oldest first.
+    pub fn console(&self) -> impl Iterator<Item = &str> {
+        self.console.iter().map(String::as_str)
+    }
+
+    /// The address bar's text state (tests type into it).
+    pub fn address(&self) -> &Entity<InputState> {
+        &self.address
+    }
+
+    pub fn focus_handle(&self) -> &FocusHandle {
+        &self.focus
+    }
+
+    pub fn crashed(&self) -> Option<&str> {
+        self.crashed.as_deref()
+    }
+
+    /// Open `url` in this block (the address bar, agents).
+    pub fn navigate(&mut self, url: String, cx: &mut Context<Self>) {
+        self.block.url = url.clone();
+        if self.sized.is_some() {
+            self.link.send(AppToHost::Navigate { id: self.id.clone(), url });
+        }
+        self.address_stale = true;
+        cx.notify();
+    }
+
+    /// The block as the view has it (url, profile, raw chords).
+    pub fn block(&self) -> &BrowserBlock {
+        &self.block
+    }
+
+    /// The layout changed the block (another url typed into the document): follow it.
+    /// The block's profile, fixed when the view was made.
+    pub fn profile(&self) -> &str {
+        &self.block.profile
+    }
+
+    pub fn set_block(&mut self, mut block: BrowserBlock, cx: &mut Context<Self>) {
+        // The launch url is the view's, used once: the document's copy never brings it back.
+        block.launch_url = self.block.launch_url.clone();
+        // A live block's profile is fixed at creation (its cookies, its grants policy): a layout
+        // update can't move it to another profile or turn the person's block into an agent's.
+        if block.profile != self.block.profile {
+            tracing::warn!("browser {}: layout asked to change its profile; ignored (close and reopen the block instead)", self.id);
+            block.profile = self.block.profile.clone();
+        }
+        if block == self.block {
+            return;
+        }
+        if block.raw_chords != self.block.raw_chords {
+            let on = block.raw_chords;
+            self.input.update(cx, |i, _| i.set_raw_chords(on));
+        }
+        let go = block.url != self.state.url && !block.url.is_empty();
+        self.block = block;
+        if go && self.sized.is_some() {
+            self.link.send(AppToHost::Navigate { id: self.id.clone(), url: self.block.url.clone() });
+        }
+        cx.notify();
+    }
+
+    pub fn on_host(&mut self, msg: HostToApp, cx: &mut Context<Self>) {
+        use HostToApp as H;
+        // Dialogs, the file chooser and downloads are the dialogs entity's (a crash also clears it).
+        let dialog = self.dialogs.update(cx, |d, cx| d.on_host(&msg, cx));
+        if dialog {
+            cx.notify();
+            return;
+        }
+        match msg {
+            H::Url { url, .. } => {
+                // A raw-chords (remote desktop) block's url may carry its one-time token: the app
+                // keeps, shows and saves it without the token.
+                let url = if self.block.raw_chords { without_token(&url) } else { url };
+                // The host denied what the old page asked for; the bar goes with it.
+                if url != self.state.url {
+                    self.prompts.clear();
+                    self.prompt_remember = false;
+                }
+                self.annotations.set_page(&url);
+                if url != self.state.url {
+                    self.overlay.changed(Change::Navigate);
+                    // A new page names its own icon (or none).
+                    if !self.state.favicon.is_empty() && zoom::host_of(&url) != zoom::host_of(&self.state.url) {
+                        self.state.favicon.clear();
+                        cx.emit(BrowserEvent::PageInfo);
+                    }
+                    // Another host: its remembered zoom (Chrome keeps zoom per host the same way).
+                    if zoom::host_of(&url) != zoom::host_of(&self.state.url) {
+                        let level = self.zoom_prefs.lock().unwrap().level_for(&url);
+                        if (level - self.zoom_level).abs() > 1e-6 {
+                            self.apply_zoom(level);
+                        }
+                    }
+                }
+                if url != self.state.url {
+                    self.state.url = url.clone();
+                    self.block.url = url.clone();
+                    self.address_stale = true;
+                    cx.emit(BrowserEvent::Url(url));
+                }
+            }
+            H::Title { title, .. } => {
+                if title != self.state.title {
+                    self.state.title = title;
+                    cx.emit(BrowserEvent::PageInfo);
+                }
+            }
+            H::Favicon { url, .. } => {
+                if url != self.state.favicon {
+                    self.state.favicon = url;
+                    cx.emit(BrowserEvent::PageInfo);
+                }
+            }
+            // The card shows from the failed load until the next load starts.
+            H::LoadError { url, code, kind, .. } => {
+                self.state.load_error = Some((kind.clone(), code));
+                self.load_error = Some((kind, code, url));
+            }
+            H::Loading { loading, can_back, can_forward, .. } => {
+                if loading {
+                    self.load_error = None;
+                    self.state.load_error = None;
+                }
+                (self.state.loading, self.state.can_back, self.state.can_forward) = (loading, can_back, can_forward);
+            }
+            H::Cursor { name, .. } => self.state.cursor = name,
+            H::Crashed { reason, .. } => {
+                // The host forgets the page; the reload card makes it again.
+                self.crashed = Some(reason);
+                self.sized = None;
+                self.frames.clear();
+                self.acked = None;
+                self.state.loading = false;
+            }
+            H::Frame { seq, surface, size, scale, .. } => {
+                if let Some(p) = &self.probe {
+                    p(&FrameEvent::Arrived { seq, surface: surface.clone(), size });
+                }
+                // Acked once painted (`send_ack` after the draw), so the host sends at most one ahead.
+                if let Err(e) = self.frames.on_frame(seq, surface, size, scale) {
+                    tracing::warn!("browser {}: frame {seq}: {e:#}", self.id);
+                    // Unpaintable: ack anyway, or the host waits on it forever.
+                    self.link.send(AppToHost::FrameAck { id: self.id.clone(), seq });
+                } else if crate::control::headless() && self.acked != Some(seq) {
+                    // A headless window never draws, so nothing would ack: take each frame as
+                    // shown, or the host stops after one and screenshots stay stale.
+                    self.acked = Some(seq);
+                    self.link.send(AppToHost::FrameAck { id: self.id.clone(), seq });
+                }
+            }
+            H::Console { message, .. } => {
+                if self.console.len() == CONSOLE_KEEP {
+                    self.console.pop_front();
+                }
+                self.console.push_back(message);
+                return;
+            }
+            H::Viewport { scroll_x, scroll_y, zoom_level, .. } => {
+                // Only a real move stales the overlays (the host may repeat itself).
+                let why = if zoom_level != self.zoom_level {
+                    Some(Change::Zoom)
+                } else if (scroll_x, scroll_y) != self.scroll {
+                    Some(Change::Scroll)
+                } else {
+                    None
+                };
+                (self.zoom_level, self.scroll) = (zoom_level, (scroll_x, scroll_y));
+                if let Some(why) = why {
+                    self.overlay.changed(why);
+                }
+                self.send_waiting_hover();
+            }
+            H::OverlayRects { req, epoch, rects, frames, .. } => {
+                let answer = OverlayAnswer {
+                    req,
+                    epoch: Epoch(epoch),
+                    rects: rects.iter().map(|r| Rect::new(r.x, r.y, r.w, r.h)).collect(),
+                    frames: frames.iter().map(|p| Pt { x: p.x, y: p.y }).collect(),
+                };
+                let geo = self.geometry();
+                self.overlay.answer(&answer, &geo);
+                self.send_waiting_hover();
+            }
+            H::FindResult { count, active, .. } => {
+                if let Some(f) = &mut self.find {
+                    (f.count, f.active) = (count, active);
+                }
+            }
+            H::ContextMenu { req, x, y, link_url, src_url, items, .. } => {
+                if let Some(old) = self.menu.take() {
+                    self.link.send(AppToHost::MenuResult { id: self.id.clone(), req: old.req, command: None });
+                }
+                self.menu = Some(Menu::build(req, x, y, link_url, src_url, items));
+            }
+            H::NewWindow { url, .. } => {
+                cx.emit(BrowserEvent::NewWindow(url));
+                return;
+            }
+            H::ImeCaret { x, y, w, h, .. } => {
+                self.input.update(cx, |i, _| i.on_caret(x, y, w, h));
+                return;
+            }
+            // The style panel's answers (its reqs start at 1 << 40); applied in render (needs the window).
+            H::StylesResult { req, ok, rows, .. } => {
+                if self.style_panel.as_ref().is_some_and(|p| p.read(cx).owns(req)) {
+                    self.style_results.push((req, ok, rows));
+                }
+            }
+            H::ScreenshotDone { req, ok, .. } if self.attaching.contains_key(&req) => self.finish_attach(req, ok, cx),
+            // HERDR: S13 inline text edit.
+            H::TextEditResult { req, ok, before, after, .. } => self.text_edit_answer(req, ok, before, after, cx),
+            H::PickInfoResult { req, ok, selector, label, rect, .. } if req >= VIEW_REQ_BASE => {
+                if let Some(ask) = self.asks.remove(&req) {
+                    self.on_target(ask, ok.then_some((selector, label, rect)), cx);
+                }
+            }
+            H::Permission { req, origin, kinds, .. } => {
+                // A remembered answer (the person's profile, exact origin and kind) needs no bar.
+                if let Some(allow) = super::permissions::decided(&self.link.config().dir, &self.block.profile, &origin, &kinds) {
+                    self.link.send(AppToHost::PermissionResult { id: self.id.clone(), req, allow });
+                    return;
+                }
+                self.prompts.push_back((req, origin, kinds));
+                // Drop it from the bar when the host's 60 s wait runs out (the host denies it).
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(Duration::from_secs(60)).await;
+                    let _ = this.update(cx, |v, cx| {
+                        // "Remember" belonged to the prompt that ran out, not to the next one.
+                        if v.prompts.front().is_some_and(|(r, _, _)| *r == req) {
+                            v.prompt_remember = false;
+                        }
+                        v.prompts.retain(|(r, _, _)| *r != req);
+                        cx.notify();
+                    });
+                })
+                .detach();
+            }
+            // The host minted `id`; only this page's own popups, and never an id already in use.
+            H::PopupOpened { opener, id, url, w, h } if opener == self.id => {
+                if !herdr_browser_protocol::is_popup_id(&id) || self.states.lock().unwrap().contains_key(&id) || self.popups_due.iter().any(|(p, ..)| *p == id) {
+                    // Never Close it: that id is a live block's.
+                    tracing::warn!("browser {}: popup id {id} is already in use; ignored", self.id);
+                } else {
+                    self.popups_due.push((id, url, w.unwrap_or(500.0), h.unwrap_or(600.0)));
+                }
+            }
+            H::PopupBlocked { url, .. } => self.blocked_popup = Some(url),
+            H::PopupClosed { .. } if self.opener.is_some() => self.popup_closed = true,
+            H::Error { message, .. } => tracing::warn!("browser {}: {message}", self.id),
+            _ => return,
+        }
+        self.states.lock().unwrap().insert(self.id.clone(), self.state.clone());
+        cx.notify();
+    }
+
+    /// The block was laid out at `size` (DIPs) and `scale`: make the page, or size it.
+    pub fn laid_out(&mut self, size: Dips, scale: f32) {
+        if self.crashed.is_some() || size.w < 1.0 || size.h < 1.0 {
+            return;
+        }
+        self.measured = Some((size, scale));
+        // Responsive mode: the page gets the device's real viewport, whatever the block's size.
+        let (size, scale) = self.device.as_ref().map_or((size, scale), |d| (Dips { w: d.w, h: d.h }, d.scale));
+        match self.sized {
+            None if self.adopted => {
+                self.link.send(AppToHost::Resize { id: self.id.clone(), size, scale });
+            }
+            None => {
+                // A launch url (with a one-time token) is used once and never kept.
+                let url = self.block.launch_url.take().or_else(|| Some(self.block.url.clone())).filter(|u| !u.is_empty());
+                // The shared profile is the host's default; another one names its own cache.
+                let profile = Some(self.block.profile.clone()).filter(|p| p != "default");
+                self.link.send(AppToHost::Create { id: self.id.clone(), url, size, scale, profile });
+            }
+            Some((s, k)) if (s.w - size.w).abs() < 0.5 && (s.h - size.h).abs() < 0.5 && k == scale => return,
+            Some(_) => {
+                self.frames.on_resize_pending(size);
+                self.overlay.changed(Change::Resize);
+                self.link.send(AppToHost::Resize { id: self.id.clone(), size, scale });
+            }
+        }
+        self.sized = Some((size, scale));
+    }
+
+    /// An agent drives this page before it was ever shown (a background tab, a headless
+    /// window): make it now at a desktop size; the first layout resizes it.
+    pub fn ensure_page(&mut self) {
+        if self.sized.is_none() && self.crashed.is_none() {
+            self.laid_out(Dips { w: 1280.0, h: 800.0 }, 2.0);
+        }
+    }
+
+    /// The reload card's button: a new page at the last url (starting the host again if needed).
+    /// The failed load's card: plain text only (the url is page-chosen), the url capped, Back and Reload.
+    /// The waiting permission requests, oldest first (origin, kinds), for tests and the bar.
+    pub fn prompts(&self) -> Vec<(String, Vec<String>)> {
+        self.prompts.iter().map(|(_, o, k)| (o.clone(), k.clone())).collect()
+    }
+
+    /// The bar's "Remember for this site" box.
+    pub fn set_prompt_remember(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.prompt_remember = on && self.block.profile == super::agent::PERSON_PROFILE;
+        cx.notify();
+    }
+
+    /// Responsive mode on (a device) or off: the page is resized to the device (or back to the
+    /// block) and told the device's UA and touch (or that every override is gone).
+    pub fn set_device(&mut self, mode: Option<super::devices::Mode>, cx: &mut Context<Self>) {
+        // Any choice closes the menu, even one that changes nothing.
+        if self.device_menu {
+            self.device_menu = false;
+            cx.notify();
+        }
+        if mode == self.device {
+            return;
+        }
+        self.device = mode;
+        // A new viewport: pick, markup, comments and text edit (for the old one) close, wherever
+        // they sit in the stack; an agent's lease stays. They can be opened again on the device.
+        if self.device.is_some() {
+            self.input.update(cx, |i, _| i.close_annotation());
+            self.drain_overlay(cx);
+        }
+        self.device_menu = false;
+        self.link.send(AppToHost::SetDevice { id: self.id.clone(), device: self.device.as_ref().map(|d| d.device()) });
+        if let Some((size, scale)) = self.measured {
+            self.laid_out(size, scale);
+        }
+        cx.notify();
+    }
+
+    /// The device being previewed, if any.
+    pub fn device(&self) -> Option<&super::devices::Mode> {
+        self.device.as_ref()
+    }
+
+    /// Whether the device menu is open.
+    pub fn device_menu_open(&self) -> bool {
+        self.device_menu
+    }
+
+    /// The 📱 button: opens or closes the device menu.
+    pub fn toggle_device_menu(&mut self, cx: &mut Context<Self>) {
+        self.device_menu = !self.device_menu;
+        cx.notify();
+    }
+
+    fn device_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.device_menu {
+            return None;
+        }
+        let item = |id: &'static str, label: String| div().id(id).px_2().py_1().rounded_sm().cursor_pointer().hover(|s| s.bg(hsla(0., 0., 1., 0.1))).child(label);
+        // Occluded: a click on the menu never falls through to the page under it.
+        let mut menu = div().id("device-menu").absolute().top(px(2.)).right(px(8.)).occlude().flex().flex_col().p_1().rounded_md().text_xs().bg(rgb(0x1f1f1f)).text_color(rgb(0xf2f2f2));
+        menu = menu.child(item("device-off", "Responsive off".into()).on_click(cx.listener(|v, _, _, cx| v.set_device(None, cx))));
+        for (i, p) in super::devices::PRESETS.iter().enumerate() {
+            let name = p.name;
+            menu = menu.child(item(["device-0", "device-1", "device-2"][i.min(2)], format!("{} · {}×{}", p.name, p.w, p.h)).on_click(cx.listener(move |v, _, _, cx| v.set_device(super::devices::Mode::preset(name), cx))));
+        }
+        if self.device.is_some() {
+            menu = menu.child(item("device-rotate", "Rotate".into()).on_click(cx.listener(|v, _, _, cx| {
+                let r = v.device.as_ref().map(|d| d.rotated());
+                v.set_device(r, cx);
+            })));
+        }
+        Some(menu.into_any_element())
+    }
+
+    /// Makes the popups the host announced (needs the window) and drops closed ones.
+    fn sync_popups(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.popups.retain(|(p, _)| !p.read(cx).popup_closed);
+        for (id, url, w, h) in std::mem::take(&mut self.popups_due) {
+            // Same profile as its opener (CEF made it in the opener's context).
+            let block = BrowserBlock { url: url.clone(), profile: self.block.profile.clone(), ..Default::default() };
+            let (link, states, opener) = (self.link.clone(), self.states.clone(), self.id.clone());
+            let agent = self.agent.clone();
+            let popup = cx.new(|cx| {
+                let mut v = BrowserView::new(&id, block, link, states, window, cx);
+                v.opener = Some(opener.clone());
+                v.adopted = true;
+                v.state.url = url;
+                v.state.opener = Some(opener);
+                v.agent = agent;
+                v.states.lock().unwrap().insert(id.clone(), v.state.clone());
+                v
+            });
+            cx.observe(&popup, |_, _, cx| cx.notify()).detach();
+            let f = popup.read(cx).focus.clone();
+            window.focus(&f, cx);
+            self.popups.push((popup, (w, h)));
+        }
+    }
+
+    /// The ids of this page's open popups.
+    pub fn popup_ids(&self, cx: &App) -> Vec<BrowserId> {
+        self.popups.iter().map(|(p, _)| p.read(cx).id.clone()).collect()
+    }
+
+    /// This page's open popup views.
+    pub fn popup_views(&self) -> Vec<Entity<BrowserView>> {
+        self.popups.iter().map(|(p, _)| p.clone()).collect()
+    }
+
+    /// The url of a popup the page asked for without a click (refused), while its chip shows.
+    pub fn blocked_popup(&self) -> Option<&str> {
+        self.blocked_popup.as_deref()
+    }
+
+    /// The page size the host was last told (None: not laid out yet).
+    pub fn page_size(&self) -> Option<Dips> {
+        self.sized.map(|(s, _)| s)
+    }
+
+    /// This view's opener when it is a popup.
+    pub fn opener(&self) -> Option<&str> {
+        self.opener.as_deref()
+    }
+
+    /// A popup's own bar: where it is NOW (its current top-level origin, never the url it opened
+    /// with: the anti-phishing line) and a close button.
+    fn popup_bar(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id("popup-bar")
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap_2()
+            .h(px(28.))
+            .px_2()
+            .text_xs()
+            .bg(rgb(0x2b2b2b))
+            .text_color(rgb(0xf0f0f0))
+            .child(div().flex_1().overflow_hidden().whitespace_nowrap().child(popup_origin(&self.state.url)))
+            .child(div().id("popup-close").px_1().cursor_pointer().child("×").on_click(cx.listener(|v, _, _, cx| {
+                v.link.send(AppToHost::Close { id: v.id.clone() });
+                v.popup_closed = true;
+                cx.notify();
+            })))
+            .into_any_element()
+    }
+
+    /// The opener's cards for its popups, centred over the page, and the blocked-popup chip.
+    fn popup_layer(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let mut out: Vec<AnyElement> = self
+            .popups
+            .iter()
+            .map(|(p, (w, h))| {
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(hsla(0., 0., 0., 0.25))
+                    .child(div().w(px(*w)).h(px(*h + 28.)).max_w_full().max_h_full().rounded_md().overflow_hidden().border_1().border_color(rgb(0x555555)).child(p.clone()))
+                    .into_any_element()
+            })
+            .collect();
+        if let Some(url) = self.blocked_popup.clone() {
+            out.push(
+                div()
+                    .id("popup-blocked")
+                    .absolute()
+                    .top(px(6.))
+                    .right(px(8.))
+                    .flex()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .text_xs()
+                    .bg(rgb(0x2b2b2b))
+                    .text_color(rgb(0xf0f0f0))
+                    .child("Pop-up blocked")
+                    .child(div().id("popup-open").cursor_pointer().underline().child("Open as tab").on_click(cx.listener(move |v, _, _, cx| {
+                        v.blocked_popup = None;
+                        cx.emit(BrowserEvent::NewWindow(url.clone()));
+                        cx.notify();
+                    })))
+                    .child(div().id("popup-dismiss").cursor_pointer().child("×").on_click(cx.listener(|v, _, _, cx| {
+                        v.blocked_popup = None;
+                        cx.notify();
+                    })))
+                    .into_any_element(),
+            );
+        }
+        out
+    }
+
+    /// The person answers the first waiting permission request (agents have no way to).
+    pub fn answer_permission(&mut self, allow: bool, cx: &mut Context<Self>) {
+        let Some((req, origin, kinds)) = self.prompts.pop_front() else { return };
+        if self.prompt_remember {
+            if let Err(e) = super::permissions::remember(&self.link.config().dir, &self.block.profile, &origin, &kinds, allow) {
+                tracing::warn!("browser {}: permissions.json: {e}", self.id);
+            }
+        }
+        self.prompt_remember = false;
+        self.link.send(AppToHost::PermissionResult { id: self.id.clone(), req, allow });
+        cx.notify();
+    }
+
+    /// The bar over the top of the page for the first waiting permission request.
+    fn permission_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (_, origin, kinds) = self.prompts.front()?;
+        let person = self.block.profile == super::agent::PERSON_PROFILE;
+        let button = |name: &'static str| div().id(name).px_2().py_0p5().rounded_sm().bg(rgb(0x3a3a3a)).cursor_pointer().child(name);
+        let more = self.prompts.len() - 1;
+        Some(
+            div()
+                .id("permission-bar")
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .py_1()
+                .text_xs()
+                .bg(rgb(0x2b2b2b))
+                .text_color(rgb(0xf0f0f0))
+                .child(div().flex_1().overflow_hidden().whitespace_nowrap().child(super::permissions::prompt_text(origin, kinds)))
+                .when(more > 0, |d| d.child(div().opacity(0.6).child(format!("+{more}"))))
+                .when(person, |d| {
+                    let on = self.prompt_remember;
+                    d.child(
+                        div()
+                            .id("permission-remember")
+                            .cursor_pointer()
+                            .child(if on { "☑ Remember for this site" } else { "☐ Remember for this site" })
+                            .on_click(cx.listener(|v, _, _, cx| {
+                                v.prompt_remember = !v.prompt_remember;
+                                cx.notify();
+                            })),
+                    )
+                })
+                .child(button("Deny").on_click(cx.listener(|v, _, _, cx| v.answer_permission(false, cx))))
+                .child(button("Allow").on_click(cx.listener(|v, _, _, cx| v.answer_permission(true, cx))))
+                .into_any_element(),
+        )
+    }
+
+    fn load_error_card(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (kind, code, url) = self.load_error.as_ref()?;
+        let (title, hint) = load_error_words(kind, url);
+        let id = self.id.clone();
+        let button = |name: &'static str| div().id(name).px_3().py_1().rounded_md().bg(rgb(0x3a3a3a)).cursor_pointer().child(name);
+        Some(
+            div()
+                .id("load-error")
+                .absolute()
+                .size_full()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .items_center()
+                .justify_center()
+                .bg(rgb(0x202020))
+                .text_color(rgb(0xe0e0e0))
+                .text_sm()
+                .child(div().text_base().child(title))
+                .child(div().text_xs().opacity(0.7).child(hint))
+                .child(div().text_xs().opacity(0.5).child(format!("{} · error {code}", capped(url, 120))))
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .when(self.state.can_back, |d| {
+                            let id = id.clone();
+                            d.child(button("Back").on_click(cx.listener(move |v, _, _, _| v.link.send(AppToHost::Back { id: id.clone() }))))
+                        })
+                        .child(button("Reload").on_click(cx.listener(move |v, _, _, _| v.link.send(AppToHost::Reload { id: id.clone(), ignore_cache: false })))),
+                )
+                .into_any_element(),
+        )
+    }
+
+    pub fn reload(&mut self, cx: &mut Context<Self>) {
+        self.crashed = None;
+        self.sized = None;
+        self.frames.clear();
+        self.acked = None;
+        cx.notify();
+    }
+
+    /// After a draw: the frame painted in it may be acked, so the host sends the next.
+    fn send_ack(&mut self) {
+        if let Some(seq) = self.frames.ack().filter(|s| Some(*s) != self.acked) {
+            self.acked = Some(seq);
+            self.link.send(AppToHost::FrameAck { id: self.id.clone(), seq });
+            if let Some(p) = &self.probe {
+                p(&FrameEvent::Acked { seq });
+            }
+        }
+    }
+
+    /// The page's geometry, with the page area's top-left as the origin (overlays draw inside it).
+    pub fn geometry(&self) -> Geometry {
+        let ((w, h), scale) = self.sized.map_or(((0.0, 0.0), 1.0), |(s, k)| ((s.w, s.h), k));
+        Geometry { zoom: zoom_factor(self.zoom_level), origin: Pt::default(), scale, size: Pt { x: w, y: h } }
+    }
+
+    /// Ask the page for overlay rects (a selector, the selection); they show when the answer is current.
+    /// Returns the request id and epoch it was sent with.
+    pub fn request_overlay(&mut self, query: OverlayQuery) -> (u64, u64) {
+        let (req, epoch) = self.overlay.request();
+        self.link.send(AppToHost::Overlay { id: self.id.clone(), req, epoch: epoch.0, query });
+        (req, epoch.0)
+    }
+
+    /// The pointer is over the page at `at` (page DIPs): a coalesced hit test for a highlight.
+    pub fn hover_overlay(&mut self, at: Pt) {
+        let css = self.geometry().page_to_viewport(at);
+        if let HoverSend::Now { req, epoch, at } = self.overlay.hover(css) {
+            self.link.send(AppToHost::Overlay { id: self.id.clone(), req, epoch: epoch.0, query: OverlayQuery::HitTest { x: at.x, y: at.y } });
+        }
+    }
+
+    fn send_waiting_hover(&mut self) {
+        if let Some(HoverSend::Now { req, epoch, at }) = self.overlay.next_hover() {
+            self.link.send(AppToHost::Overlay { id: self.id.clone(), req, epoch: epoch.0, query: OverlayQuery::HitTest { x: at.x, y: at.y } });
+        }
+    }
+
+    /// Overlay rects to draw now, in page DIPs (empty while stale).
+    pub fn overlay_rects(&self) -> &[Rect] {
+        self.overlay.shown()
+    }
+
+    fn make_dialogs(id: &str, link: &Arc<HostClient>, downloads: Downloads, cx: &mut Context<Self>) -> (Entity<PageDialogs>, Subscription) {
+        let link = link.clone() as Arc<dyn HostLink>;
+        let dialogs = cx.new(|cx| PageDialogs::new(id, link, downloads, cx));
+        let sub = cx.subscribe(&dialogs, |_, _, ev: &DialogsEvent, cx| match ev {
+            DialogsEvent::Notice(n) => cx.emit(BrowserEvent::Notice(n.clone())),
+        });
+        (dialogs, sub)
+    }
+
+    /// Share the app's download list (Browsers hands every block the same one).
+    pub fn use_downloads(&mut self, downloads: Downloads, cx: &mut Context<Self>) {
+        let (dialogs, sub) = Self::make_dialogs(&self.id.clone(), &self.link, downloads.clone(), cx);
+        (self.dialogs, self._dialogs, self.downloads) = (dialogs, sub, downloads);
+    }
+
+    /// The page's dialogs (a JS dialog on screen, tests answer it).
+    pub fn dialogs(&self) -> &Entity<PageDialogs> {
+        &self.dialogs
+    }
+
+    /// S29: a grant (or the sensitive mark) as the person set it in the shield; never an agent's.
+    /// Marked sensitive by the person: a popup is as sensitive as its opener.
+    pub fn sensitive(&self) -> bool {
+        let id = self.opener.clone().unwrap_or_else(|| self.id.clone());
+        self.agent.as_ref().is_some_and(|a| a.lock().unwrap().grants.get(&id, Grant::Sensitive))
+    }
+
+    pub fn grant(&self, g: Grant) -> bool {
+        self.agent.as_ref().is_some_and(|a| a.lock().unwrap().grants.get(&self.id, g))
+    }
+
+    /// The person flips a grant in the shield (only this view's UI calls it).
+    pub fn set_grant(&mut self, g: Grant, on: bool, cx: &mut Context<Self>) {
+        if let Some(a) = &self.agent {
+            a.lock().unwrap().grants.set(&self.id, g, on);
+        }
+        cx.notify();
+    }
+
+    pub fn toggle_shield(&mut self, cx: &mut Context<Self>) {
+        self.shield_open = !self.shield_open;
+        cx.notify();
+    }
+
+    fn shield_panel(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.shield_open {
+            return None;
+        }
+        let row = |g: Grant, label: &'static str, hint: &'static str| {
+            let on = self.grant(g);
+            div()
+                .id(label)
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .py_1()
+                .cursor_pointer()
+                .hover(|d| d.bg(hsla(0., 0., 0.5, 0.12)))
+                .on_click(cx.listener(move |v, _, _, cx| v.set_grant(g, !on, cx)))
+                .child(div().w(px(26.)).text_center().rounded_full().text_xs().bg(if on { rgb(0x0a84ff) } else { rgb(0xc8c8c8) }).text_color(rgb(0xffffff)).child(if on { "on" } else { "off" }))
+                .child(div().flex().flex_col().child(div().text_sm().child(label)).child(div().text_xs().opacity(0.6).child(hint)))
+        };
+        Some(
+            div()
+                .id("shield-panel")
+                .absolute()
+                .top(px(4.))
+                .right(px(8.))
+                .w(px(300.))
+                .py_1()
+                .bg(rgb(0xffffff))
+                .text_color(rgb(0x1a1a1a))
+                .border_1()
+                .border_color(rgb(0xc8c8c8))
+                .rounded_md()
+                .shadow_lg()
+                .occlude()
+                .on_mouse_down_out(cx.listener(|v, _, _, cx| {
+                    v.shield_open = false;
+                    cx.notify();
+                }))
+                .child(div().px_2().text_xs().opacity(0.6).child("What agents may do in this browser"))
+                .child(row(Grant::Control, "Control", "Navigate, click, type, read and run scripts here"))
+                .child(row(Grant::Cdp, "CDP", "Raw DevTools access (inspection only)"))
+                .child(row(Grant::Capture, "Capture", "Screenshots even when the page is sensitive"))
+                .child(div().h(px(1.)).mx_2().my_1().bg(rgb(0xe0e0e0)))
+                .child(row(Grant::Sensitive, "Mark page sensitive", "Agents' screenshots need Capture"))
+                .into_any_element(),
+        )
+    }
+
+    pub fn toggle_downloads(&mut self, cx: &mut Context<Self>) {
+        self.downloads_open = !self.downloads_open;
+        cx.notify();
+    }
+
+    pub fn downloads_open(&self) -> bool {
+        self.downloads_open
+    }
+
+    fn downloads_panel(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.downloads_open {
+            return None;
+        }
+        let list = self.downloads.list();
+        let rows = list.iter().rev().take(12).map(|d| {
+            let state = match d.state {
+                DownloadState::Started => "starting".to_string(),
+                DownloadState::Progress => match d.total {
+                    Some(t) if t > 0 => format!("{} %", d.received * 100 / t),
+                    _ => format!("{} KB", d.received / 1024),
+                },
+                DownloadState::Done => "done".into(),
+                DownloadState::Failed => "failed".into(),
+            };
+            div()
+                .flex()
+                .flex_col()
+                .px_2()
+                .py_1()
+                .child(div().text_sm().child(d.name.clone()))
+                .child(div().text_xs().opacity(0.6).child(format!("{state} · {}", d.path.clone().unwrap_or_else(|| d.url.clone()))))
+        });
+        Some(
+            div()
+                .id("downloads-panel")
+                .absolute()
+                .top(px(4.))
+                .right(px(8.))
+                .w(px(320.))
+                .py_1()
+                .bg(rgb(0xffffff))
+                .text_color(rgb(0x1a1a1a))
+                .border_1()
+                .border_color(rgb(0xc8c8c8))
+                .rounded_md()
+                .shadow_lg()
+                .occlude()
+                .on_mouse_down_out(cx.listener(|v, _, _, cx| {
+                    v.downloads_open = false;
+                    cx.notify();
+                }))
+                .child(div().px_2().text_xs().opacity(0.6).child(if list.is_empty() { "No downloads yet" } else { "Downloads" }))
+                .children(rows)
+                .into_any_element(),
+        )
+    }
+
+    /// Drain what `BrowserInput` routed away from the page (part 4's owners): markup draws,
+    /// pick hovers the highlight, a refusal flashes the lease strip, an owner change re-renders.
+    pub fn drain_overlay(&mut self, cx: &mut Context<Self>) {
+        let events = self.input.update(cx, |i, _| i.take_overlay());
+        if events.is_empty() {
+            return;
+        }
+        for ev in &events {
+            match ev {
+                OverlayEvent::Pointer { owner: Owner::Pick, kind, x, y, .. } => match self.region_drag.on_event(ev) {
+                    // A drag draws a rubber band; its release is a region (S6).
+                    region::Outcome::Dragging(r) => self.rubber = Some(r),
+                    region::Outcome::Region(r) => {
+                        self.rubber = None;
+                        self.ask_target(PageAsk::RegionAnchor(r), r.x, r.y);
+                        self.input.update(cx, |i, _| {
+                            i.escape();
+                        });
+                        cx.emit(BrowserEvent::Region(r));
+                    }
+                    // A click's release picks what is highlighted (after the release, so the page
+                    // never gets a stray button-up). Comment-on-pick keeps pick open for the field.
+                    region::Outcome::Click(cx_, cy) => {
+                        self.hover_overlay(Pt { x: cx_, y: cy });
+                        // A stepped pick (arrow keys) is what the click picks, wherever the pointer is.
+                        let (cx_, cy) = match self.hovered.as_ref().filter(|_| self.stepped) {
+                            Some(t) => (t.rect.0 + t.rect.2 / 2.0, t.rect.1 + t.rect.3 / 2.0),
+                            None => (cx_, cy),
+                        };
+                        if self.comment_on_pick {
+                            self.click_target(PageAsk::CommentTarget, cx_, cy, cx);
+                        } else if self.styles_on_pick {
+                            self.click_target(PageAsk::StyleTarget, cx_, cy, cx);
+                            self.input.update(cx, |i, _| {
+                                i.escape();
+                            });
+                        } else {
+                            // HERDR: S13. Pick ends after the double-click interval, unless a second click edits text.
+                            self.leave_pick_unless_double_click(cx);
+                        }
+                        cx.emit(BrowserEvent::Picked { x: cx_, y: cy });
+                    }
+                    region::Outcome::None => {
+                        if matches!(kind, MouseKind::Move | MouseKind::Down) {
+                            self.hover_overlay(Pt { x: *x, y: *y });
+                            self.hover_label(Pt { x: *x, y: *y });
+                        }
+                    }
+                },
+                OverlayEvent::Owner(o) => {
+                    self.region_drag.on_event(ev);
+                    if *o != Owner::Pick {
+                        self.rubber = None;
+                    }
+                    if !matches!(o, Owner::Pick | Owner::Comment) {
+                        (self.hovered, self.stepped) = (None, false);
+                    }
+                    // The comment field closed (Esc, a lease): its target goes with it.
+                    if *o != Owner::Comment {
+                        self.comment_target = None;
+                    }
+                }
+                OverlayEvent::Pointer { owner: Owner::Markup, .. } | OverlayEvent::Edit { owner: Owner::Markup, .. } => {
+                    self.markup.update(cx, |m, _| m.on_event(ev));
+                }
+                OverlayEvent::Refused => self.refused_at = Some(std::time::Instant::now()),
+                OverlayEvent::PickStep(step) => self.pick_step(*step),
+                // HERDR: S13 inline text edit.
+                OverlayEvent::DoubleClick { x, y } => self.text_edit_at(*x, *y, cx),
+                OverlayEvent::TextEditDone { commit } => self.text_edit_done(*commit),
+                _ => {}
+            }
+        }
+        // The input owner may have pushed more while handling (an Owner change after escape).
+        let more = self.input.update(cx, |i, _| i.take_overlay());
+        for ev in &more {
+            if let OverlayEvent::Pointer { owner: Owner::Markup, .. } | OverlayEvent::Edit { owner: Owner::Markup, .. } = ev {
+                self.markup.update(cx, |m, _| m.on_event(ev));
+            }
+        }
+        cx.notify();
+    }
+
+    /// Ask the page what element is at (x, y) page DIPs: selector, label and rect (CSS px).
+    fn ask_target(&mut self, ask: PageAsk, x: f32, y: f32) -> u64 {
+        let css = self.geometry().page_to_viewport(Pt { x, y });
+        self.next_ask += 1;
+        let req = VIEW_REQ_BASE + self.next_ask;
+        self.asks.insert(req, ask);
+        self.link.send(AppToHost::PickInfo { id: self.id.clone(), req, x: css.x, y: css.y });
+        req
+    }
+
+    /// A click's target: the element an arrow key stepped to, else the one under (x, y).
+    fn click_target(&mut self, ask: PageAsk, x: f32, y: f32, cx: &mut Context<Self>) {
+        match self.hovered.clone().filter(|_| self.stepped) {
+            Some(t) => self.resolved(ask, Some(t), cx),
+            None => {
+                self.ask_target(ask, x, y);
+            }
+        }
+    }
+
+    /// A2: ask the hovered element's label; one request in flight, the newest point waits behind it.
+    fn hover_label(&mut self, at: Pt) {
+        self.stepped = false;
+        if self.hover_ask.is_some() {
+            self.hover_next = Some(at);
+        } else {
+            self.hover_ask = Some(self.ask_target(PageAsk::Hover, at.x, at.y));
+        }
+    }
+
+    /// HERDR: S13. A plain pick click ends pick mode only once no second click came.
+    fn leave_pick_unless_double_click(&mut self, cx: &mut Context<Self>) {
+        let n = self.text_edit.wait_for_second_click();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(super::text_edit::DOUBLE_CLICK_MS)).await;
+            let _ = this.update(cx, |v, cx| {
+                if v.text_edit.wait_ran_out(n) && v.owner(cx) == Owner::Pick {
+                    v.input.update(cx, |i, _| {
+                        i.escape();
+                    });
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// HERDR: S13. A double-click while picking: the comment the first click opened closes, and the
+    /// element under the pointer is asked for (a pick, so the host lets it be edited).
+    fn text_edit_at(&mut self, x: f32, y: f32, cx: &mut Context<Self>) {
+        self.text_edit.exit_wait = None;
+        if self.owner(cx) == Owner::Comment {
+            self.input.update(cx, |i, _| {
+                i.escape();
+            });
+        }
+        self.ask_target(PageAsk::TextEdit, x, y);
+    }
+
+    /// HERDR: S13. Return saved or Esc (or a lease) cancelled: the host keeps or restores the text.
+    fn text_edit_done(&mut self, commit: bool) {
+        self.next_ask += 1;
+        let req = VIEW_REQ_BASE + self.next_ask;
+        let op = if commit { protocol::TextEditOp::Commit } else { protocol::TextEditOp::Cancel };
+        if let Some(selector) = self.text_edit.ask(req, op) {
+            self.link.send(AppToHost::TextEdit { id: self.id.clone(), req, selector, op });
+        }
+    }
+
+    fn text_edit_answer(&mut self, req: u64, ok: bool, before: String, after: String, cx: &mut Context<Self>) {
+        use super::text_edit::Next;
+        match self.text_edit.answered(req, ok, before, after) {
+            Next::Edit => {
+                let entered = self.input.update(cx, |i, _| i.enter(Owner::TextEdit));
+                // Picking ended (or a lease came) before the host answered: put the text back.
+                if !entered {
+                    self.text_edit_done(false);
+                }
+            }
+            Next::Pin { target, before, after } => {
+                self.annotations.add_text_edit(target, &before, &after);
+            }
+            // The "only plain text" hint goes after a few seconds.
+            Next::Refused => {
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(Duration::from_secs(3)).await;
+                    let _ = this.update(cx, |v, cx| {
+                        if v.text_edit.hint == Some(super::text_edit::HINT_REFUSED) {
+                            v.text_edit.hint = None;
+                            cx.notify();
+                        }
+                    });
+                })
+                .detach();
+            }
+            Next::Nothing => {}
+        }
+        cx.notify();
+    }
+
+    /// A3: an arrow key steps from the current pick to its parent, first child or a sibling.
+    fn pick_step(&mut self, step: PickStep) {
+        let Some(from) = self.hovered.as_ref().map(|t| t.selector.clone()) else { return };
+        self.next_ask += 1;
+        let req = VIEW_REQ_BASE + self.next_ask;
+        self.asks.insert(req, PageAsk::Step);
+        self.link.send(AppToHost::PickRelative { id: self.id.clone(), req, from, step });
+    }
+
+    /// The page answered `ask_target`.
+    /// `label` is untrusted page text: it is shown here, and redacted by agent.rs before an agent sees it.
+    fn on_target(&mut self, ask: PageAsk, answer: Option<(String, String, herdr_browser_protocol::CssRect)>, cx: &mut Context<Self>) {
+        let geo = self.geometry();
+        let target = answer.map(|(selector, label, r)| {
+            let (a, b) = (geo.viewport_to_page(Pt { x: r.x, y: r.y }), geo.viewport_to_page(Pt { x: r.x + r.w, y: r.y + r.h }));
+            annotate::Target { selector, label, rect: (a.x, a.y, b.x - a.x, b.y - a.y) }
+        });
+        self.resolved(ask, target, cx);
+    }
+
+    /// What an ask resolved to (the page's answer, or the stepped pick).
+    fn resolved(&mut self, ask: PageAsk, target: Option<annotate::Target>, cx: &mut Context<Self>) {
+        let geo = self.geometry();
+        match ask {
+            PageAsk::Hover => {
+                self.hover_ask = None;
+                if !self.stepped {
+                    self.hovered = target;
+                }
+                if let Some(at) = self.hover_next.take() {
+                    self.hover_label(at);
+                }
+            }
+            // ok false keeps the current pick.
+            // HERDR: S13. The double-clicked element: ask the host to make it editable.
+            PageAsk::TextEdit => {
+                if let Some(t) = target {
+                    self.hovered = Some(t.clone());
+                    self.text_edit.target = Some(t);
+                    self.next_ask += 1;
+                    let req = VIEW_REQ_BASE + self.next_ask;
+                    if let Some(selector) = self.text_edit.ask(req, protocol::TextEditOp::Begin) {
+                        self.link.send(AppToHost::TextEdit { id: self.id.clone(), req, selector, op: protocol::TextEditOp::Begin });
+                    }
+                }
+            }
+            PageAsk::Step => {
+                if let Some(t) = target {
+                    self.hovered = Some(t);
+                    self.stepped = true;
+                }
+            }
+            PageAsk::RegionAnchor(r) => {
+                let anchor = target.map(|t| (t.selector, region::Rect { x: t.rect.0, y: t.rect.1, w: t.rect.2, h: t.rect.3 }));
+                let scroll = geo.viewport_to_page(Pt { x: self.scroll.0, y: self.scroll.1 });
+                // The document-anchored copy places the region at Send (scroll since then applied).
+                self.region_docs.push((region::Region::new(r, None, (scroll.x, scroll.y)), anchor.as_ref().map(|(s, _)| s.clone())));
+                self.regions.push(region::Region::new(r, anchor, (scroll.x, scroll.y)));
+            }
+            PageAsk::StyleTarget => {
+                // Another pick replaces the open panel; nothing there closes it.
+                self.style_panel = target.map(|t| {
+                    let link = self.link.clone() as Arc<dyn HostLink>;
+                    let id = self.id.clone();
+                    cx.new(|_| StylePanelView::new(id, link, &t.selector))
+                });
+            }
+            PageAsk::CommentTarget => match target {
+                Some(t) => {
+                    // With the style panel on too, the same element opens it beside the comment.
+                    if self.styles_on_pick {
+                        let link = self.link.clone() as Arc<dyn HostLink>;
+                        let id = self.id.clone();
+                        let sel = t.selector.clone();
+                        self.style_panel = Some(cx.new(|_| StylePanelView::new(id, link, &sel)));
+                    }
+                    let entered = self.input.update(cx, |i, _| i.enter(Owner::Comment));
+                    if entered {
+                        self.comment_target = Some(t);
+                    }
+                }
+                // Nothing pickable there: pick ends as a plain pick would.
+                None => self.input.update(cx, |i, _| {
+                    i.escape();
+                }),
+            },
+        }
+        self.drain_overlay(cx);
+        cx.notify();
+    }
+
+    /// Save the open comment as an annotation (S7) and close the field and pick.
+    pub fn save_comment(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.comment_target.take() else { return };
+        let text = self.input.update(cx, |i, _| i.take_comment());
+        match self.editing_pin.take() {
+            Some(n) => {
+                self.annotations.set_comment(n, &text);
+            }
+            None => {
+                let n = self.annotations.add(target, &text);
+                let s = self.geometry().viewport_to_page(Pt { x: self.scroll.0, y: self.scroll.1 });
+                self.pin_scroll.insert(n, (s.x, s.y));
+            }
+        }
+        self.input.update(cx, |i, _| {
+            i.escape(); // Comment -> Pick
+            i.escape(); // Pick -> Browse
+        });
+        self.drain_overlay(cx);
+        cx.notify();
+    }
+
+    /// The view's PickInfo requests still waiting for an answer (tests play the host).
+    pub fn pending_pick_reqs(&self) -> Vec<u64> {
+        let mut v: Vec<u64> = self.asks.keys().copied().collect();
+        v.sort();
+        v
+    }
+
+    /// Styles-on-pick: a picked element opens the style panel (S10).
+    pub fn set_styles_on_pick(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.styles_on_pick = on;
+        if !on {
+            self.style_panel = None;
+        }
+        cx.notify();
+    }
+
+    pub fn style_panel(&self) -> Option<&Entity<StylePanelView>> {
+        self.style_panel.as_ref()
+    }
+
+    pub fn close_style_panel(&mut self, cx: &mut Context<Self>) {
+        self.style_panel = None;
+        cx.notify();
+    }
+
+    /// Comment-on-pick: a picked element opens a comment field (S7).
+    pub fn set_comment_on_pick(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.comment_on_pick = on;
+        cx.notify();
+    }
+
+    // HERDR: S13. What the strip says about a text edit (for tests and the chrome).
+    pub fn text_edit_hint(&self) -> Option<&'static str> {
+        self.text_edit.hint
+    }
+
+    pub fn annotations(&self) -> &annotate::Annotations {
+        &self.annotations
+    }
+
+    /// The field's target while a comment is open.
+    pub fn comment_target(&self) -> Option<&annotate::Target> {
+        self.comment_target.as_ref()
+    }
+
+    /// Send: the pending batch goes to the agent (S8 formats it) and the pins clear.
+    /// Send (S7, attach flow): takes a host screenshot of the page; when it is in, burns the markup
+    /// into it, crops it to the newest region, and emits the batch with the picture. A failed
+    /// screenshot still sends the batch, without a picture.
+    pub fn send_annotations(&mut self, cx: &mut Context<Self>) {
+        self.send_annotations_to(None, cx);
+    }
+
+    /// Send bound to one request: the recipient (None: the legacy pull path), the batch and the
+    /// page it was taken from travel with the screenshot request, so two sends never mix.
+    fn send_annotations_to(&mut self, to: Option<Recipient>, cx: &mut Context<Self>) {
+        let annotations = self.annotations.send();
+        if annotations.is_empty() {
+            cx.notify();
+            return;
+        }
+        let dir = self.link.config().dir.join("attach");
+        let _ = std::fs::create_dir_all(&dir);
+        let at = now_ms();
+        self.next_ask += 1;
+        let req = VIEW_REQ_BASE + self.next_ask;
+        let page = dir.join(format!("{}-{at}.page.png", self.id));
+        // The person's new values only; the old ones came from the page and travel fenced.
+        let style_edits = self.style_panel.as_ref().map(|p| p.read(cx).panel.edits()).unwrap_or_default();
+        let (css_edits, css_was) = (super::edits::person_line(&style_edits), super::edits::was_values(&style_edits));
+        let scroll = self.geometry().viewport_to_page(Pt { x: self.scroll.0, y: self.scroll.1 });
+        let region = self.region_docs.last().map(|(r, anchor)| {
+            let now = r.resolve(None, (scroll.x, scroll.y));
+            (anchor.clone(), now)
+        });
+        let batch = AnnotationBatch {
+            version: 1,
+            id: at,
+            sent_at_ms: at,
+            block: self.id.clone(),
+            url: self.state.url.clone(),
+            title: self.state.title.clone(),
+            scroll: (scroll.x, scroll.y),
+            annotations,
+            css_edits,
+            css_was,
+            picture: None,
+            region: region.as_ref().map(|(anchor, r)| RegionInfo { anchor: anchor.clone(), rect: r.map(|r| (r.x, r.y, r.w, r.h)).unwrap_or_default(), detached: r.is_none() }),
+            scale: 1.0,
+            untrusted: ["url", "title", "annotations.target.label", "annotations.target.selector", "annotations.target.rect", "annotations.text_edit", "region.anchor", "css_was"].iter().map(|s| s.to_string()).collect(),
+        };
+        self.attaching.insert(req, Attach { batch, page: page.clone(), to });
+        self.link.send(AppToHost::Screenshot { id: self.id.clone(), req, path: page.to_string_lossy().into_owned() });
+        cx.notify();
+    }
+
+    /// The host wrote the page screenshot for a Send: finish the picture and emit the batch.
+    fn finish_attach(&mut self, req: u64, ok: bool, cx: &mut Context<Self>) {
+        let Some(Attach { mut batch, page, to }) = self.attaching.remove(&req) else { return };
+        let width = self.geometry().size.x.max(1.0);
+        // The picture must show what was sent: the same document, and the region if there is one.
+        let mut picture_note = None;
+        let made = if !ok {
+            picture_note = Some("the screenshot failed".to_owned());
+            None
+        } else if self.state.url != batch.url {
+            picture_note = Some("the page changed before the picture was taken".to_owned());
+            None
+        } else {
+            image::open(&page).ok().and_then(|img| {
+                let img = img.to_rgba8();
+                let scale = img.width() as f32 / width;
+                let burned = self.markup.read(cx).burn(&img, scale);
+                let rect = batch.region.as_ref().filter(|r| !r.detached).map(|r| region::Rect { x: r.rect.0, y: r.rect.1, w: r.rect.2, h: r.rect.3 });
+                match rect {
+                    // A region that cannot be cut is left out, never widened to the whole viewport.
+                    Some(r) => match region::crop(&burned, r, scale) {
+                        Some(pic) => Some((pic, scale)),
+                        None => {
+                            picture_note = Some("the region was off screen".to_owned());
+                            None
+                        }
+                    },
+                    None => Some((burned, scale)),
+                }
+            })
+        };
+        let _ = std::fs::remove_file(&page);
+        if let Some((pic, scale)) = made {
+            let out = page.with_file_name(format!("{}-{}.png", self.id, batch.id));
+            if std::fs::write(&out, markup::png(&pic)).is_ok() {
+                batch.picture = Some(out);
+                batch.scale = scale;
+            }
+        }
+        match to {
+            // Addressed: that agent's inbox only, never the global pull path.
+            Some(to) => {
+                let r = send_to::deliver(&self.link.config().dir, &batch, &to, now_ms()).map(|_| (to, batch.id));
+                if r.is_err() {
+                    let ns: Vec<u32> = batch.annotations.iter().map(|a| a.n).collect();
+                    self.annotations.restore(&ns);
+                }
+                self.send_to.delivered(r, now_ms(), picture_note);
+                self.poll_chip(cx);
+            }
+            None => cx.emit(BrowserEvent::Annotations(batch)),
+        }
+        cx.notify();
+    }
+
+    /// S27: the window's answer to PickRecipient, the running agents.
+    pub fn show_recipients(&mut self, list: Vec<send_to::Candidate>, cx: &mut Context<Self>) {
+        self.send_to.show(list);
+        cx.notify();
+    }
+
+    /// S27: the person picked `terminal` in the popover (the consent): Send goes to its inbox.
+    pub fn choose_recipient(&mut self, terminal: &str, cx: &mut Context<Self>) {
+        if let Some(to) = self.send_to.choose(terminal) {
+            self.send_annotations_to(Some(to), cx);
+        }
+        cx.notify();
+    }
+
+    /// While the sent batch is unread, redraw once a second so the chip moves to Read / Not read yet.
+    fn poll_chip(&mut self, cx: &mut Context<Self>) {
+        self.chip_poll = Some(cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(Duration::from_secs(1)).await;
+            let more = this.update(cx, |v, cx| {
+                cx.notify();
+                v.send_to.waiting(&send_to_root(&v.link.config().dir))
+            });
+            if !matches!(more, Ok(true)) {
+                break;
+            }
+        }));
+    }
+
+    /// Responsive mode: how much the page is scaled to fit its block (1 when off).
+    pub fn fit(&self) -> f32 {
+        match (&self.device, self.measured) {
+            (Some(d), Some((area, _))) => d.fit(area.w, area.h),
+            _ => 1.0,
+        }
+    }
+
+    /// A page-DIP rect where overlays draw it (`geometry::to_drawn` at this block's fit).
+    fn drawn(&self, r: (f32, f32, f32, f32)) -> (f32, f32, f32, f32) {
+        super::geometry::to_drawn(r, self.fit())
+    }
+
+    fn annotation_layer(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let mut out: Vec<AnyElement> = self
+            .annotations
+            .visible()
+            .map(|a| {
+                let (x, y, _, _) = self.drawn(self.pin_rect(a));
+                let n = a.n;
+                div()
+                    .id(("pin", n as usize))
+                    .absolute()
+                    .left(px(x - 9.))
+                    .top(px(y - 9.))
+                    .size(px(18.))
+                    .rounded_full()
+                    .bg(rgb(0xff3b30))
+                    .text_color(rgb(0xffffff))
+                    .text_xs()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, cx.listener(move |v, _, _, cx| {
+                        cx.stop_propagation();
+                        v.open_pin = if v.open_pin == Some(n) { None } else { Some(n) };
+                        cx.notify();
+                    }))
+                    .child(a.n.to_string())
+                    .into_any_element()
+            })
+            .collect();
+        // A9: the open pin's popover beside it.
+        if let Some(pin) = self.open_pin.and_then(|n| self.annotations.visible().find(|p| p.n == n).cloned()) {
+            let (x, y, _, _) = self.drawn(self.pin_rect(&pin));
+            let popover = design_bar::pin_popover(pin.n, &pin.comment, cx, |v, a, _, cx| v.pin_action(a, cx));
+            out.push(
+                div()
+                    .id("pin-popover-at")
+                    .absolute()
+                    .left(px(x + 12.))
+                    .top(px(y + 12.))
+                    .occlude()
+                    .on_mouse_down_out(cx.listener(|v, _, _, cx| {
+                        v.open_pin = None;
+                        cx.notify();
+                    }))
+                    .child(popover)
+                    .into_any_element(),
+            );
+        }
+        // A9: pins scrolled out of view, as markers on the page area's edges (a click does nothing in v1).
+        if let Some((size, _)) = self.sized {
+            let pins: Vec<(u32, (f32, f32, f32, f32))> = self.annotations.visible().map(|a| (a.n, self.pin_rect(a))).collect();
+            let o = design_bar::offscreen(&pins, (size.w, size.h));
+            let (_, _, dw, dh) = self.drawn((0.0, 0.0, size.w, size.h));
+            let size = Dips { w: dw, h: dh };
+            for (id, text) in design_bar::offscreen_labels(&o) {
+                let m = div().id(id).absolute().px_1().rounded_full().text_xs().bg(rgb(0xff3b30)).text_color(rgb(0xffffff)).child(text);
+                let m = match id {
+                    "pins-above" => m.top(px(4.)).left(px(size.w / 2. - 20.)),
+                    "pins-below" => m.bottom(px(4.)).left(px(size.w / 2. - 20.)),
+                    "pins-left" => m.left(px(4.)).top(px(size.h / 2. - 9.)),
+                    _ => m.right(px(4.)).top(px(size.h / 2. - 9.)),
+                };
+                out.push(m.into_any_element());
+            }
+        }
+        if let Some(r) = self.rubber {
+            let (x, y, w, h) = self.drawn((r.x, r.y, r.w, r.h));
+            let r = Rect { x, y, w, h };
+            out.push(div().absolute().left(px(r.x)).top(px(r.y)).w(px(r.w)).h(px(r.h)).border_1().border_color(rgb(0x3b82f6)).bg(hsla(0.6, 0.9, 0.6, 0.12)).into_any_element());
+        }
+        if let Some(t) = &self.comment_target {
+            let input = self.input.read(cx);
+            let typed = input.comment().text.clone() + input.comment().marked.as_deref().unwrap_or("");
+            let (x, y, _, h) = self.drawn(t.rect);
+            out.push(
+                div()
+                    .id("comment-field")
+                    .absolute()
+                    .left(px(x))
+                    .top(px(y + h + 6.))
+                    .w(px(260.))
+                    .p_2()
+                    .rounded_md()
+                    .shadow_lg()
+                    .bg(rgb(0xffffff))
+                    .text_color(rgb(0x1a1a1a))
+                    .text_sm()
+                    .occlude()
+                    .child(div().text_xs().opacity(0.6).child(t.label.clone()))
+                    .child(div().min_h(px(20.)).child(if typed.is_empty() { "Add a comment…".to_string() } else { typed }))
+                    .child(div().id("comment-save").mt_1().px_2().rounded_sm().bg(rgb(0x2563eb)).text_color(rgb(0xffffff)).cursor_pointer().child("Save").on_mouse_down(MouseButton::Left, cx.listener(|v, _, _, cx| {
+                        cx.stop_propagation();
+                        v.save_comment(cx);
+                    })))
+                    .into_any_element(),
+            );
+        }
+        out
+    }
+
+    /// The input owner on top (Browse, Pick, Comment, Markup, Agent).
+    pub fn owner(&self, cx: &App) -> Owner {
+        self.input.read(cx).owner()
+    }
+
+    /// The markup layer (tests and the attach flow read and burn it).
+    pub fn markup(&self) -> &Entity<Markup> {
+        &self.markup
+    }
+
+    /// Toggle a mode (Pick or Markup): enter it, or leave it when it is on top.
+    pub fn toggle_mode(&mut self, owner: Owner, cx: &mut Context<Self>) {
+        // Opens the mode, swaps pick and markup, or closes it when on top; refused under a lease.
+        self.input.update(cx, |i, _| {
+            i.toggle(owner);
+        });
+        self.drain_overlay(cx);
+        cx.notify();
+    }
+
+    /// "Take Control": the agent's lease ends, the user has the page again.
+    pub fn take_control(&mut self, cx: &mut Context<Self>) {
+        self.input.update(cx, |i, _| i.end_lease());
+        self.drain_overlay(cx);
+        cx.notify();
+    }
+
+    fn mode_strip(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let input = self.input.read(cx);
+        let owner = input.owner();
+        if let Some(agent) = input.lease().map(str::to_owned) {
+            let flash = self.refused_at.is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(600));
+            return Some(
+                div()
+                    .id("lease-strip")
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap_2()
+                    .h(px(FIND_HEIGHT))
+                    .px_2()
+                    .text_xs()
+                    .bg(if flash { rgb(0xf59e0b) } else { rgb(0x7c3aed) })
+                    .text_color(rgb(0xffffff))
+                    .child(format!("{agent} is driving"))
+                    .child("·")
+                    .child(div().id("take-control").px_1().rounded_sm().cursor_pointer().bg(hsla(0., 0., 1., 0.2)).child("Take Control").on_click(cx.listener(|v, _, _, cx| v.take_control(cx))))
+                    .into_any_element(),
+            );
+        }
+        let count = self.annotations.count();
+        let state = design_bar::StripState { owner, tool: self.markup.read(cx).tool, styles_on: self.styles_on_pick, comment_on: self.comment_on_pick, count };
+        let strip = design_bar::strip(&state, FIND_HEIGHT, cx, |v, a, _, cx| v.design_action(a, cx))?;
+        // S27: the Send chip beside the badge, and the recipient list under it.
+        // HERDR: S13. While editing (or when an edit was refused) the strip says so.
+        let chip = self.text_edit.hint.map(str::to_owned).or_else(|| self.send_to.chip_line(&send_to_root(&self.link.config().dir), now_ms()));
+        let popover = send_to::popover(&self.send_to, count, cx, |v, choice, _, cx| {
+            match choice {
+                Some(t) => v.choose_recipient(&t, cx),
+                None => v.send_to.open = None,
+            }
+            cx.notify();
+        });
+        Some(
+            div()
+                .relative()
+                .flex_none()
+                .child(strip)
+                .when_some(chip, |d, c| d.child(div().absolute().top_0().right(px(8.)).h(px(FIND_HEIGHT)).flex().items_center().text_xs().text_color(rgb(0xd4d4d4)).child(c)))
+                .when_some(popover, |d, p| d.child(div().absolute().top(px(FIND_HEIGHT)).right(px(8.)).child(p)))
+                .into_any_element(),
+        )
+    }
+
+    /// A1: what a strip control asks.
+    pub fn design_action(&mut self, a: design_bar::StripAction, cx: &mut Context<Self>) {
+        use design_bar::StripAction as A;
+        match a {
+            A::Select => {
+                if self.owner(cx) != Owner::Pick {
+                    self.toggle_mode(Owner::Pick, cx);
+                }
+            }
+            A::Draw => self.toggle_mode(Owner::Markup, cx),
+            A::Tool(t) => self.markup.update(cx, |m, _| m.tool = t),
+            A::Undo => self.markup.update(cx, |m, _| { m.undo(); }),
+            A::ToggleStyles => {
+                let on = !self.styles_on_pick;
+                self.set_styles_on_pick(on, cx);
+            }
+            A::ToggleComment => {
+                let on = !self.comment_on_pick;
+                self.set_comment_on_pick(on, cx);
+            }
+            A::Send => cx.emit(BrowserEvent::PickRecipient),
+            A::Done => {
+                self.input.update(cx, |i, _| while i.owner() != Owner::Browse && i.escape() {});
+                self.drain_overlay(cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// A9: a pin's box now, in page DIPs (it follows the page's scroll since it was made).
+    fn pin_rect(&self, a: &annotate::Annotation) -> (f32, f32, f32, f32) {
+        let (x, y, w, h) = a.target.rect;
+        let Some(&(sx, sy)) = self.pin_scroll.get(&a.n) else { return (x, y, w, h) };
+        let now = self.geometry().viewport_to_page(Pt { x: self.scroll.0, y: self.scroll.1 });
+        (x - (now.x - sx), y - (now.y - sy), w, h)
+    }
+
+    /// A9: a pin's popover asked to edit or delete it.
+    fn pin_action(&mut self, a: design_bar::PinAction, cx: &mut Context<Self>) {
+        self.open_pin = None;
+        match a {
+            design_bar::PinAction::Edit(n) => {
+                let Some(pin) = self.annotations.visible().find(|p| p.n == n).cloned() else { return };
+                let rect = self.pin_rect(&pin);
+                // enter(Comment) empties the field: its text goes in after.
+                let entered = self.input.update(cx, |i, _| i.enter(Owner::Comment) && {
+                    i.set_comment(&pin.comment);
+                    true
+                });
+                if entered {
+                    self.editing_pin = Some(n);
+                    self.comment_target = Some(annotate::Target { rect, ..pin.target });
+                }
+            }
+            design_bar::PinAction::Delete(n) => {
+                self.annotations.remove(n);
+                self.pin_scroll.remove(&n);
+            }
+        }
+        self.drain_overlay(cx);
+        cx.notify();
+    }
+
+    /// Where the page area starts under the bars, in DIPs from the block's top.
+    pub fn page_top(&self) -> f32 {
+        CHROME_HEIGHT + if self.find.is_some() { FIND_HEIGHT } else { 0.0 } + if self.strip_shown { FIND_HEIGHT } else { 0.0 }
+    }
+
+    /// The find bar's state: (text, active, count), when open.
+    pub fn find_state(&self) -> Option<(String, u32, u32)> {
+        self.find.as_ref().map(|f| (f.text.clone(), f.active, f.count))
+    }
+
+    /// The find bar's input (tests type into it).
+    pub fn find_input(&self) -> Option<Entity<InputState>> {
+        self.find.as_ref().map(|f| f.input.clone())
+    }
+
+    /// cmd-F: open the find bar (or focus it), its text selected.
+    pub fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.find.is_none() {
+            let input = cx.new(|cx| InputState::new(window, cx).placeholder("Find in page"));
+            let typed = cx.subscribe_in(&input, window, |v, input, ev: &InputEvent, window, cx| match ev {
+                InputEvent::Change => {
+                    let text = input.read(cx).value().to_string();
+                    v.find_text(text, true, false);
+                    cx.notify();
+                }
+                InputEvent::PressEnter { shift, .. } => {
+                    let text = input.read(cx).value().to_string();
+                    v.find_text(text, !shift, true);
+                    cx.notify();
+                }
+                _ => {
+                    let _ = window;
+                }
+            });
+            self.find = Some(FindBar { input, text: String::new(), count: 0, active: 0, _typed: typed });
+        }
+        if let Some(f) = &self.find {
+            f.input.update(cx, |i, cx| {
+                i.focus(window, cx);
+                i.select_all(window, cx);
+            });
+        }
+        cx.notify();
+    }
+
+    /// Search `text` (forward or back); `next` continues the current search.
+    pub fn find_text(&mut self, text: String, forward: bool, next: bool) {
+        let Some(f) = &mut self.find else { return };
+        if text.is_empty() {
+            (f.count, f.active) = (0, 0);
+            f.text.clear();
+            self.link.send(AppToHost::StopFind { id: self.id.clone(), clear_selection: true });
+            return;
+        }
+        let next = next && f.text == text;
+        f.text = text.clone();
+        self.link.send(AppToHost::Find { id: self.id.clone(), text, forward, match_case: false, find_next: next });
+    }
+
+    /// Esc or ×: close the bar, clear the highlights, give the page the keyboard back.
+    pub fn close_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.find.take().is_some() {
+            self.link.send(AppToHost::StopFind { id: self.id.clone(), clear_selection: false });
+            window.focus(&self.focus, cx);
+            cx.notify();
+        }
+    }
+
+    fn find_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let f = self.find.as_ref()?;
+        let label = match (f.text.is_empty(), f.count) {
+            (true, _) => String::new(),
+            (false, 0) => "No matches".into(),
+            // CEF's first answer has no active match yet (ordinal 0).
+            (false, n) if f.active == 0 => format!("{n} matches"),
+            (false, n) => format!("{} of {n}", f.active),
+        };
+        let button = |id: &'static str, label: &'static str| div().id(id).px_1().rounded_sm().cursor_pointer().hover(|d| d.bg(hsla(0., 0., 0.5, 0.15))).child(label);
+        Some(
+            div()
+                .id("find-bar")
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap_1()
+                .h(px(FIND_HEIGHT))
+                .px_2()
+                .text_xs()
+                .bg(hsla(0., 0., 0.5, 0.12))
+                .child(div().w(px(220.)).child(Input::new(&f.input)))
+                .child(div().id("find-count").min_w(px(72.)).child(label))
+                .child(button("find-prev", "‹").on_click(cx.listener(|v, _, _, cx| {
+                    let t = v.find.as_ref().map(|f| f.text.clone()).unwrap_or_default();
+                    v.find_text(t, false, true);
+                    cx.notify();
+                })))
+                .child(button("find-next", "›").on_click(cx.listener(|v, _, _, cx| {
+                    let t = v.find.as_ref().map(|f| f.text.clone()).unwrap_or_default();
+                    v.find_text(t, true, true);
+                    cx.notify();
+                })))
+                .child(button("find-close", "×").on_click(cx.listener(|v, _, window, cx| v.close_find(window, cx))))
+                .into_any_element(),
+        )
+    }
+
+    /// The open context menu, if any.
+    pub fn menu(&self) -> Option<&Menu> {
+        self.menu.as_ref()
+    }
+
+    /// Run menu row `row` (or dismiss with None): app commands here, the rest by the host.
+    pub fn choose_menu(&mut self, row: Option<usize>, cx: &mut Context<Self>) {
+        let Some(menu) = self.menu.take() else { return };
+        let item = row.and_then(|r| menu.rows.get(r)).filter(|i| i.enabled && i.command != 0);
+        let command = match item.map(|i| i.command) {
+            Some(MENU_OPEN_LINK_IN_NEW_TAB) => {
+                if let Some(url) = menu.link_url.clone() {
+                    cx.emit(BrowserEvent::NewWindow(url));
+                }
+                None
+            }
+            Some(MENU_COPY_LINK_ADDRESS) => {
+                if let Some(url) = &menu.link_url {
+                    cx.write_to_clipboard(ClipboardItem::new_string(url.clone()));
+                }
+                None
+            }
+            Some(MENU_SAVE_IMAGE_AS) => {
+                // The page downloads it (the host's download flow saves it and tells the app).
+                if let Some(src) = &menu.src_url {
+                    let expr = format!("(()=>{{const a=document.createElement('a');a.href={};a.download='';document.body.append(a);a.click();a.remove();return true}})()", serde_json::Value::String(src.clone()));
+                    self.link.send(AppToHost::Eval { id: self.id.clone(), req: 0, expr });
+                }
+                None
+            }
+            other => other,
+        };
+        self.link.send(AppToHost::MenuResult { id: self.id.clone(), req: menu.req, command });
+        cx.notify();
+    }
+
+    fn menu_element(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let menu = self.menu.as_ref()?;
+        let rows = menu.rows.iter().enumerate().map(|(i, r)| {
+            if r.command == 0 {
+                return div().h(px(MENU_ROW)).flex().items_center().child(div().w_full().h(px(1.)).bg(rgb(0xd0d0d0))).into_any_element();
+            }
+            let enabled = r.enabled;
+            div()
+                .id(("menu-row", i))
+                .h(px(MENU_ROW))
+                .px_3()
+                .flex()
+                .items_center()
+                .gap_2()
+                .rounded_sm()
+                .text_sm()
+                .when(!enabled, |d| d.text_color(rgb(0xa0a0a0)))
+                .when(enabled, |d| d.hover(|d| d.bg(rgb(0x2563eb)).text_color(rgb(0xffffff))))
+                .child(if r.checked { "✓" } else { " " })
+                .child(r.label.clone())
+                .on_mouse_down(MouseButton::Left, cx.listener(move |v, _, _, cx| {
+                    cx.stop_propagation();
+                    if enabled {
+                        v.choose_menu(Some(i), cx);
+                    }
+                }))
+                .into_any_element()
+        });
+        Some(
+            div()
+                .id("context-menu")
+                .absolute()
+                .left(px(menu.at.0))
+                .top(px(menu.at.1))
+                .w(px(MENU_WIDTH))
+                .py(px(4.))
+                .bg(rgb(0xffffff))
+                .text_color(rgb(0x1a1a1a))
+                .border_1()
+                .border_color(rgb(0xc8c8c8))
+                .rounded_md()
+                .shadow_lg()
+                .occlude()
+                .on_mouse_down_out(cx.listener(|v, _, _, cx| v.choose_menu(None, cx)))
+                .children(rows)
+                .into_any_element(),
+        )
+    }
+
+    /// Set the page zoom (Chrome level) and remember it for this host.
+    pub fn set_zoom(&mut self, level: f64, cx: &mut Context<Self>) {
+        self.apply_zoom(level);
+        self.zoom_prefs.lock().unwrap().set(&self.state.url, level);
+        cx.notify();
+    }
+
+    fn apply_zoom(&mut self, level: f64) {
+        self.zoom_level = level;
+        self.overlay.changed(Change::Zoom);
+        self.link.send(AppToHost::SetZoom { id: self.id.clone(), level });
+    }
+
+    /// cmd-plus / cmd-minus: Chrome's next preset in or out.
+    pub fn zoom_step(&mut self, zoom_in: bool, cx: &mut Context<Self>) {
+        let level = zoom::step(self.zoom_level, zoom_in);
+        self.set_zoom(level, cx);
+    }
+
+    /// Share the app's per-host zoom levels.
+    pub fn use_zoom_prefs(&mut self, prefs: Arc<Mutex<zoom::ZoomPrefs>>) {
+        self.zoom_prefs = prefs;
+    }
+
+    /// The page zoom level (Chrome's: 0 is 100 %).
+    pub fn zoom_level(&self) -> f64 {
+        self.zoom_level
+    }
+
+    /// Tests and the parity harness: hear each frame arrive, paint and get acked.
+    pub fn set_frame_probe(&mut self, probe: Option<FrameProbe>) {
+        self.probe = probe;
+    }
+
+    /// The newest frame's sequence number, if one is shown.
+    pub fn frame_seq(&self) -> Option<u64> {
+        self.frames.seq()
+    }
+
+    fn chrome(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let button = |label: &'static str, on: bool| {
+            div()
+                .id(label)
+                .px_1()
+                .rounded_sm()
+                .when(on, |d| d.cursor_pointer().hover(|d| d.bg(hsla(0., 0., 0.5, 0.15))))
+                .when(!on, |d| d.opacity(0.35))
+                .child(label)
+        };
+        let id = self.id.clone();
+        let (back, fwd) = (self.state.can_back, self.state.can_forward);
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap_1()
+            .h(px(CHROME_HEIGHT))
+            .px_2()
+            .text_xs()
+            .bg(hsla(0., 0., 0.5, 0.08))
+            .child(button("‹", back).when(back, |d| {
+                let id = id.clone();
+                d.on_click(cx.listener(move |v, _, _, _| v.link.send(AppToHost::Back { id: id.clone() })))
+            }))
+            .child(button("›", fwd).when(fwd, |d| {
+                let id = id.clone();
+                d.on_click(cx.listener(move |v, _, _, _| v.link.send(AppToHost::Forward { id: id.clone() })))
+            }))
+            .child(if self.state.loading {
+                let id = id.clone();
+                button("×", true).on_click(cx.listener(move |v, _, _, _| v.link.send(AppToHost::Stop { id: id.clone() })))
+            } else {
+                let id = id.clone();
+                button("↻", true).on_click(cx.listener(move |v, _, _, _| v.link.send(AppToHost::Reload { id: id.clone(), ignore_cache: false })))
+            })
+            .child(div().flex_1().min_w_0().overflow_hidden().child(Input::new(&self.address)))
+            .when(self.state.loading, |d| d.child("loading"))
+            // A1: one Design button; the strip under the bar holds every design control.
+            .child(button("Design", true).on_click(cx.listener(|v, _, _, cx| v.toggle_mode(Owner::Pick, cx))))
+            // The zoom label shows only off 100 %; a click resets it.
+            .when(self.zoom_level.abs() > 1e-6, |d| {
+                d.child(div().id("zoom-label").px_1().rounded_sm().cursor_pointer().bg(hsla(0., 0., 0.5, 0.15)).child(zoom::percent(self.zoom_level)).on_click(cx.listener(|v, _, _, cx| v.set_zoom(0.0, cx))))
+            })
+            .child(button(if self.device.is_some() { "📱•" } else { "📱" }, true).on_click(cx.listener(|v, _, _, cx| {
+                v.device_menu = !v.device_menu;
+                cx.notify();
+            })))
+            .child(button("⬇", true).on_click(cx.listener(|v, _, _, cx| v.toggle_downloads(cx))))
+            // S29: what agents may do here. Tinted while any grant is on; "Agent" while one drives it.
+            .child({
+                let granted = [Grant::Control, Grant::Cdp, Grant::Capture].iter().any(|g| self.grant(*g));
+                let driving = self.input.read(cx).lease().is_some();
+                div()
+                    .id("shield")
+                    .px_1()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .when(granted, |d| d.bg(rgb(0x0a84ff)).text_color(rgb(0xffffff)))
+                    .when(!granted, |d| d.hover(|d| d.bg(hsla(0., 0., 0.5, 0.15))))
+                    .child(if driving { "🛡 Agent" } else { "🛡" })
+                    .on_click(cx.listener(|v, _, _, cx| v.toggle_shield(cx)))
+            })
+    }
+
+    fn shown_url(&self) -> String {
+        if self.state.url.is_empty() { "about:blank".into() } else { self.state.url.clone() }
+    }
+}
+
+impl Drop for BrowserView {
+    fn drop(&mut self) {
+        self.link.close(&self.id);
+        self.states.lock().unwrap().remove(&self.id);
+    }
+}
+
+impl Render for BrowserView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_popups(window, cx);
+        if self.address_stale && !self.address.read(cx).focus_handle(cx).is_focused(window) {
+            self.address_stale = false;
+            let url = self.state.url.clone();
+            self.address.update(cx, |a, cx| a.set_value(url, window, cx));
+        }
+        // Also checked here: focus events need an active window, which offscreen ones never are.
+        let focused = self.focus.is_focused(window);
+        if focused && !self.was_focused {
+            cx.emit(BrowserEvent::Focused);
+        }
+        self.was_focused = focused;
+        self.input.update(cx, |i, _| i.set_focused(focused));
+        let me = cx.entity().downgrade();
+        let (input_el, focus) = (self.input.clone(), self.focus.clone());
+        // Responsive mode: the device letterboxed into the page area, drawn at `fit`.
+        let fit = match (&self.device, self.measured) {
+            (Some(d), Some((area, _))) => d.fit(area.w, area.h),
+            _ => 1.0,
+        };
+        self.input.update(cx, |i, _| i.set_fit(fit));
+        let boxed = self.device.is_some();
+        let (box_input, box_focus) = (self.input.clone(), self.focus.clone());
+        let page = div()
+            .id("page")
+            .relative()
+            .size_full()
+            .track_focus(&self.focus)
+            .cursor(input::cursor_style(&self.state.cursor))
+            // A click focuses the page, in the capture phase: part 4's listeners stop the event.
+            .capture_any_mouse_down(cx.listener(|v, _, window, cx| {
+                window.focus(&v.focus, cx);
+            }))
+            .bg(rgb(0xffffff));
+        let page = input::listen(page, &self.input)
+            // Measures the page area; a new size reaches the host after this frame.
+            .child(
+                canvas(
+                    move |bounds, window, cx| {
+                        let size = Dips { w: f32::from(bounds.size.width), h: f32::from(bounds.size.height) };
+                        let scale = window.scale_factor();
+                        let me = me.clone();
+                        window.defer(cx, move |_, cx| {
+                            let _ = me.update(cx, |v, _| v.laid_out(size, scale));
+                        });
+                    },
+                    // Where the page is, and the window's text input (IME) while focused.
+                    move |bounds, _, window, cx| {
+                        if !boxed {
+                            input::paint(&input_el, &focus, bounds, window, cx);
+                        }
+                    },
+                )
+                .absolute()
+                .size_full(),
+            );
+        // The page's newest frame; before the first one, a white sheet with its url.
+        let frame = if self.crashed.is_none() { self.frames.element() } else { None };
+        if let (Some(p), true, Some(seq)) = (&self.probe, frame.is_some(), self.frames.seq()) {
+            p(&FrameEvent::Painted { seq });
+        }
+        if frame.is_some() {
+            // After this draw (GPUI presents it in the same tick): acked only if the window is
+            // visible (frame.rs: presentation, not receipt). Reuse is fenced separately by the
+            // IOSurface use count, so acking before the GPU finishes is safe.
+            let me = cx.entity().downgrade();
+            window.defer(cx, move |window, cx| {
+                let visible = window.is_visible();
+                let _ = me.update(cx, |v, _| {
+                    v.frames.presented(visible);
+                    v.send_ack();
+                });
+            });
+        }
+        // A window shot covers a page the person marked sensitive (its pixels never reach the file).
+        let masked = SHOT_MASK.load(std::sync::atomic::Ordering::SeqCst) && self.sensitive();
+        let frame = if masked { None } else { frame };
+        // Current overlay rects (stale ones are already gone), outlined over the frame.
+        // A3: a stepped pick draws its own box (the pointer's hit test is not it).
+        let stepped = self.hovered.as_ref().filter(|_| self.stepped).map(|t| Rect { x: t.rect.0, y: t.rect.1, w: t.rect.2, h: t.rect.3 });
+        let boxes: Vec<Rect> = match stepped {
+            Some(r) => vec![r],
+            None => self.overlay.shown().to_vec(),
+        };
+        let boxes: Vec<Rect> = boxes.iter().map(|r| { let (x, y, w, h) = self.drawn((r.x, r.y, r.w, r.h)); Rect { x, y, w, h } }).collect();
+        // Every overlay goes in `over`: drawn over the frame, inside the letterboxed box in
+        // responsive mode (positions already through `drawn`).
+        let mut over: Vec<AnyElement> = Vec::new();
+        over.extend(boxes.iter().map(|r| {
+            div().absolute().left(px(r.x)).top(px(r.y)).w(px(r.w)).h(px(r.h)).border_2().border_color(rgb(0x3b82f6)).bg(hsla(0.6, 0.9, 0.6, 0.15)).into_any_element()
+        }));
+        // A2: the label chip on the hover box while picking ("element · W×H" until the label comes).
+        let chip = (self.owner(cx) == Owner::Pick).then(|| boxes.first().copied()).flatten().map(|r| {
+            let label = self.hovered.as_ref().map(|t| t.label.as_str()).unwrap_or("");
+            let (x, y) = design_bar::chip_origin((r.x, r.y, r.w, r.h));
+            div().absolute().left(px(x)).top(px(y)).child(design_bar::chip(design_bar::chip_text(label, r.w, r.h)))
+        });
+        over.extend(chip.map(IntoElement::into_any_element));
+        // S6/S7: pins, the rubber band and the comment field over the frame.
+        over.extend(self.annotation_layer(cx));
+        // Markup above the frame and the highlights, while marking up or when shapes exist.
+        let marking = self.owner(cx) == Owner::Markup || !self.markup.read(cx).shapes().is_empty();
+        if marking {
+            over.push(markup::element(self.markup.clone(), self.fit()).into_any_element());
+        }
+        let mut over_slot = Some(over);
+        let page = match (&self.crashed, frame) {
+            _ if masked => page.child(
+                div().absolute().size_full().flex().items_center().justify_center().bg(rgb(0x202020)).text_color(rgb(0x909090)).text_sm().child("Hidden in screenshots: marked sensitive"),
+            ),
+            (None, Some(frame)) if boxed => {
+                let d = self.device.clone().expect("boxed");
+                page.bg(rgb(0x2a2a2a)).child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .gap_1()
+                        .child(div().text_xs().text_color(rgb(0xb0b0b0)).child(d.label(fit)))
+                        .child(
+                            div()
+                                .relative()
+                                .w(px(d.w * fit))
+                                .h(px(d.h * fit))
+                                .bg(rgb(0xffffff))
+                                .child(div().absolute().size_full().child(frame))
+                                .child(canvas(|_, _, _| (), move |bounds, _, window, cx| input::paint(&box_input, &box_focus, bounds, window, cx)).absolute().size_full())
+                                .children(over_slot.take().into_iter().flatten()),
+                        ),
+                )
+                .children(self.load_error_card(cx))
+                .children(self.permission_bar(cx))
+            }
+            (None, Some(frame)) => page.child(div().absolute().size_full().child(frame)).children(self.load_error_card(cx)).children(self.permission_bar(cx)),
+            (None, None) => page.child(
+                div().absolute().size_full().flex().items_center().justify_center().text_color(rgb(0x606060)).text_sm().child(self.shown_url()),
+            ),
+            (Some(reason), _) => page.child(
+                div()
+                    .absolute()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .items_center()
+                    .justify_center()
+                    .bg(rgb(0x202020))
+                    .text_color(rgb(0xe0e0e0))
+                    .text_sm()
+                    .child("This page stopped")
+                    .child(div().text_xs().opacity(0.6).child(reason.clone()))
+                    .child(
+                        div()
+                            .id("reload")
+                            .px_3()
+                            .py_1()
+                            .rounded_md()
+                            .bg(rgb(0x3a3a3a))
+                            .cursor_pointer()
+                            .child("Reload")
+                            .on_click(cx.listener(|v, _, _, cx| v.reload(cx))),
+                    ),
+            ),
+        };
+        // In responsive mode the device's box took the overlays; otherwise they go over the page.
+        let page = page.children(over_slot.take().into_iter().flatten());
+        // The context menu over everything in the page; it takes the mouse first (occlude).
+        let menu = self.menu_element(cx);
+        let page = page.children(menu);
+        // A JS dialog and the downloads list sit beside the page element, over it: keys and clicks in
+        // them must not bubble into the page's input listeners.
+        let page = div()
+            .relative()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .child(page)
+            .child(self.dialogs.clone())
+            .children(self.downloads_panel(cx))
+            .children(self.shield_panel(cx))
+            .children(self.device_menu(cx));
+        // S10: the style panel in its own column beside the page.
+        if let Some(panel) = self.style_panel.clone() {
+            for (req, ok, rows) in std::mem::take(&mut self.style_results) {
+                panel.update(cx, |p, cx| p.on_result(req, ok, rows, window, cx));
+            }
+        }
+        let page = div()
+            .flex()
+            .flex_row()
+            .flex_1()
+            .min_h_0()
+            .child(page)
+            .when_some(self.style_panel.clone(), |d, p| d.child(div().id("style-panel").flex_none().h_full().overflow_y_scroll().child(p)));
+        let strip = self.mode_strip(cx);
+        self.strip_shown = strip.is_some();
+        // After any input event, drain what BrowserInput routed away from the page (its own
+        // listeners may stop the event, so the drain is deferred to after dispatch).
+        let drain = |cx: &mut Context<Self>, window: &mut Window| {
+            let me = cx.entity().downgrade();
+            window.defer(cx, move |_, cx| {
+                let _ = me.update(cx, |v, cx| v.drain_overlay(cx));
+            });
+        };
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .capture_any_mouse_down(cx.listener(move |_, _, window, cx| drain(cx, window)))
+            .capture_any_mouse_up(cx.listener(move |_, _, window, cx| drain(cx, window)))
+            .on_mouse_move(cx.listener(move |v, _, window, cx| {
+                if v.owner(cx) != Owner::Browse {
+                    drain(cx, window);
+                }
+            }))
+            .capture_key_down(cx.listener(move |_, _, window, cx| drain(cx, window)))
+            .key_context("Browser")
+            // Escape closes an open context menu, else an open find bar, before the page sees it.
+            .capture_key_down(cx.listener(|v, ev: &KeyDownEvent, window, cx| {
+                // Enter in the comment field saves it (shift-Enter is typed as a new line by the field).
+                if ev.keystroke.key == "enter" && !ev.keystroke.modifiers.shift && v.comment_target.is_some() && v.owner(cx) == Owner::Comment {
+                    cx.stop_propagation();
+                    v.save_comment(cx);
+                    return;
+                }
+                if ev.keystroke.key != "escape" {
+                    return;
+                }
+                if v.menu.is_some() {
+                    cx.stop_propagation();
+                    v.choose_menu(None, cx);
+                } else if v.style_panel.is_some() && v.owner(cx) == Owner::Browse && v.find.is_none() {
+                    cx.stop_propagation();
+                    v.close_style_panel(cx);
+                } else if v.find.is_some() {
+                    cx.stop_propagation();
+                    v.close_find(window, cx);
+                }
+            }))
+            .on_action(cx.listener(|v, _: &OpenFind, window, cx| v.open_find(window, cx)))
+            .on_action(cx.listener(|v, _: &input::TogglePick, _, cx| v.toggle_mode(Owner::Pick, cx)))
+            .on_action(cx.listener(|v, _: &input::ToggleMarkup, _, cx| v.toggle_mode(Owner::Markup, cx)))
+            .on_action(cx.listener(|v, _: &ZoomIn, _, cx| v.zoom_step(true, cx)))
+            .on_action(cx.listener(|v, _: &ZoomOut, _, cx| v.zoom_step(false, cx)))
+            .on_action(cx.listener(|v, _: &ZoomReset, _, cx| v.set_zoom(0.0, cx)))
+            .on_action(cx.listener(|v, _: &FocusAddress, window, cx| {
+                v.address.update(cx, |a, cx| {
+                    a.focus(window, cx);
+                    a.select_all(window, cx);
+                });
+            }))
+            .relative()
+            .map(|d| if self.opener.is_some() { d.child(self.popup_bar(cx)) } else { d.child(self.chrome(cx)).children(self.find_bar(cx)).children(strip) })
+            .child(page)
+            .children(self.popup_layer(cx))
+    }
+}
+
+/// cmd-L (ctrl-L elsewhere) puts the cursor in the address bar, once per app.
+fn bind_keys(cx: &mut App) {
+    struct Bound;
+    impl Global for Bound {}
+    if cx.has_global::<Bound>() {
+        return;
+    }
+    cx.set_global(Bound);
+    let cmd = if cfg!(target_os = "macos") { "cmd" } else { "ctrl" };
+    cx.bind_keys([
+        KeyBinding::new(&format!("{cmd}-l"), FocusAddress, Some("Browser")),
+        KeyBinding::new(&format!("{cmd}-f"), OpenFind, Some("Browser")),
+        KeyBinding::new(&format!("{cmd}-="), ZoomIn, Some("Browser")),
+        KeyBinding::new(&format!("{cmd}-+"), ZoomIn, Some("Browser")),
+        KeyBinding::new(&format!("{cmd}--"), ZoomOut, Some("Browser")),
+        KeyBinding::new(&format!("{cmd}-0"), ZoomReset, Some("Browser")),
+    ]);
+    // Mode chords (part 4, docs/browser-input-owner.md): pick and markup.
+    for (k, m) in input::default_chords() {
+        match m {
+            Owner::Pick => cx.bind_keys([KeyBinding::new(k, input::TogglePick, Some("Browser"))]),
+            _ => cx.bind_keys([KeyBinding::new(k, input::ToggleMarkup, Some("Browser"))]),
+        }
+    }
+}
+
+/// `browser.device`'s arguments: a named device, a custom size, or off. Never a user agent: those
+/// come only from the device list.
+pub fn device_mode(a: &serde_json::Value) -> Result<Option<super::devices::Mode>, String> {
+    if a.get("user_agent").is_some() || a.get("userAgent").is_some() {
+        return Err("browser.device takes a device name or a size, not a user agent".into());
+    }
+    if a.get("off").and_then(serde_json::Value::as_bool) == Some(true) || a.get("name").and_then(serde_json::Value::as_str) == Some("off") {
+        return Ok(None);
+    }
+    if let Some(name) = a.get("name").and_then(serde_json::Value::as_str) {
+        return super::devices::Mode::preset(name).map(Some).ok_or_else(|| format!("no device {name:?}: try iPhone 15, Pixel 8, iPad Air, or w and h"));
+    }
+    let num = |k: &str| a.get(k).and_then(serde_json::Value::as_f64).map(|v| v as f32);
+    match (num("w"), num("h")) {
+        (Some(w), Some(h)) => super::devices::Mode::custom(w, h, num("scale")).map(Some),
+        _ => Err("browser.device needs name, or w and h, or off: true".into()),
+    }
+}
+
+/// The broker's grant check: the agent's grants and the block's profile, read fresh on every call
+/// and event, so a revoked grant or a closed block takes effect at once.
+pub fn broker_authorizer(agent: Arc<Mutex<Agent>>, states: Arc<Mutex<HashMap<BrowserId, BrowserState>>>) -> super::broker::Authorize {
+    Arc::new(move |block: &str, method: &str| {
+        // A popup answers to its opener's grants and profile.
+        let (grants_of, profile) = {
+            let st = states.lock().unwrap();
+            let owner = st.get(block).and_then(|s| s.opener.clone()).unwrap_or_else(|| block.to_string());
+            let profile = st.get(&owner).filter(|_| st.contains_key(block)).map(|s| s.profile.clone());
+            (owner, profile)
+        };
+        agent.lock().unwrap().broker_allowed(&grants_of, method, profile.as_deref())
+    })
+}
+
+/// Set while `herdr-app shot` renders the window: blocks marked sensitive draw a cover instead of the page.
+pub static SHOT_MASK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// One `BrowserView` per browser block in the layouts. A view lives while its block does (shown
+/// or not: a hidden tab keeps its page); the host page is made at the block's first paint.
+#[derive(Default)]
+pub struct Browsers {
+    link: Option<Arc<HostClient>>,
+    views: HashMap<BrowserId, (Entity<BrowserView>, Subscription)>,
+    states: Arc<Mutex<HashMap<BrowserId, BrowserState>>>,
+    /// `herdr-app do browser.*` (part 5); hears every host message.
+    agent: Option<Arc<Mutex<Agent>>>,
+    /// The browser that last took the keyboard: agent commands' default target.
+    pub focused: Option<BrowserId>,
+    /// Sent annotation batches, newest last (at most 20).
+    pub batches: Arc<Mutex<std::collections::VecDeque<AnnotationBatch>>>,
+    /// Zoom per host, `$HERDR_APP_HOME/browser/zoom.json`, loaded with the first block.
+    zoom: Option<Arc<Mutex<zoom::ZoomPrefs>>>,
+    /// Every download this run, shared by all blocks (`browser.downloads` reads it).
+    pub downloads: Downloads,
+}
+
+impl Browsers {
+    pub fn view(&self, id: &str) -> Option<&Entity<BrowserView>> {
+        self.views.get(id).map(|(v, _)| v)
+    }
+
+    /// A block's profile as the app made it (None: no such block).
+    pub fn profile_of(&self, id: &str) -> Option<String> {
+        self.states.lock().unwrap().get(id).map(|s| s.profile.clone())
+    }
+
+    pub fn link_arc(&mut self) -> Arc<HostClient> {
+        if self.link.is_none() {
+            let link = HostClient::new(HostConfig::from_env());
+            let agent = Arc::new(Mutex::new(Agent::new(link.config().dir.clone())));
+            agent.lock().unwrap().states = Some(self.states.clone());
+            let a = agent.clone();
+            link.set_tap(Arc::new(move |msg| a.lock().unwrap().on_host(msg)));
+            // HERDR: part 5. CDP on the app's pipe: agents reach it only through the broker (agent.sock + token).
+            if cdp_pipe_wanted() {
+                let (l, ag) = (link.clone(), agent.clone());
+                let started = super::broker::Broker::start(link.config().dir.clone(), Arc::new(move || l.cdp()), Arc::new(move |b| ag.lock().unwrap().cdp.target_of(b)), broker_authorizer(agent.clone(), self.states.clone()));
+                if let Err(e) = started {
+                    tracing::warn!("the browser broker did not start: {e}");
+                }
+            }
+            (self.link, self.agent) = (Some(link), Some(agent));
+        }
+        self.link.clone().expect("made above")
+    }
+
+    /// For tests: browsers over a given link (its agent is made here too).
+    pub fn with_link(link: Arc<HostClient>) -> Self {
+        let agent = Arc::new(Mutex::new(Agent::new(link.config().dir.clone())));
+        let states: Arc<Mutex<HashMap<BrowserId, BrowserState>>> = Default::default();
+        agent.lock().unwrap().states = Some(states.clone());
+        let a = agent.clone();
+        link.set_tap(Arc::new(move |msg| a.lock().unwrap().on_host(msg)));
+        Self { link: Some(link), agent: Some(agent), states, ..Default::default() }
+    }
+
+    /// `herdr-app do browser.<name>`: answered through `reply` (now, or when the host answers).
+    /// `Open` and `Close` come back for the window, which owns the layout.
+    pub fn run(&mut self, name: &str, args: &serde_json::Value, block_of_pane: &dyn Fn(&str) -> Option<BrowserId>, reply: Reply, cx: &mut App) -> Step {
+        self.link_arc();
+        let agent = self.agent.clone().expect("made with the link");
+        // The page the command targets must exist on the host, shown or not.
+        let target = args.get("id").and_then(serde_json::Value::as_str).map(str::to_owned)
+            .or_else(|| args.get("pane").and_then(serde_json::Value::as_str).and_then(block_of_pane))
+            .or_else(|| self.focused.clone());
+        if let Some((view, _)) = target.and_then(|t| self.views.get(&t)) {
+            view.update(cx, |v, _| v.ensure_page());
+        }
+        let focus = Focus { focused: self.focused.clone().filter(|f| self.views.contains_key(f)), block_of_pane };
+        if name == "browser.device" {
+            let r = agent.lock().unwrap().check(name, args, self, &focus).and_then(|id| Ok((id, device_mode(args)?)));
+            reply(r.and_then(|(id, mode)| {
+                let view = self.views.get(&id).map(|(v, _)| v.clone()).ok_or_else(|| format!("no browser {id:?}"))?;
+                let label = mode.as_ref().map(|m| m.label(1.0));
+                view.update(cx, |v, cx| v.set_device(mode, cx));
+                Ok(serde_json::json!({ "id": id, "device": label }))
+            }));
+            return Step::Done;
+        }
+        agent.lock().unwrap().run(name, args, self, &focus, reply)
+    }
+
+    /// HERDR: P2-18. Picks that waited past `PERSON_WAIT` are answered "timed out"; the blocks left with
+    /// nobody waiting come back so the window can end their pick mode.
+    pub fn expire_picks(&self) -> Vec<BrowserId> {
+        self.agent.as_ref().map(|a| a.lock().unwrap().expire_waiters(std::time::Instant::now())).unwrap_or_default()
+    }
+
+    /// HERDR: P2-18. Ends pick mode on a block whose pick timed out (a comment the person is writing stays).
+    pub fn end_pick(&self, id: &str, cx: &mut App) {
+        if let Some((view, _)) = self.views.get(id) {
+            let input = view.read(cx).input().clone();
+            input.update(cx, |i, _| i.end_pick());
+        }
+    }
+
+    // HERDR: browser block (part 5). The person picked an element: the agent captures it for `browser.pick`.
+    /// Send's batch (S7 attach flow) for the agent side (fork-agent's S8 takes it from here);
+    /// the newest 20 are kept for `browser.annotations`.
+    pub fn annotations(&mut self, batch: AnnotationBatch) {
+        if let (Some(agent), Ok(v)) = (&self.agent, serde_json::to_value(&batch)) {
+            agent.lock().unwrap().annotated(v);
+        }
+        let mut q = self.batches.lock().unwrap();
+        q.push_back(batch);
+        while q.len() > 20 {
+            q.pop_front();
+        }
+    }
+
+    pub fn picked(&mut self, id: &str, x: f32, y: f32) {
+        let link = self.link_arc();
+        if let Some(agent) = &self.agent {
+            agent.lock().unwrap().picked(&id.to_owned(), x, y, &*link);
+        }
+    }
+
+    /// Match the views to `blocks` (every browser block in every layout, as id and block):
+    /// new blocks get a view (`on_event` hears its url changes), gone ones close their page.
+    pub fn sync<W: 'static>(
+        &mut self,
+        blocks: Vec<(String, BrowserBlock)>,
+        window: &mut Window,
+        cx: &mut Context<W>,
+        on_event: impl Fn(&mut W, &str, &BrowserEvent, &mut Window, &mut Context<W>) + Clone + 'static,
+    ) {
+        let keep: HashSet<&str> = blocks.iter().map(|(id, _)| id.as_str()).collect();
+        let gone: Vec<BrowserId> = self.views.keys().filter(|id| !keep.contains(id.as_str())).cloned().collect();
+        for id in gone {
+            self.views.remove(&id);
+            if let Some(agent) = &self.agent {
+                agent.lock().unwrap().closed(&id);
+            }
+            if self.focused.as_ref() == Some(&id) {
+                self.focused = None;
+            }
+        }
+        for (id, block) in blocks {
+            if let Some((v, _)) = self.views.get(&id) {
+                v.update(cx, |v, cx| v.set_block(block, cx));
+                continue;
+            }
+            let (link, states) = (self.link_arc(), self.states.clone());
+            let downloads = self.downloads.clone();
+            let agent = self.agent.clone();
+            let dir = link.config().dir.clone();
+            let prefs = self.zoom.get_or_insert_with(|| Arc::new(Mutex::new(zoom::ZoomPrefs::load(dir.join("zoom.json"))))).clone();
+            let view = cx.new(|cx| {
+                let mut v = BrowserView::new(&id, block, link, states, window, cx);
+                v.use_downloads(downloads, cx);
+                v.use_zoom_prefs(prefs);
+                v.agent = agent.clone();
+                v
+            });
+            let key = id.clone();
+            let on = on_event.clone();
+            let sub = cx.subscribe_in(&view, window, move |w, _, ev, window, cx| on(w, &key, ev, window, cx));
+            self.views.insert(id, (view, sub));
+        }
+    }
+
+    pub fn ids(&self) -> Vec<BrowserId> {
+        let mut ids: Vec<_> = self.views.keys().cloned().collect();
+        ids.sort();
+        ids
+    }
+}
+
+impl BrowserRegistry for Browsers {
+    fn state(&self, id: &BrowserId) -> Option<BrowserState> {
+        self.states.lock().unwrap().get(id).cloned()
+    }
+    fn link(&self) -> &dyn HostLink {
+        self.link.as_deref().expect("a browser block made the host link")
+    }
+}
+
+/// A failed load's title and hint, by kind (`url` names a dead localhost).
+pub fn load_error_words(kind: &str, url: &str) -> (String, String) {
+    let host = url.split_once("://").map_or(url, |(_, r)| r).split(['/', '?', '#']).next().unwrap_or("");
+    let local = host.starts_with("127.0.0.1") || host.starts_with("localhost") || host.starts_with("[::1]");
+    match kind {
+        "dns" => ("This site can't be found".into(), format!("{} doesn't resolve. Check the address.", capped(host, 80))),
+        "offline" => ("You're offline".into(), "Check your connection, then reload.".into()),
+        "refused" if local => (format!("Nothing is running at {}", capped(host, 80)), "Start the server, then reload.".into()),
+        "refused" => ("The site refused to connect".into(), format!("{} isn't accepting connections.", capped(host, 80))),
+        "timeout" => ("The site took too long".into(), "It didn't answer in time. Try again.".into()),
+        "certificate" => ("This connection isn't private".into(), "The site's certificate isn't valid, so it wasn't opened.".into()),
+        _ => ("This page couldn't load".into(), "Reload to try again.".into()),
+    }
+}
+
+/// The S27 inbox under the browser dir.
+fn send_to_root(dir: &Path) -> PathBuf {
+    super::inbox::root(dir)
+}
+
+/// A popup's bar text: its scheme and host only (plain, capped), from the url it shows now.
+pub fn popup_origin(url: &str) -> String {
+    let clean: String = url.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+    let origin = match clean.split_once("://") {
+        Some((scheme, rest)) => {
+            let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+            // Userinfo is not where the page is: `https://google.com@evil.test` shows evil.test.
+            let host = host.rsplit_once('@').map_or(host, |(_, h)| h);
+            format!("{scheme}://{host}")
+        }
+        None => clean,
+    };
+    capped(&origin, 80)
+}
+
+/// At most `n` characters, with an ellipsis when cut.
+fn capped(s: &str, n: usize) -> String {
+    if s.chars().count() <= n { s.to_string() } else { s.chars().take(n).collect::<String>() + "…" }
+}
+
+/// Socket path checks for tests and `herdr-app doctor`-style reports.
+pub fn socket_of(dir: &Path) -> PathBuf {
+    dir.join("host.sock")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use herdr_browser_protocol::Size;
+
+    #[::core::prelude::v1::test]
+    fn the_cdp_port_opens_only_for_a_number_in_a_developer_build() {
+        for off in [None, Some(""), Some("off"), Some("of"), Some("Off"), Some("no"), Some("false"), Some("-1"), Some("70000"), Some("9222x")] {
+            assert_eq!(cdp_port(off, true), None, "{off:?}");
+        }
+        assert_eq!(cdp_port(Some("9222"), true), Some(9222));
+        assert_eq!(cdp_port(Some(" 0 "), true), Some(0));
+        assert_eq!(cdp_port(Some("9222"), false), None, "release builds never open a port");
+    }
+
+    #[::core::prelude::v1::test]
+    fn browser_device_takes_a_name_or_a_size_never_a_user_agent() {
+        use serde_json::json;
+        assert_eq!(device_mode(&json!({ "name": "Pixel 8" })).unwrap().unwrap().w, 412.0);
+        assert_eq!(device_mode(&json!({ "w": 500, "h": 700 })).unwrap().unwrap().user_agent, None);
+        assert_eq!(device_mode(&json!({ "off": true })).unwrap(), None);
+        assert!(device_mode(&json!({ "name": "iPhone 15", "user_agent": "evil" })).unwrap_err().contains("not a user agent"));
+        assert!(device_mode(&json!({ "w": 500, "userAgent": "evil" })).is_err());
+        assert!(device_mode(&json!({ "name": "Nokia" })).is_err());
+        assert!(device_mode(&json!({})).is_err());
+    }
+
+    #[::core::prelude::v1::test]
+    fn load_error_cards_name_the_kind_and_cap_the_url() {
+        assert_eq!(load_error_words("refused", "http://127.0.0.1:3000/x").0, "Nothing is running at 127.0.0.1:3000");
+        assert_eq!(load_error_words("refused", "https://a.test/").0, "The site refused to connect");
+        assert_eq!(load_error_words("certificate", "https://self.test/").0, "This connection isn't private");
+        assert_eq!(load_error_words("dns", "http://nope.invalid/").1, "nope.invalid doesn't resolve. Check the address.");
+        assert_eq!(load_error_words("weird", "x").0, "This page couldn't load");
+        let long = format!("https://a.test/{}", "x".repeat(300));
+        assert_eq!(capped(&long, 120).chars().count(), 121);
+    }
+
+    fn tmp(name: &str) -> PathBuf {
+        // Short: macOS socket paths stop at 104 bytes.
+        let d = PathBuf::from(format!("/tmp/hb-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn recv(rx: &async_channel::Receiver<HostToApp>, want: impl Fn(&HostToApp) -> bool) -> HostToApp {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match rx.try_recv() {
+                Ok(m) if want(&m) => return m,
+                Ok(_) => {}
+                Err(_) if Instant::now() > deadline => panic!("no matching host event in time"),
+                Err(_) => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+    }
+
+    /// A fake host: accepts on the socket, records lines, answers Url for Create and Navigate.
+    fn fake_host(sock: PathBuf) -> (Arc<Mutex<Vec<AppToHost>>>, mpsc::Sender<()>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (kill, killed) = mpsc::channel::<()>();
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let s = seen.clone();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut out = stream.try_clone().unwrap();
+            stream.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+            let mut r = BufReader::new(stream);
+            let mut line = String::new();
+            loop {
+                if killed.try_recv().is_ok() {
+                    return; // drops the socket: the app sees the host die
+                }
+                line.clear();
+                match r.read_line(&mut line) {
+                    Ok(0) => return,
+                    Ok(_) => {}
+                    Err(_) => continue,
+                }
+                let msg: AppToHost = protocol::decode(&line).unwrap();
+                let reply = match &msg {
+                    AppToHost::Create { id, url: Some(url), .. } | AppToHost::Navigate { id, url } => Some(HostToApp::Url { id: id.clone(), url: url.clone() }),
+                    _ => None,
+                };
+                s.lock().unwrap().push(msg);
+                if let Some(m) = reply {
+                    let _ = writeln!(out, "{}", protocol::encode(&m));
+                }
+            }
+        });
+        (seen, kill)
+    }
+
+    #[::core::prelude::v1::test]
+    fn launch_urls_lose_their_token_in_the_document() {
+        let t = "0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(without_token(&format!("http://127.0.0.1:7000/?token={t}&machine=box")), "http://127.0.0.1:7000/?machine=box");
+        assert_eq!(without_token(&format!("http://127.0.0.1:7000/?token={t}")), "http://127.0.0.1:7000/");
+        assert_eq!(without_token("http://127.0.0.1:7000/?a=1&token=x#f"), "http://127.0.0.1:7000/?a=1#f");
+        assert_eq!(without_token("http://127.0.0.1:7000/x"), "http://127.0.0.1:7000/x");
+    }
+
+    #[::core::prelude::v1::test]
+    fn a_tab_showing_a_page_takes_its_title_unless_named() {
+        let st = BrowserState { url: "https://a.test/".into(), title: "A page".into(), favicon: "https://a.test/f.ico".into(), ..Default::default() };
+        let mut t = serde_json::json!({ "name": "2" });
+        annotate_tab(&mut t, &st, false);
+        assert_eq!((t["name"].as_str(), t["favicon"].as_str(), t["url"].as_str()), (Some("A page"), Some("https://a.test/f.ico"), Some("https://a.test/")));
+        let mut named = serde_json::json!({ "name": "docs" });
+        annotate_tab(&mut named, &st, true);
+        assert_eq!(named["name"], "docs", "a name someone gave stays");
+        assert_eq!(named["page_title"], "A page");
+        let mut blank = serde_json::json!({ "name": "3" });
+        annotate_tab(&mut blank, &BrowserState::default(), false);
+        assert_eq!(blank["name"], "3", "no title yet: the number stays");
+    }
+
+    #[::core::prelude::v1::test]
+    fn the_address_bar_opens_urls_hosts_and_searches() {
+        use crate::settings::SearchEngine::{Bing, Google};
+        let go = |t: &str| address_to_url(t, Google);
+        assert_eq!(go("  "), None);
+        assert_eq!(go("https://example.com/a?b=1").as_deref(), Some("https://example.com/a?b=1"));
+        assert_eq!(go("example.com").as_deref(), Some("https://example.com"));
+        assert_eq!(go("docs.rs/gpui/latest").as_deref(), Some("https://docs.rs/gpui/latest"));
+        assert_eq!(go("localhost:3000/x").as_deref(), Some("http://localhost:3000/x"));
+        assert_eq!(go("127.0.0.1:8080").as_deref(), Some("http://127.0.0.1:8080"));
+        assert_eq!(go("about:blank").as_deref(), Some("about:blank"));
+        assert_eq!(go("file:///tmp/a.html").as_deref(), Some("file:///tmp/a.html"));
+        assert_eq!(go("how do iosurfaces work").as_deref(), Some("https://www.google.com/search?q=how+do+iosurfaces+work"));
+        assert_eq!(go("rust").as_deref(), Some("https://www.google.com/search?q=rust"));
+        assert_eq!(go("what is 3.5 kg").as_deref(), Some("https://www.google.com/search?q=what+is+3.5+kg"));
+        assert_eq!(address_to_url("cef osr", Bing).as_deref(), Some("https://www.bing.com/search?q=cef+osr"));
+    }
+
+    fn size() -> Size {
+        Size { w: 400.0, h: 300.0 }
+    }
+
+    #[::core::prelude::v1::test]
+    fn link_says_hello_first_then_routes_events_by_block() {
+        let dir = tmp("route");
+        let (seen, _kill) = fake_host(socket_of(&dir));
+        let link = HostClient::new(HostConfig { dir: dir.clone(), program: "/nonexistent".into(), args: vec![], cdp_port: None });
+        let (a, b) = (link.subscribe("a"), link.subscribe("b"));
+        link.send(AppToHost::Create { id: "a".into(), url: Some("https://a.test".into()), size: size(), scale: 2.0, profile: None });
+        link.send(AppToHost::Create { id: "b".into(), url: Some("https://b.test".into()), size: size(), scale: 2.0, profile: None });
+        assert_eq!(recv(&a, |m| matches!(m, HostToApp::Url { .. })), HostToApp::Url { id: "a".into(), url: "https://a.test".into() });
+        assert_eq!(recv(&b, |m| matches!(m, HostToApp::Url { .. })), HostToApp::Url { id: "b".into(), url: "https://b.test".into() });
+        assert!(a.try_recv().is_err(), "a hears only its own events");
+        let seen = seen.lock().unwrap().clone();
+        assert!(matches!(&seen[0], AppToHost::Hello { profile_dir, .. } if profile_dir.ends_with("profile")), "{seen:?}");
+        let creates: Vec<_> = seen.iter().filter_map(|m| match m { AppToHost::Create { id, .. } => Some(id.as_str()), _ => None }).collect();
+        assert_eq!(creates, ["a", "b"], "each page made once: {seen:?}");
+    }
+
+    #[::core::prelude::v1::test]
+    fn closing_a_block_closes_its_page_and_forgets_it() {
+        let dir = tmp("close");
+        let (seen, _kill) = fake_host(socket_of(&dir));
+        let link = HostClient::new(HostConfig { dir, program: "/nonexistent".into(), args: vec![], cdp_port: None });
+        let a = link.subscribe("a");
+        link.send(AppToHost::Create { id: "a".into(), url: Some("https://a.test".into()), size: size(), scale: 1.0, profile: None });
+        recv(&a, |m| matches!(m, HostToApp::Url { .. }));
+        link.close("a");
+        link.close("a"); // twice: one Close
+        assert!(link.open_ids().is_empty());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !seen.lock().unwrap().iter().any(|m| matches!(m, AppToHost::Close { .. })) {
+            assert!(Instant::now() < deadline, "no Close");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(seen.lock().unwrap().iter().filter(|m| matches!(m, AppToHost::Close { .. })).count(), 1);
+    }
+
+    #[::core::prelude::v1::test]
+    fn a_dead_host_is_a_crash_and_the_next_send_makes_the_pages_again() {
+        let dir = tmp("crash");
+        let (_seen, kill) = fake_host(socket_of(&dir));
+        let link = HostClient::new(HostConfig { dir: dir.clone(), program: "/nonexistent".into(), args: vec![], cdp_port: None });
+        let a = link.subscribe("a");
+        link.send(AppToHost::Create { id: "a".into(), url: Some("https://a.test".into()), size: size(), scale: 2.0, profile: None });
+        link.send(AppToHost::Navigate { id: "a".into(), url: "https://a.test/2".into() });
+        recv(&a, |m| matches!(m, HostToApp::Url { url, .. } if url.ends_with("/2")));
+        kill.send(()).unwrap();
+        recv(&a, |m| matches!(m, HostToApp::Crashed { .. }));
+        // A new host on the same socket: the next message replays the open page at its last url.
+        let _ = std::fs::remove_file(socket_of(&dir));
+        let (seen2, _kill2) = fake_host(socket_of(&dir));
+        link.send(AppToHost::Reload { id: "a".into(), ignore_cache: false });
+        recv(&a, |m| matches!(m, HostToApp::Url { url, .. } if url.ends_with("/2")));
+        let seen2 = seen2.lock().unwrap().clone();
+        assert!(matches!(&seen2[0], AppToHost::Hello { .. }), "{seen2:?}");
+        assert!(matches!(&seen2[1], AppToHost::Create { id, url: Some(u), scale, .. } if id == "a" && u.ends_with("/2") && *scale == 2.0), "{seen2:?}");
+        assert!(matches!(&seen2[2], AppToHost::Reload { .. }), "{seen2:?}");
+    }
+
+    #[::core::prelude::v1::test]
+    fn no_host_program_is_a_crash_not_a_hang() {
+        let dir = tmp("nohost");
+        let link = HostClient::new(HostConfig { dir, program: "/nonexistent/herdr-browser-host".into(), args: vec![], cdp_port: None });
+        let a = link.subscribe("a");
+        link.send(AppToHost::Create { id: "a".into(), url: None, size: size(), scale: 1.0, profile: None });
+        let m = recv(&a, |m| matches!(m, HostToApp::Crashed { .. }));
+        assert!(matches!(&m, HostToApp::Crashed { reason, .. } if reason.contains("can't start")), "{m:?}");
+    }
+
+    /// Against the real stub host binary (part 2), when one is given:
+    /// `HERDR_BROWSER_HOST=<path to herdr-browser-host> cargo test --bin herdr-app stub_host`.
+    #[::core::prelude::v1::test]
+    fn stub_host_spawns_lazily_answers_and_restarts_after_a_kill() {
+        let Some(program) = std::env::var_os("HERDR_BROWSER_HOST").map(PathBuf::from) else {
+            eprintln!("HERDR_BROWSER_HOST unset: stub host test skipped");
+            return;
+        };
+        let dir = tmp("stub");
+        let link = HostClient::new(HostConfig { dir: dir.clone(), program, args: vec!["--stub".into()], cdp_port: None });
+        let a = link.subscribe("a");
+        assert!(UnixStream::connect(socket_of(&dir)).is_err(), "no host before the first send");
+        link.send(AppToHost::Create { id: "a".into(), url: Some("https://example.com".into()), size: size(), scale: 2.0, profile: None });
+        recv(&a, |m| matches!(m, HostToApp::Url { url, .. } if url == "https://example.com"));
+        let frame = recv(&a, |m| matches!(m, HostToApp::Frame { .. }));
+        assert!(matches!(frame, HostToApp::Frame { size: PixelSize { w: 800, h: 600 }, .. }), "{frame:?}");
+        // Responsive mode on: after a restart the new host hears it again with the page.
+        let device = protocol::Device { mobile: true, touch: true, user_agent: Some("UA-phone".into()) };
+        link.send(AppToHost::SetDevice { id: "a".into(), device: Some(device) });
+        recv(&a, |m| matches!(m, HostToApp::Console { message, .. } if message == "device mobile=true touch=true ua=true"));
+        // Kill the host: the view hears a crash, the next send starts a new one and makes the page again.
+        let pid = String::from_utf8(Command::new("pgrep").args(["-f", &format!("{}", socket_of(&dir).display())]).output().unwrap().stdout).unwrap();
+        let pid = pid.lines().next().expect("stub host running").trim().to_owned();
+        Command::new("kill").args(["-9", &pid]).status().unwrap();
+        recv(&a, |m| matches!(m, HostToApp::Crashed { .. }));
+        link.send(AppToHost::Reload { id: "a".into(), ignore_cache: false });
+        recv(&a, |m| matches!(m, HostToApp::Url { url, .. } if url == "https://example.com"));
+        recv(&a, |m| matches!(m, HostToApp::Console { message, .. } if message == "device mobile=true touch=true ua=true"));
+        drop(link);
+        std::thread::sleep(Duration::from_millis(700));
+        let left = Command::new("pgrep").args(["-f", &format!("{}", socket_of(&dir).display())]).output().unwrap();
+        assert!(left.stdout.is_empty(), "host left running after the app let go");
+    }
+}
