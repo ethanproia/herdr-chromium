@@ -3590,7 +3590,7 @@ impl AppWindow {
                 crate::update::relaunch();
                 cx.quit();
             }
-            "window.close" | "window.minimize" | "window.maximize" => return self.window_command(name, window, cx),
+            "window.close" | "window.minimize" | "window.maximize" | "window.fullscreen" => return self.window_command(name, window, cx),
             "window.native" => return self.answer(Self::window_native(window)),
             // HERDR: test-only (commands::TEST_COMMANDS): unknown unless HERDR_APP_TEST_INPUT=1 at start.
             "mod.click" => {

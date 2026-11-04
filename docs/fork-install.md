@@ -67,7 +67,8 @@ The installer never writes inside `~/.config/herdr-app`. On first install only
 
 1. Copies `~/.config/herdr-app` to `~/.config/trestle`. It reads stock's
    files and never moves them, and leaves out sockets
-   (`herdr-app.sock`) and `layouts/.state`.
+   (`herdr-app.sock`), `layouts/.state` and the `.updated` marker, so a
+   pending stock app update never makes the fork touch herdr-core.
 2. Writes `"layout": "labs"` into the copy's `shared.json`, so the fork opens
    on Labs.
 3. Leaves the copy's `keys.json` alone. The mod key merge adds the fork's

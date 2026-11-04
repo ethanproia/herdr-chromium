@@ -4,7 +4,8 @@
 //! machine, checks its sha256 and unpacks it next to itself (`<install>.new`).
 //! The frame then shows "Restart"; the swap happens on restart or the next
 //! quit, or before opening the next window after a crash. The first start
-//! after a swap runs `hc update` for the core.
+//! after a swap runs `hc update` for the core (release builds only; a source
+//! build just removes the marker).
 //!
 //! A build from source never updates: only `scripts/package` (the release
 //! builds) sets `HERDR_APP_RELEASE`. `scripts/install-macos` makes a
@@ -117,12 +118,17 @@ pub fn set_core(version: Option<String>, managed: Option<String>) {
 }
 
 fn checks_app() -> Option<PathBuf> {
-    root().filter(|_| option_env!("HERDR_APP_RELEASE").is_some() || std::env::var_os("HERDR_RELEASES_URL").is_some())
+    root().filter(|_| checks_core())
 }
 
 /// A release build checks the core; a source build only when pointed at a test release server.
 fn checks_core() -> bool {
-    option_env!("HERDR_APP_RELEASE").is_some() || std::env::var_os("HERDR_RELEASES_URL").is_some()
+    checks_core_with(option_env!("HERDR_APP_RELEASE").is_some(), std::env::var_os("HERDR_RELEASES_URL").is_some())
+}
+
+/// `checks_core` with the environment passed in, so a test can pin it down.
+fn checks_core_with(release_build: bool, releases_url: bool) -> bool {
+    release_build || releases_url
 }
 
 /// For the settings screen: both programs, what's waiting, when we last looked.
@@ -581,9 +587,15 @@ fn marker() -> PathBuf {
 /// of this app's generation (`hc update --version`, terminals kept). If the
 /// release check fails or offers another generation, keep the minimum pin.
 /// Cores before 0.1.5 lack `--version`: they keep their same-generation update
-/// path. A core a package manager owns is left alone (hc says so).
+/// path. A core a package manager owns is left alone (hc says so). Only where
+/// `checks_core`: a source or fork build just removes the marker, so a copied
+/// one can never make it update a person's core on its own.
 pub fn after_update() {
     if std::fs::remove_file(marker()).is_err() {
+        return;
+    }
+    if !checks_core() {
+        tracing::info!("update: a source build leaves the core alone");
         return;
     }
     std::thread::spawn(|| {
@@ -799,6 +811,19 @@ mod tests {
         assert_eq!(after_update_target("0.1.4", Some(&latest), 1, "0.1.11"), None);
         assert_eq!(after_update_target("0.1.5", Some(&latest), 1, "0.1.11"), Some("0.1.13"));
         assert_eq!(after_update_target("0.1.5", None, 1, "0.1.11"), Some("0.1.11"));
+    }
+
+    #[test]
+    fn a_source_build_never_updates_the_core_after_an_app_update() {
+        // Test builds never set the compile-time release flag.
+        assert!(option_env!("HERDR_APP_RELEASE").is_none());
+        // With no flag and no release server, `after_update` removes the marker
+        // and stops: a fork's copied `.updated` must not update the person's core.
+        assert!(!checks_core_with(false, false));
+        // A release build, or any build pointed at a test server, still updates.
+        assert!(checks_core_with(true, false));
+        assert!(checks_core_with(false, true));
+        assert!(checks_core_with(true, true));
     }
 
     #[test]
