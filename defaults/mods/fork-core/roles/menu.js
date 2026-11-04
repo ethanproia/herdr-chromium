@@ -11,6 +11,8 @@ import { sectionLocked } from "../sections-pure.js";
 import { escapeLabel, tabLeaf } from "../labels.js";
 import { sideMenuItems, runSideAction } from "./side-strip.js";
 import { sections, toggleFromClick, toggleSidebar, isCollapsed } from "./sections.js";
+import { inboxSnapshot } from "../notes.js";
+import { bellMenuItems } from "../inbox-pure.js";
 
 // Where a space is now: its first terminal's live folder, else where it was made.
 function place(s) {
@@ -120,6 +122,9 @@ function items(p, git) {
         [folded ? "Expand" : "Collapse", "machine.fold", { key: tg.key }],
       ];
     }
+    case "inbox":
+      // Right-click on the notification bell: Mark All Read, Do Not Disturb (a check), Clear All.
+      return bellMenuItems(inboxSnapshot());
     case "side":
       // A side panel strip tab: Pin / Unpin, Open as tab, Close.
       return sideMenuItems(tg);
@@ -178,6 +183,9 @@ function menuIcon(command, args) {
   if (command === "worktree") return icon("worktree");
   if (command === "app.help") return icon("keyboard");
   if (command === "app.theme") return icon("theme");
+  if (command === "notifications.read_all") return icon("check-check");
+  if (command === "notifications.toggle_dnd") return icon("bell-off");
+  if (command === "notifications.clear_all") return icon("trash");
   return icon("plus");
 }
 
@@ -215,7 +223,7 @@ function shortcut(name, args) {
 // A hairline sits before some items, which groups them.
 // A side-panel tool is pinned when it's in shared panels.pins (pinned tools show at the top right of the tab bar).
 const pinned = (id) => { const p = shared("panels.pins"); return Array.isArray(p) && p.includes(id); };
-const breaksBefore = (list, i) => i > 0 && ((list[i][1] === "sidebar.toggle" && list[i - 1][1] === "sidebar.collapse") || (list[i][1] === "tool.open" && list[i - 1][1] !== "tool.open") || (list[i][1] === "panel.pin" && list[i - 1][1] !== "panel.pin") || (list[i][1] === "space.rename" && list[i - 1][1] === "panel.pin") || list[i][1] === "machine.add" || list[i][1].endsWith(".close") || list[i][1] === "app.help" || list[i][1] === "terminal.right_click" || list[i][1] === "copy-link" || (list[i][1] === "space.move" && list[i - 1][1] !== "space.move") || list[i][1] === "tab.rename" || (list[i][1] === "app.theme" && list[i - 1][1] !== "app.theme"));
+const breaksBefore = (list, i) => i > 0 && ((list[i][1] === "sidebar.toggle" && list[i - 1][1] === "sidebar.collapse") || (list[i][1] === "tool.open" && list[i - 1][1] !== "tool.open") || (list[i][1] === "panel.pin" && list[i - 1][1] !== "panel.pin") || (list[i][1] === "space.rename" && list[i - 1][1] === "panel.pin") || list[i][1] === "machine.add" || list[i][1].endsWith(".close") || list[i][1] === "app.help" || list[i][1] === "terminal.right_click" || list[i][1] === "copy-link" || (list[i][1] === "space.move" && list[i - 1][1] !== "space.move") || list[i][1] === "tab.rename" || (list[i][1] === "app.theme" && list[i - 1][1] !== "app.theme") || list[i][1] === "notifications.clear_all");
 
 export default class Menu {
   init(_props, cx) {
@@ -240,6 +248,7 @@ export default class Menu {
     if (it[1] === "sidebar.toggle") { toggleFromClick(it[2].key); return cx?.notify?.(); }
     if (it[1] === "sidebar.collapse") { closeOverlay(props()?.overlay); return toggleSidebar(); }
     if (it[1] === "machine.add") { closeOverlay(props()?.overlay); return run("mod.open", { name: "machine-add" }); }
+    if (it[1] === "notifications.toggle_dnd") { run(it[1], it[2]); return cx?.notify?.(); }   // a check flips in place
     if (it[1] === "panel.pin") { runSideAction(pinned(it[2].tool) ? "side.unpin" : "side.pin", { tool: it[2].tool }); return cx?.notify?.(); }   // a check flips in place
     if (it[1] === "tool.open") { closeOverlay(props()?.overlay); const tool = (shared("core.registry")?.tools ?? []).find((x) => x.id === it[2].id); return tool && openInTab(tool, spaces().find((x) => x.active)?.id); }
     closeOverlay(props()?.overlay);
@@ -302,7 +311,7 @@ export default class Menu {
               icon: it[1] === "space.color" ? div().size(12).rounded(6).bg(SPACE_COLORS[it[2].color][1]) : svg(menuIcon(it[1], it[2])).size(15).when((it[1] === "sidebar.toggle" && !sections()[it[2].key]) || (it[1] === "panel.pin" && !pinned(it[2].tool)) || !live(i), (el) => el.text_color(t.dim)),
               name: it[0], active: i === this.at && live(i), enabled: live(i),
               // A toggle shows its state as a check on the right, where other menus show a shortcut.
-              hint: it[1] === "panel.pin" ? (pinned(it[2].tool) ? svg(icon("check")).size(14).text_color(t.foreground) : "") : it[1] === "space.color" ? (((shared("space.colors") ?? {})[it[2].id] ?? "ansi6") === it[2].color ? svg(icon("check")).size(14).text_color(t.foreground) : "") : it[1] === "sidebar.collapse" ? shortcut(`${SELF}.toggle-sidebar`) : it[1] === "sidebar.toggle" ? (sections()[it[2].key] ? svg(icon("check")).size(14).text_color(t.foreground).when(sectionLocked(sections(), it[2].key), (el) => el.tooltip("At least one list stays on")) : "") : shortcut(it[1], it[2]),
+              hint: it[1] === "notifications.toggle_dnd" ? (inboxSnapshot()?.settings?.dnd ? svg(icon("check")).size(14).text_color(t.foreground) : "") : it[1] === "panel.pin" ? (pinned(it[2].tool) ? svg(icon("check")).size(14).text_color(t.foreground) : "") : it[1] === "space.color" ? (((shared("space.colors") ?? {})[it[2].id] ?? "ansi6") === it[2].color ? svg(icon("check")).size(14).text_color(t.foreground) : "") : it[1] === "sidebar.collapse" ? shortcut(`${SELF}.toggle-sidebar`) : it[1] === "sidebar.toggle" ? (sections()[it[2].key] ? svg(icon("check")).size(14).text_color(t.foreground).when(sectionLocked(sections(), it[2].key), (el) => el.tooltip("At least one list stays on")) : "") : shortcut(it[1], it[2]),
               onClick: (_e, cx) => this.choose(i, cx),
               onHover: (cx) => { if (this.at !== i) { this.at = i; cx.notify(); } },
             }))),
