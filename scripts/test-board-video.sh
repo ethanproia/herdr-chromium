@@ -52,7 +52,7 @@ for y in range(0,h,4):
 if len(xs)<=100:
     print(0,0,0,0,0,0); sys.exit()
 x0,y0,x1,y1=min(xs),min(ys),max(xs),max(ys); cx,cy=(x0+x1)//2,(y0+y1)//2
-# The board pane's focus border (blue) bounds its slot: walk out from the clip to find it.
+# The focus border (blue) of the board pane bounds its slot: walk out from the clip to find it.
 blue=lambda p: p[2]>170 and p[0]<130 and 60<p[1]<200
 sx=next((x+1 for x in range(x0-3,0,-1) if blue(rows[cy][x*4:x*4+3])),0)
 sy=next((y+1 for y in range(y0-3,0,-1) if blue(rows[y][cx*4:cx*4+3])),0)
