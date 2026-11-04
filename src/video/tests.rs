@@ -173,6 +173,21 @@ fn paths_follow_the_image_rule() {
     let _ = std::fs::remove_file(outside);
 }
 
+#[test]
+fn the_controls_bar_maps_time_and_clicks() {
+    assert_eq!((clock(0.0), clock(3.4), clock(75.0), clock(3725.0)), ("0:00".into(), "0:03".into(), "1:15".into(), "1:02:05".into()));
+    assert_eq!((fraction(2.5, 10.0), fraction(12.0, 10.0), fraction(1.0, 0.0)), (0.25, 1.0, 0.0));
+    assert_eq!((fraction_at(150.0, 100.0, 200.0), fraction_at(50.0, 100.0, 200.0), fraction_at(400.0, 100.0, 200.0)), (0.25, 0.0, 1.0));
+    let (_d, _fake, mut c) = setup();
+    let now = Instant::now();
+    assert_eq!(c.status("v"), None);
+    c.painted("v", &spec(0), true, now);
+    assert_eq!(c.status("v"), Some((false, 0.0, None)));
+    c.play("v", now).unwrap();
+    c.painted("v", &spec(0), true, now);
+    assert_eq!(c.status("v"), Some((true, 1.0, Some(10.0))), "what the bar shows while playing");
+}
+
 /// A throwaway directory, removed on drop.
 mod tempfile_dir {
     pub struct Dir(pub std::path::PathBuf);
