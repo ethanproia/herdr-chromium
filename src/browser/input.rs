@@ -274,6 +274,12 @@ impl BrowserInput {
         }
     }
 
+    /// HERDR: P2-18. The agent's pick timed out: pick mode ends if it is on top. A comment the person is
+    /// writing over it stays (they finish or Esc it themselves). Returns whether pick mode ended.
+    pub fn end_pick(&mut self) -> bool {
+        self.owner() == Owner::Pick && self.escape()
+    }
+
     /// An agent takes the page: the user's held keys, buttons and compositions are released first.
     pub fn grant_lease(&mut self, agent: &str) {
         if self.owner() != Owner::Agent {
@@ -1175,6 +1181,19 @@ mod tests {
         assert!(rec.inputs().is_empty(), "the page saw neither Esc");
         cx.simulate_keystrokes("escape");
         assert_eq!(rec.inputs(), vec![InputEvent::Key { kind: KeyKind::Down, key: "Escape".into(), code: "Escape".into(), native: 0x35, repeat: false, mods: mods() }]);
+    }
+
+    #[gpui::test]
+    fn a_timed_out_pick_ends_pick_mode_but_not_a_comment(cx: &mut TestAppContext) {
+        let (_rec, block, cx) = setup(cx);
+        with(cx, &block, |i| i.enter(Owner::Pick));
+        assert!(with(cx, &block, |i| i.end_pick()));
+        assert_eq!(with(cx, &block, |i| i.owner()), Owner::Browse);
+        assert!(!with(cx, &block, |i| i.end_pick()), "nothing to end in browse");
+        with(cx, &block, |i| i.enter(Owner::Pick));
+        with(cx, &block, |i| i.enter(Owner::Comment));
+        assert!(!with(cx, &block, |i| i.end_pick()), "the person's comment stays");
+        assert_eq!(with(cx, &block, |i| i.owner()), Owner::Comment);
     }
 
     #[gpui::test]
