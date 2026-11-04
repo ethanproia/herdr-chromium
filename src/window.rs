@@ -4218,6 +4218,16 @@ impl AppWindow {
                     input.update(cx, |i, _| i.enter(crate::browser::input::Owner::Pick));
                     cx.notify();
                 }
+                // HERDR: P2-18. Nobody picked in time: the agent is told so, and the block leaves pick mode.
+                self._tasks.push(cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(crate::browser::agent::PERSON_WAIT + Duration::from_millis(200)).await;
+                    let _ = this.update(cx, |this, cx| {
+                        for ended in this.browsers.expire_picks() {
+                            this.browsers.end_pick(&ended, cx);
+                        }
+                        cx.notify();
+                    });
+                }));
                 return;
             }
             // The person sees "<agent> is driving · Take Control" and their input is refused while the lease holds.
