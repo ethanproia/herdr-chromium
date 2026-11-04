@@ -25,7 +25,7 @@
 //! view's previous paint, frame arrival to paint latency, frames the host coalesced away before
 //! this one) and a `summary` line every 2 s (paints/s, p50/p95 interval, p95 latency, dropped).
 
-use gpui::{AnyElement, IntoElement, ObjectFit, Styled, surface};
+use gpui::{AnyElement, IntoElement, ObjectFit, ParentElement, Styled, surface};
 use herdr_browser_protocol::{PixelSize, Size, SurfaceRef};
 use herdr_browser_surface::{Surface, import};
 
