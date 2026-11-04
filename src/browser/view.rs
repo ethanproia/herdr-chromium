@@ -1012,6 +1012,7 @@ impl BrowserView {
                 // The host denied what the old page asked for; the bar goes with it.
                 if url != self.state.url {
                     self.prompts.clear();
+                    self.prompt_remember = false;
                 }
                 self.annotations.set_page(&url);
                 if url != self.state.url {
@@ -1160,6 +1161,10 @@ impl BrowserView {
                 cx.spawn(async move |this, cx| {
                     cx.background_executor().timer(Duration::from_secs(60)).await;
                     let _ = this.update(cx, |v, cx| {
+                        // "Remember" belonged to the prompt that ran out, not to the next one.
+                        if v.prompts.front().is_some_and(|(r, _, _)| *r == req) {
+                            v.prompt_remember = false;
+                        }
                         v.prompts.retain(|(r, _, _)| *r != req);
                         cx.notify();
                     });
