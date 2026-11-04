@@ -197,9 +197,20 @@ pub fn text_edit_message(id: &str, req: u64, selector: &str, op: herdr_browser_p
         T::Begin => "if(self.__herdrEdit)return{ok:false};            if(![...el.childNodes].every(c=>c.nodeType===3))return{ok:false};            const before=el.textContent,attr=el.getAttribute('contenteditable');            self.__herdrEdit={el,before,attr};el.setAttribute('contenteditable','plaintext-only');el.focus();            const r=document.createRange();r.selectNodeContents(el);const s=getSelection();s.removeAllRanges();s.addRange(r);            return{ok:true,before,after:before}",
         T::Commit | T::Cancel => {
             if op == T::Cancel {
-                "const e=self.__herdrEdit;if(!e||e.el!==el)return{ok:false};if(el.textContent!==e.before)el.textContent=e.before;                 if(e.attr===null)el.removeAttribute('contenteditable');else el.setAttribute('contenteditable',e.attr);                 self.__herdrEdit=null;el.blur();return{ok:true,before:e.before,after:el.textContent}"
+                // Late keys must not land after the text is put back: the same wait as Commit.
+                "const e=self.__herdrEdit;if(!e||e.el!==el)return{ok:false};\
+                 return new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(()=>setTimeout(()=>{\
+                 if(el.textContent!==e.before)el.textContent=e.before;\
+                 if(e.attr===null)el.removeAttribute('contenteditable');else el.setAttribute('contenteditable',e.attr);\
+                 self.__herdrEdit=null;el.blur();r({ok:true,before:e.before,after:el.textContent})},100))))"
             } else {
-                "const e=self.__herdrEdit;if(!e||e.el!==el)return{ok:false};                 if(e.attr===null)el.removeAttribute('contenteditable');else el.setAttribute('contenteditable',e.attr);                 self.__herdrEdit=null;el.blur();return{ok:true,before:e.before,after:el.textContent}"
+                // Typing reaches the page as input events, this script over DevTools: the two are not ordered, so a
+                // fast Return could read the text before the last keys land (measured: Text then Commit at once lost
+                // it). Wait two frames and a moment for them first.
+                "const e=self.__herdrEdit;if(!e||e.el!==el)return{ok:false};\
+                 return new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(()=>setTimeout(()=>{\
+                 if(e.attr===null)el.removeAttribute('contenteditable');else el.setAttribute('contenteditable',e.attr);\
+                 self.__herdrEdit=null;el.blur();r({ok:true,before:e.before,after:el.textContent})},100))))"
             }
         }
     };
