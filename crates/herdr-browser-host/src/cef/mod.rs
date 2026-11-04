@@ -5,6 +5,7 @@
 //! CEF callback therefore runs on the main thread too, so host state lives in a thread-local.
 //! Rule for that state: never call into CEF while it is borrowed (CEF may call back synchronously).
 
+mod begin_frame;
 mod blit;
 mod handlers;
 mod keys;
@@ -64,11 +65,17 @@ pub(crate) struct Entry {
     /// The newest scroll offset (CSS px) and the last `Viewport` sent (scroll x, y, zoom level).
     scroll: Option<(f32, f32)>,
     viewport: Option<(f32, f32, f64)>,
+    /// External BeginFrame pacing (`HERDR_BROWSER_BEGIN_FRAME`): when the last paint arrived,
+    /// until when one is expected, and the 250 ms watchdog.
+    pace: begin_frame::Pacing,
+    /// Created with `external_begin_frame_enabled`: only then may `send_external_begin_frame`
+    /// be called on it (CEF DCHECKs the flag).
+    external: bool,
 }
 
 impl Entry {
     fn new(size: Size, scale: f32) -> Entry {
-        Entry { browser: None, size, scale, pool: FramePool::new(), last: None, hidden: false, shots: Vec::new(), resized: None, _devtools: None, queued: Vec::new(), loaded: false, input_ready: false, person_input: None, load_gen: 0, nudged: None, pointer: (0.0, 0.0), view: None, popup: None, popup_shown: false, popup_rect: None, starting: Vec::new(), scroll: None, viewport: None }
+        Entry { browser: None, size, scale, pool: FramePool::new(), last: None, hidden: false, shots: Vec::new(), resized: None, _devtools: None, queued: Vec::new(), loaded: false, input_ready: false, person_input: None, load_gen: 0, nudged: None, pointer: (0.0, 0.0), view: None, popup: None, popup_shown: false, popup_rect: None, starting: Vec::new(), scroll: None, viewport: None, pace: begin_frame::Pacing::new(), external: false }
     }
 }
 
@@ -83,7 +90,9 @@ pub(crate) fn adopt_popup(opener: &str, w: Option<f32>, h: Option<f32>) -> Optio
         // A reserved namespace, and only a vacant entry: a live block is never replaced.
         let id = mint_popup_id(opener, &mut h_.next_popup, |id| h_.browsers.contains_key(id));
         let size = Size { w: w.unwrap_or(POPUP_DEFAULT.0).clamp(200.0, 1600.0), h: h.unwrap_or(POPUP_DEFAULT.1).clamp(200.0, 1200.0) };
-        h_.browsers.insert(id.clone(), Entry::new(size, scale));
+        let mut entry = Entry::new(size, scale);
+        entry.external = begin_frame::on();
+        h_.browsers.insert(id.clone(), entry);
         h_.popups.insert(id.clone(), opener.to_string());
         Some(id)
     })
@@ -190,6 +199,8 @@ pub(crate) struct Host {
     dark: Option<bool>,
     /// `HERDR_BROWSER_STATS=1`: blit cost, appended to `<browser dir>/host-stats.log`.
     stats: Option<BlitStats>,
+    /// Vsyncs seen, for the idle trickle (`HERDR_BROWSER_BEGIN_FRAME`).
+    tick: u64,
 }
 
 /// Per-frame copy cost (review A4: `waitUntilCompleted` runs on CEF's UI thread).
@@ -416,6 +427,9 @@ fn paint(id: &str, layer: Option<(bool, *mut std::ffi::c_void, u32, u32)>) {
         let entry = host.browsers.get_mut(id)?;
         let blitter = host.blitter.as_ref()?;
         let t = std::time::Instant::now();
+        if layer.is_some() {
+            entry.pace.painted();
+        }
         let res = (|| -> Result<Painted, String> {
             // Hidden and no screenshot waiting: CEF should not paint, and if it does, skip the copies.
             if entry.hidden && entry.shots.is_empty() {
@@ -592,6 +606,49 @@ fn input_kind(event: &InputEvent) -> &'static str {
         InputEvent::Key { .. } => "key",
         InputEvent::Text { .. } => "text",
         InputEvent::Ime(_) => "ime",
+    }
+}
+
+/// A vsync passed (`HERDR_BROWSER_BEGIN_FRAME`): one external BeginFrame to each browser that
+/// wants a frame this tick. CEF drops a BeginFrame it cannot use yet (`begin_frame_pending`), so
+/// a browser whose compositor lags a vsync is simply skipped. The watchdog nudge is for a
+/// browser paced 250 ms without a paint: `set_windowless_frame_rate` re-arms CEF's own pacing if
+/// external BeginFrames never engaged (a no-op params update when they did), and `invalidate`
+/// forces damage in case the page was waiting on a frame it was never given.
+fn pace_browsers() {
+    let now = std::time::Instant::now();
+    let (send, nudge): (Vec<String>, Vec<String>) = with_host(|h| {
+        h.tick += 1;
+        let tick = h.tick;
+        let mut send = Vec::new();
+        let mut nudge = Vec::new();
+        for (id, e) in &mut h.browsers {
+            if !e.external {
+                continue;
+            }
+            match e.pace.decide(now, e.hidden, !e.shots.is_empty(), e.pool.in_flight_len() >= FramePool::MAX_IN_FLIGHT, tick) {
+                begin_frame::Pace::Skip => {}
+                begin_frame::Pace::Frame => send.push(id.clone()),
+                begin_frame::Pace::Watchdog => {
+                    nudge.push(id.clone());
+                    send.push(id.clone());
+                }
+            }
+        }
+        (send, nudge)
+    })
+    .unwrap_or_default();
+    for id in &nudge {
+        debug(format_args!("{id}: begin-frame watchdog: paced 250 ms with no paint, nudging"));
+        with_host(|h| h.stats.as_mut().map(|s| { let _ = writeln!(s.out, "begin_frame watchdog id={id}"); }));
+    }
+    for id in send {
+        let Some(host) = browser(&id).and_then(|b| b.host()) else { continue };
+        host.send_external_begin_frame();
+        if nudge.contains(&id) {
+            host.set_windowless_frame_rate(60);
+            host.invalidate(PaintElementType::default());
+        }
     }
 }
 
@@ -796,6 +853,7 @@ fn serve(socket: &Path, listener: UnixListener, args: &Args) -> io::Result<()> {
             perms: HashMap::new(),
             quit: false,
             stats: BlitStats::open(profile_dir.parent().unwrap_or(&profile_dir)),
+            tick: 0,
         })
     });
     if with_host(|h| h.blitter.is_none()).unwrap_or(true) {
@@ -837,7 +895,15 @@ fn serve(socket: &Path, listener: UnixListener, args: &Args) -> io::Result<()> {
         }
         nudge_waiting();
         deny_permissions(None, true);
-        std::thread::sleep(Duration::from_millis(4));
+        if begin_frame::on() {
+            if begin_frame::take_ticks() > 0 {
+                pace_browsers();
+            }
+            // A BeginFrame is due within a vsync: poll finer than 4 ms so it lands on its tick.
+            std::thread::sleep(Duration::from_millis(1));
+        } else {
+            std::thread::sleep(Duration::from_millis(4));
+        }
     }
 
     // Close every browser, let CEF finish closing, then shut down.
@@ -987,8 +1053,15 @@ fn handle(m: AppToHost) {
                     return;
                 }
             };
-            with_host(|h| h.browsers.insert(id.clone(), Entry::new(size, scale)));
-            let window_info = WindowInfo { windowless_rendering_enabled: 1, shared_texture_enabled: 1, ..Default::default() };
+            // External BeginFrames only when the display link runs (else CEF's own timer paces).
+            let external = begin_frame::on();
+            with_host(|h| {
+                h.browsers.insert(id.clone(), Entry::new(size, scale));
+                if let Some(e) = h.browsers.get_mut(&id) {
+                    e.external = external;
+                }
+            });
+            let window_info = WindowInfo { windowless_rendering_enabled: 1, shared_texture_enabled: 1, external_begin_frame_enabled: external as i32, ..Default::default() };
             let settings = BrowserSettings { windowless_frame_rate: 60, ..Default::default() };
             let mut client = handlers::client(&id);
             let url = CefString::from(url.as_deref().unwrap_or("about:blank"));
@@ -1058,7 +1131,10 @@ fn handle(m: AppToHost) {
         M::Screenshot { id, req, path } => {
             // Hidden: CEF is not painting, so the last pixels may be stale. Show the page to CEF
             // until its next paint, which answers (see `on_frame`).
-            let hidden = with_host(|h| h.browsers.get_mut(&id).filter(|e| e.hidden).map(|e| e.shots.push((req, path.clone())))).flatten();
+            let hidden = with_host(|h| h.browsers.get_mut(&id).filter(|e| e.hidden).map(|e| {
+                e.shots.push((req, path.clone()));
+                e.pace.want();
+            })).flatten();
             if hidden.is_some() {
                 if let Some(b) = browser(&id).and_then(|b| b.host()) {
                     b.was_hidden(0);
@@ -1117,6 +1193,9 @@ pub(crate) fn on_created(id: &str, b: Browser) {
         h.browsers.get_mut(id).map(|e| {
             e.browser = Some(b.clone());
             e._devtools = reg;
+            // Its first paint is still owed (the create-time wake may have expired while CEF
+            // made the browser).
+            e.pace.want();
             std::mem::take(&mut e.starting)
         })
     })
@@ -1152,6 +1231,11 @@ fn browser_msg(m: AppToHost) {
         return;
     };
     let Some(host) = b.host() else { return unknown(&id) };
+    // A paint is likely after these: the browser earns pacing for a while even if none arrives
+    // (external BeginFrames; evals and probes deliberately don't — a polled page may stay idle).
+    if matches!(m, M::Navigate { .. } | M::Back { .. } | M::Forward { .. } | M::Reload { .. } | M::Stop { .. } | M::Resize { .. } | M::Focus { .. } | M::SetZoom { .. } | M::SetDevice { .. } | M::Input { .. } | M::Edit { .. } | M::SetVisible { visible: true, .. } | M::TextEdit { .. } | M::SetStyle { .. } | M::RevertStyle { .. }) {
+        with_host(|h| h.browsers.get_mut(&id).map(|e| e.pace.want()));
+    }
     match m {
         M::Navigate { url, .. } => {
             if let Some(f) = b.main_frame() {

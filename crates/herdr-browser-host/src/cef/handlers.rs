@@ -743,7 +743,7 @@ wrap_life_span_handler! {
                 if let (Some(info), Some(client), Some(settings)) = (window_info, client, settings)
                     && let Some(id) = super::adopt_popup(&self.id, w, h)
                 {
-                    *info = WindowInfo { windowless_rendering_enabled: 1, shared_texture_enabled: 1, ..Default::default() };
+                    *info = WindowInfo { windowless_rendering_enabled: 1, shared_texture_enabled: 1, external_begin_frame_enabled: super::begin_frame::on() as i32, ..Default::default() };
                     *client = Some(client_for(&id));
                     settings.windowless_frame_rate = 60;
                     send(HostToApp::PopupOpened { opener: self.id.clone(), id, url: s(target_url), w, h });
