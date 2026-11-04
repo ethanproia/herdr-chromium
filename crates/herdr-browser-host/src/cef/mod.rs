@@ -855,12 +855,19 @@ fn serve(socket: &Path, listener: UnixListener, args: &Args) -> io::Result<()> {
         let _ = tx.send(Incoming::Gone);
     });
 
+    // CEF's external pump (SEC: frames, acks and input all wait on it): run `do_message_loop_work`,
+    // handle a bounded batch of messages, then wait until CEF's own deadline
+    // (`on_schedule_message_pump_work`) or the next message, whichever is first, never longer than
+    // PUMP_FALLBACK. A fixed sleep here made every frame and ack wait for the next pass.
+    let mut woke: Option<Incoming> = None;
     loop {
+        *PUMP_DUE.lock().unwrap() = None;
         let pump = trace::on().then(trace::now);
         do_message_loop_work();
         let drain = trace::on().then(trace::now);
         let mut drained = 0;
-        while let Ok(m) = rx.try_recv() {
+        while drained < DRAIN_MAX {
+            let Some(m) = woke.take().or_else(|| rx.try_recv().ok()) else { break };
             drained += 1;
             match m {
                 Incoming::Wake => {}
@@ -883,7 +890,19 @@ fn serve(socket: &Path, listener: UnixListener, args: &Args) -> io::Result<()> {
                 trace::line("pump", format_args!("work_us={} drain_us={} msgs={drained}", (d - p) / 1000, (end - d) / 1000));
             }
         }
-        std::thread::sleep(Duration::from_millis(4));
+        if drained == DRAIN_MAX {
+            continue;
+        }
+        let now = std::time::Instant::now();
+        let due = PUMP_DUE.lock().unwrap().map_or(now + PUMP_FALLBACK, |d| d.min(now + PUMP_FALLBACK));
+        let wait = due.saturating_duration_since(now);
+        if !wait.is_zero() {
+            match rx.recv_timeout(wait) {
+                Ok(m) => woke = Some(m),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => woke = Some(Incoming::Gone),
+            }
+        }
     }
 
     // Close every browser, let CEF finish closing, then shut down.
