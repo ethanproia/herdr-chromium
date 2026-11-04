@@ -414,6 +414,24 @@ pub struct Person {
     /// backgrounds (sidebar, canvas); panes stay opaque. Off unless set to true.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub glass: bool,
+    /// HERDR: where toasts stack: top right under the top bar (default), or bottom right.
+    #[serde(skip_serializing_if = "ToastCorner::is_top_right")]
+    pub toast_corner: ToastCorner,
+}
+
+/// HERDR: the toast deck's corner (`toast_corner`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ToastCorner {
+    #[default]
+    TopRight,
+    BottomRight,
+}
+
+impl ToastCorner {
+    fn is_top_right(&self) -> bool {
+        *self == Self::TopRight
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -503,6 +521,7 @@ impl Default for Person {
             labs_checkout: None,
             mods_disabled: Vec::new(),
             glass: false,
+            toast_corner: ToastCorner::TopRight,
         }
     }
 }
@@ -538,6 +557,8 @@ pub struct Settings {
     pub sounds: Sounds,
     /// HERDR: see `Person::glass`.
     pub glass: bool,
+    /// HERDR: see `Person::toast_corner`.
+    pub toast_corner: ToastCorner,
 }
 
 /// Attention sounds: when an agent needs you, and when one finished while you
@@ -580,6 +601,7 @@ impl Default for Settings {
             search_engine: SearchEngine::Google,
             sounds: Sounds::default(),
             glass: false,
+            toast_corner: ToastCorner::TopRight,
         }
     }
 }
@@ -618,6 +640,7 @@ impl Settings {
             option_as_alt: person.option_as_alt,
             search_engine: person.search_engine,
             glass: person.glass,
+            toast_corner: person.toast_corner,
         }
     }
 }
@@ -886,6 +909,15 @@ pub const DEFAULT_FONT: &str = "JetBrains Mono";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn toast_corner_is_top_right_unless_set_and_not_written_by_default() {
+        let d = Person::default();
+        assert_eq!(Settings::compose(&d, &crate::layout::Look::default(), true).toast_corner, ToastCorner::TopRight);
+        assert!(!serde_json::to_string(&d).unwrap().contains("toast_corner"));
+        let b: Person = serde_json::from_str(r#"{"toast_corner": "bottom-right"}"#).unwrap();
+        assert_eq!(Settings::compose(&b, &crate::layout::Look::default(), true).toast_corner, ToastCorner::BottomRight);
+    }
 
     #[test]
     fn glass_is_off_unless_set_and_not_written_when_off() {
