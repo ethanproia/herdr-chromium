@@ -63,6 +63,9 @@ pub enum Owner {
     Markup,
     /// An agent drives the page; the user's input is refused (with a cue) until Take Control.
     Agent,
+    // HERDR: S13. An inline text edit of the picked element: keys, text, IME, paste and the pointer
+    // go to the page (the element is editable there); Return saves, Esc cancels.
+    TextEdit,
 }
 
 /// What the overlay owners receive; their slices (pick, markup, comment UI) draw from it.
@@ -77,6 +80,8 @@ pub enum OverlayEvent {
     Owner(Owner),
     // HERDR: arrow keys while picking (A3): Up the parent, Down the first child, Left/Right siblings.
     PickStep(PickStep),
+    // HERDR: S13. The text edit ended: save it (Return) or put the text back (Esc, an agent lease).
+    TextEditDone { commit: bool },
 }
 
 /// The comment field's text: committed text, an open IME composition and undo history.
@@ -223,7 +228,7 @@ impl BrowserInput {
                 self.overlay.push(OverlayEvent::Refused);
                 return false;
             }
-            (Owner::Browse, Owner::Pick | Owner::Markup) | (Owner::Pick | Owner::Markup, Owner::Comment) => true,
+            (Owner::Browse, Owner::Pick | Owner::Markup) | (Owner::Pick | Owner::Markup, Owner::Comment) | (Owner::Pick, Owner::TextEdit) => true,
             (Owner::Pick, Owner::Markup) | (Owner::Markup, Owner::Pick) => {
                 self.owners.pop();
                 true
@@ -251,7 +256,7 @@ impl BrowserInput {
                 self.overlay.push(OverlayEvent::Refused);
                 false
             }
-            (Owner::Comment, _) => false,
+            (Owner::Comment | Owner::TextEdit, _) => false,
             _ => self.enter(mode),
         }
     }
@@ -266,12 +271,27 @@ impl BrowserInput {
                 true
             }
             top => {
+                if top == Owner::TextEdit {
+                    self.overlay.push(OverlayEvent::TextEditDone { commit: false });
+                }
                 self.leave(top);
                 self.owners.pop();
                 self.overlay.push(OverlayEvent::Owner(self.owner()));
                 true
             }
         }
+    }
+
+    /// HERDR: S13. Return: the edit is saved and the pick layer underneath owns input again.
+    pub fn commit_text_edit(&mut self) -> bool {
+        if self.owner() != Owner::TextEdit {
+            return false;
+        }
+        self.leave(Owner::TextEdit);
+        self.owners.pop();
+        self.overlay.push(OverlayEvent::TextEditDone { commit: true });
+        self.overlay.push(OverlayEvent::Owner(self.owner()));
+        true
     }
 
     /// HERDR: P2-18. The agent's pick timed out: pick mode ends if it is on top. A comment the person is
@@ -282,6 +302,10 @@ impl BrowserInput {
 
     /// An agent takes the page: the user's held keys, buttons and compositions are released first.
     pub fn grant_lease(&mut self, agent: &str) {
+        // HERDR: S13. An edit in progress is put back: an agent never inherits the person's edit.
+        if self.owner() == Owner::TextEdit {
+            self.escape();
+        }
         if self.owner() != Owner::Agent {
             let from = self.owner();
             self.leave(from);
@@ -302,7 +326,7 @@ impl BrowserInput {
     /// Leaving an owner drops what it was holding, so nothing it started reaches the next one.
     fn leave(&mut self, from: Owner) {
         match from {
-            Owner::Browse => self.release_all(),
+            Owner::Browse | Owner::TextEdit => self.release_all(),
             Owner::Comment => self.comment.marked = None,
             _ => {}
         }
@@ -314,7 +338,7 @@ impl BrowserInput {
 
     fn pointer_route(&self) -> Route {
         match self.owner() {
-            Owner::Browse => Route::Page,
+            Owner::Browse | Owner::TextEdit => Route::Page,
             Owner::Agent => Route::Refused,
             Owner::Pick | Owner::Markup if self.space_held => Route::Page,
             o => Route::Overlay(o),
@@ -438,7 +462,7 @@ impl BrowserInput {
         }
         // The wheel scrolls the page while picking too; markup draws on a still picture.
         match self.owner() {
-            Owner::Browse | Owner::Pick => {}
+            Owner::Browse | Owner::Pick | Owner::TextEdit => {}
             Owner::Markup if self.space_held => {}
             Owner::Agent => return self.overlay.push(OverlayEvent::Refused),
             _ => return,
@@ -456,6 +480,16 @@ impl BrowserInput {
         let k = &ev.keystroke;
         match self.owner() {
             Owner::Browse => {}
+            // HERDR: S13. Return saves and Esc cancels (outside a composition); the rest is the page's.
+            Owner::TextEdit if self.marked.is_none() && !k.modifiers.platform && !k.modifiers.control && !k.modifiers.alt && k.key == "enter" => {
+                self.commit_text_edit();
+                return true;
+            }
+            Owner::TextEdit if self.marked.is_none() && k.key == "escape" && !k.modifiers.modified() => {
+                self.escape();
+                return true;
+            }
+            Owner::TextEdit => {}
             Owner::Agent => {
                 self.overlay.push(OverlayEvent::Refused);
                 return true;
@@ -784,7 +818,7 @@ impl EntityInputHandler for BrowserInput {
 
     fn replace_text_in_range(&mut self, _range: Option<Range<usize>>, text: &str, _w: &mut Window, _cx: &mut Context<Self>) {
         match self.owner() {
-            Owner::Browse => {}
+            Owner::Browse | Owner::TextEdit => {}
             Owner::Comment => return self.comment.commit(text),
             Owner::Agent => return self.overlay.push(OverlayEvent::Refused),
             _ => return,
@@ -798,7 +832,7 @@ impl EntityInputHandler for BrowserInput {
 
     fn replace_and_mark_text_in_range(&mut self, range: Option<Range<usize>>, text: &str, selected: Option<Range<usize>>, _w: &mut Window, _cx: &mut Context<Self>) {
         match self.owner() {
-            Owner::Browse => {}
+            Owner::Browse | Owner::TextEdit => {}
             Owner::Comment => {
                 self.comment.marked = (!text.is_empty()).then(|| text.to_owned());
                 return;
@@ -1122,6 +1156,35 @@ mod tests {
         assert_eq!(rec.inputs().len(), 1, "in Browse the page gets its arrow");
     }
 
+    // HERDR: S13. Typing reaches the page (the element is editable there); Return saves, Esc puts
+    // the text back, and an agent lease cancels the edit first.
+    #[gpui::test]
+    fn a_text_edit_types_into_the_page_and_return_saves_esc_cancels(cx: &mut TestAppContext) {
+        let (rec, block, cx) = setup(cx);
+        with(cx, &block, |i| {
+            assert!(i.enter(Owner::Pick) && i.enter(Owner::TextEdit));
+            i.take_overlay();
+        });
+        cx.simulate_keystrokes("left shift-enter");
+        assert!(!rec.inputs().is_empty(), "keys go to the page while editing");
+        let done = |cx: &mut gpui::VisualTestContext| with(cx, &block, |i| i.take_overlay()).into_iter().filter_map(|e| match e { OverlayEvent::TextEditDone { commit } => Some(commit), _ => None }).collect::<Vec<_>>();
+        assert_eq!(done(cx), [true], "Shift+Return saves too (plain text has no line breaks)");
+        assert_eq!(with(cx, &block, |i| i.owner()), Owner::Pick, "back to picking");
+        with(cx, &block, |i| assert!(i.enter(Owner::TextEdit)));
+        cx.simulate_keystrokes("escape");
+        assert_eq!(done(cx), [false]);
+        assert_eq!(with(cx, &block, |i| i.owner()), Owner::Pick, "one Esc ends the edit, not design mode");
+        with(cx, &block, |i| {
+            assert!(i.enter(Owner::TextEdit));
+            assert!(!i.toggle(Owner::Markup), "no mode switch mid-edit");
+            i.take_overlay();
+            i.grant_lease("claude");
+        });
+        assert_eq!(done(cx), [false], "a lease puts the text back");
+        assert_eq!(with(cx, &block, |i| i.owner()), Owner::Agent);
+        with(cx, &block, |i| assert!(!i.enter(Owner::TextEdit), "never under a lease"));
+    }
+
     #[test]
     fn set_comment_opens_the_field_with_a_pins_text() {
         let mut i = BrowserInput::new("b1".into(), Arc::new(Recording::default()));
@@ -1143,6 +1206,7 @@ mod tests {
             (Pick, Comment, true, Comment), (Pick, Markup, true, Markup), (Pick, Pick, false, Pick), (Pick, Browse, false, Pick),
             (Markup, Comment, true, Comment), (Markup, Pick, true, Pick),
             (Comment, Pick, false, Comment), (Comment, Markup, false, Comment), (Comment, Comment, false, Comment),
+            (Pick, TextEdit, true, TextEdit), (Browse, TextEdit, false, Browse), (Markup, TextEdit, false, Markup), (Comment, TextEdit, false, Comment),
         ];
         for (from, to, allowed, after) in table {
             let mut i = BrowserInput::new("b1".into(), Arc::new(Recording::default()));
