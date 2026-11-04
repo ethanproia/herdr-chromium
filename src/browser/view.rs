@@ -689,6 +689,11 @@ pub struct BrowserView {
     load_error: Option<(String, i32, String)>,
     /// Size and scale the host was last told; None: no page made yet.
     sized: Option<(Dips, f32)>,
+    /// HERDR: one resize in flight at a time. When the last one went out, and the newest size laid
+    /// out since (sent when a frame answers, or after RESIZE_WAIT): a drag sends a few sizes, not
+    /// one per layout, so Chromium doesn't relayout for every width on the way.
+    resize_sent: Option<std::time::Instant>,
+    resize_wanted: Option<(Dips, f32)>,
     /// The newest frame from the host, painted into the page area (part 3).
     frames: FrameView,
     /// The last frame acked (each frame is acked once, however often it's painted).
@@ -963,6 +968,8 @@ impl BrowserView {
             prompt_remember: false,
             load_error: None,
             sized: None,
+            resize_sent: None,
+            resize_wanted: None,
             frames: FrameView::new(),
             acked: None,
             focus,
@@ -1171,7 +1178,9 @@ impl BrowserView {
                     p(&FrameEvent::Arrived { seq, surface: surface.clone(), size });
                 }
                 // Acked once painted (`send_ack` after the draw), so the host sends at most one ahead.
-                if let Err(e) = self.frames.on_frame(seq, surface, size, scale) {
+                let result = self.frames.on_frame(seq, surface, size, scale);
+                self.flush_resize(true);
+                if let Err(e) = result {
                     tracing::warn!("browser {}: frame {seq}: {e:#}", self.id);
                     // Unpaintable: ack anyway, or the host waits on it forever.
                     self.link.send(AppToHost::FrameAck { id: self.id.clone(), seq });
@@ -1295,6 +1304,7 @@ impl BrowserView {
         self.measured = Some((size, scale));
         // Responsive mode: the page gets the device's real viewport, whatever the block's size.
         let (size, scale) = self.device.as_ref().map_or((size, scale), |d| (Dips { w: d.w, h: d.h }, d.scale));
+        self.flush_resize(false);
         match self.sized {
             None if self.adopted => {
                 self.link.send(AppToHost::Resize { id: self.id.clone(), size, scale });
@@ -1310,10 +1320,27 @@ impl BrowserView {
             Some(_) => {
                 self.frames.on_resize_pending(size);
                 self.overlay.changed(Change::Resize);
-                self.link.send(AppToHost::Resize { id: self.id.clone(), size, scale });
+                self.resize_wanted = Some((size, scale));
+                self.flush_resize(false);
             }
         }
         self.sized = Some((size, scale));
+    }
+
+    /// Sends the newest laid-out size if no resize is in flight (or the last one is RESIZE_WAIT
+    /// old); `answered`: a frame just came, so the host is ready for the next.
+    fn flush_resize(&mut self, answered: bool) {
+        const RESIZE_WAIT: std::time::Duration = std::time::Duration::from_millis(150);
+        if answered {
+            self.resize_sent = None;
+        }
+        if self.resize_sent.is_some_and(|t| t.elapsed() < RESIZE_WAIT) {
+            return;
+        }
+        if let Some((size, scale)) = self.resize_wanted.take() {
+            self.resize_sent = Some(std::time::Instant::now());
+            self.link.send(AppToHost::Resize { id: self.id.clone(), size, scale });
+        }
     }
 
     /// An agent drives this page before it was ever shown (a background tab, a headless

@@ -69,10 +69,20 @@ struct Frame {
     _surface: Surface,
 }
 
+/// HERDR: how long a resize may hold the last accepted frame before a frame at another size is
+/// shown anyway (a long drag still moves; a size CEF never paints exactly can't freeze the page).
+const HOLD_MAX: std::time::Duration = std::time::Duration::from_millis(500);
+/// A frame within this many pixels of the asked size counts as that size (CEF rounds DIPs).
+const SIZE_SLACK: u32 = 2;
+
 #[derive(Default)]
 pub struct FrameView {
     frame: Option<Frame>,
     pending_resize: Option<Size>,
+    /// When the pending resize began holding the shown frame.
+    held_since: Option<std::time::Instant>,
+    /// The newest frame passed over while holding: acked (the ack is cumulative) but never drawn.
+    skipped: Option<u64>,
     /// Went into the latest scene; becomes `presented` once that scene is shown visibly.
     drawn: Option<u64>,
     presented: Option<u64>,
@@ -92,6 +102,18 @@ impl FrameView {
         {
             let frame = self.frame.as_ref()?;
             self.drawn = Some(frame.seq);
+            if self.stretching() {
+                // HERDR: held during a resize: drawn at its own size from the top left (clipped),
+                // never stretched, so the page doesn't swim before the new layout arrives.
+                let (w, h) = (frame.size.w as f32 / frame.scale, frame.size.h as f32 / frame.scale);
+                return Some(
+                    gpui::div()
+                        .size_full()
+                        .overflow_hidden()
+                        .child(surface(frame.buffer.clone()).w(gpui::px(w)).h(gpui::px(h)).object_fit(ObjectFit::Fill))
+                        .into_any_element(),
+                );
+            }
             Some(surface(frame.buffer.clone()).size_full().object_fit(ObjectFit::Fill).into_any_element())
         }
         #[cfg(not(target_os = "macos"))]
@@ -101,11 +123,7 @@ impl FrameView {
     /// True while the shown frame does not match the size the block asked for.
     pub fn stretching(&self) -> bool {
         match (&self.frame, self.pending_resize) {
-            (Some(f), Some(want)) => {
-                let w = (want.w * f.scale).ceil() as u32;
-                let h = (want.h * f.scale).ceil() as u32;
-                (w, h) != (f.size.w, f.size.h)
-            }
+            (Some(f), Some(want)) => !fits(want, f.scale, f.size),
             _ => false,
         }
     }
@@ -150,12 +168,24 @@ impl FrameView {
         self.frame = None;
         self.drawn = None;
         self.presented = None;
+        self.skipped = None;
+        self.held_since = None;
     }
 }
 
 impl FrameSink for FrameView {
     fn on_frame(&mut self, seq: u64, surface: SurfaceRef, size: PixelSize, scale: f32) -> anyhow::Result<()> {
         if self.frame.as_ref().is_some_and(|f| f.seq >= seq) {
+            return Ok(());
+        }
+        // HERDR: resizing. A frame painted for an older size would show the page laid out for a
+        // width it no longer has (the jump): keep the last accepted frame until one at the size
+        // asked for arrives, or HOLD_MAX passes. The skipped frame is still acked.
+        if let (Some(want), Some(_)) = (self.pending_resize, &self.frame)
+            && !fits(want, scale, size)
+            && self.held_since.is_none_or(|t| t.elapsed() < HOLD_MAX)
+        {
+            self.skipped = Some(self.skipped.map_or(seq, |s| s.max(seq)));
             return Ok(());
         }
         let imported = import(&surface)?;
@@ -172,17 +202,29 @@ impl FrameSink for FrameView {
         });
         if !self.stretching() {
             self.pending_resize = None;
+            self.held_since = None;
         }
         Ok(())
     }
 
     fn on_resize_pending(&mut self, dips: Size) {
         self.pending_resize = Some(dips);
+        self.held_since.get_or_insert_with(std::time::Instant::now);
     }
 
     fn ack(&mut self) -> Option<u64> {
-        self.presented.take()
+        // Cumulative on the host: the newest of the presented and the skipped frames.
+        match (self.presented.take(), self.skipped.take()) {
+            (Some(p), Some(s)) => Some(p.max(s)),
+            (p, s) => p.or(s),
+        }
     }
+}
+
+/// Whether a frame of `size` pixels at `scale` is the `want` DIPs asked for (CEF rounds DIPs).
+fn fits(want: Size, scale: f32, size: PixelSize) -> bool {
+    let (w, h) = ((want.w * scale).round() as i64, (want.h * scale).round() as i64);
+    (w - size.w as i64).unsigned_abs() <= SIZE_SLACK as u64 && (h - size.h as i64).unsigned_abs() <= SIZE_SLACK as u64
 }
 
 /// Per-view paint statistics for `HERDR_BROWSER_STATS=1` (see the module docs).
@@ -253,5 +295,46 @@ impl Stats {
             self.line(format_args!("summary paints_per_s={fps:.1} interval_p50_ms={p50:.2} interval_p95_ms={p95:.2} latency_p95_ms={l95:.2} dropped={dropped}"));
             self.window_start = now;
         }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    /// A real IOSurface of `w`x`h` px and its reference (kept alive by the returned Surface).
+    fn surface(w: u32, h: u32) -> (Surface, SurfaceRef) {
+        let mut s = herdr_browser_surface::create_pixels(PixelSize { w, h }).unwrap();
+        let r = s.export(herdr_browser_surface::Transport::GlobalId).unwrap();
+        (s, r)
+    }
+
+    fn shown(v: &FrameView) -> Option<(u64, u32)> {
+        v.frame.as_ref().map(|f| (f.seq, f.size.w))
+    }
+
+    /// HERDR: a resize keeps the last accepted frame until one at the asked size arrives (never
+    /// a stale-size layout); the skipped frames are still acked; HOLD_MAX ends the hold.
+    #[test]
+    fn a_resize_holds_the_last_frame_until_one_at_the_new_size() {
+        let mut v = FrameView::default();
+        let (_a, a) = surface(100, 50);
+        v.on_frame(1, a, PixelSize { w: 100, h: 50 }, 1.0).unwrap();
+        v.on_resize_pending(Size { w: 200.0, h: 50.0 });
+        assert!(v.stretching());
+        let (_b, b) = surface(150, 50);
+        v.on_frame(2, b, PixelSize { w: 150, h: 50 }, 1.0).unwrap();
+        assert_eq!(shown(&v), Some((1, 100)), "a frame for a width on the way is not shown");
+        assert_eq!(v.ack(), Some(2), "but it is acked, so the host keeps sending");
+        let (_c, c) = surface(201, 50);
+        v.on_frame(3, c, PixelSize { w: 201, h: 50 }, 1.0).unwrap();
+        assert_eq!(shown(&v), Some((3, 201)), "the asked size (CEF rounding allowed) replaces it");
+        assert!(!v.stretching(), "and the hold is over");
+        // A size CEF never paints: after HOLD_MAX the newest frame shows anyway.
+        v.on_resize_pending(Size { w: 300.0, h: 50.0 });
+        v.held_since = Some(std::time::Instant::now() - HOLD_MAX);
+        let (_d, d) = surface(250, 50);
+        v.on_frame(4, d, PixelSize { w: 250, h: 50 }, 1.0).unwrap();
+        assert_eq!(shown(&v), Some((4, 250)));
     }
 }
