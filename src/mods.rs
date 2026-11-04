@@ -938,7 +938,8 @@ fn module(inst: Instance, copy: u64) -> HostModule {
     let note_owner = (!notes_all(&inst.name)).then(|| inst.name.clone());
     let (cmd_tx, commands) = async_channel::unbounded::<String>();
     COMMANDS.with(|c| c.borrow_mut().push((copy, inst.name.clone(), cmd_tx)));
-    HostModule::new("herdr")
+    // HERDR: video (`src/video.rs`).
+    crate::video::functions(HostModule::new("herdr"))
         .declarations(DECLARATIONS)
         .async_function("exec", |a| {
             let command = a.string(0)?.to_owned();
