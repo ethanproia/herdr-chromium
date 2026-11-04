@@ -103,6 +103,11 @@ path = "tests/browser_device_overlays.rs"
 harness = false
 
 [[test]]
+name = "browser_device_overlays_cef"
+path = "tests/browser_device_overlays_cef.rs"
+harness = false
+
+[[test]]
 name = "browser_load_errors"
 path = "tests/browser_load_errors.rs"
 harness = false
