@@ -55,6 +55,7 @@ herdr-browser-host.app/Contents/
 - Early input: Chromium drops input sent before the first frame painted after the first load finishes; the host queues it until then and replays it.
 - Wheel sign: CEF's convention, a negative `dy` scrolls the page down.
 - DevTools has no window here: `DevTools` answers an Error pointing at the CDP port.
+- `HERDR_BROWSER_RATE_FIX=1` (off by default): the app sends the window's display (`SetDisplay`) on open and on display moves; the host paces OSR at that display's real refresh (`windowless_frame_rate` clamped 30..120) and starts Chromium with `enable-begin-frame-scheduling`.
 
 ## CDP: pipe by default, TCP port dev-only
 - `Hello.cdp_pipe: true` starts Chromium with `remote-debugging-pipe`: CDP on fds 3 (in) and 4 (out), NUL-framed JSON, and no TCP port (`Ready.cdp_pipe: true`, `cdp_port: None`). The launcher must pass both fds as pipes; otherwise the host answers an Error and runs without CDP. Measured (CEF 156, from the bundle): `Browser.getVersion` answers on fd 4, and `lsof -iTCP -sTCP:LISTEN` is empty for the host and its helpers (`tests/cef.rs` `cdp_over_fds_3_and_4`).

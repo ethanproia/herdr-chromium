@@ -190,6 +190,8 @@ pub(crate) struct Host {
     dark: Option<bool>,
     /// `HERDR_BROWSER_STATS=1`: blit cost, appended to `<browser dir>/host-stats.log`.
     stats: Option<BlitStats>,
+    /// The windowless frame rate new browsers get and `SetDisplay` gave the open ones.
+    frame_rate: i32,
 }
 
 /// Per-frame copy cost (review A4: `waitUntilCompleted` runs on CEF's UI thread).
@@ -254,6 +256,87 @@ pub(crate) fn debug(args: std::fmt::Arguments) {
     if std::env::var_os("HERDR_BROWSER_HOST_DEBUG").is_some() {
         eprintln!("herdr-browser-host: {args}");
     }
+}
+
+/// `HERDR_BROWSER_RATE_FIX=1`: pace CEF's off-screen compositor at the real refresh of the
+/// display the app's window is on (`SetDisplay`), instead of the fixed 60.
+pub(crate) fn rate_fix() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("HERDR_BROWSER_RATE_FIX").is_some_and(|v| v != "0"))
+}
+
+/// The windowless frame rate browsers are made with and `SetDisplay` sets on open ones.
+pub(crate) fn frame_rate() -> i32 {
+    with_host(|h| h.frame_rate).unwrap_or(60)
+}
+
+/// `SetDisplay`: the app's window moved displays (or a browser view first drew); pace every
+/// open browser and future ones at that display's refresh (`SetWindowlessFrameRate`).
+fn set_display(display: u64) {
+    if !rate_fix() {
+        return;
+    }
+    let Some(hz) = display_refresh_hz(display) else {
+        debug(format_args!("display {display}: no refresh rate; frame rate unchanged"));
+        return;
+    };
+    let rate = crate::frame_rate_for_refresh(hz);
+    let browsers: Vec<Browser> = with_host(|h| {
+        if h.frame_rate == rate {
+            return Vec::new();
+        }
+        debug(format_args!("display {display}: {hz:.2} Hz -> windowless frame rate {rate}"));
+        h.frame_rate = rate;
+        h.browsers.values().filter_map(|e| e.browser.clone()).collect()
+    })
+    .unwrap_or_default();
+    // CEF is called only after the host borrow ends.
+    for b in browsers {
+        if let Some(host) = b.host() {
+            host.set_windowless_frame_rate(rate);
+        }
+    }
+}
+
+/// The display's refresh in Hz: the current mode's rate, else the highest mode's (a display
+/// with a variable rate, like ProMotion, reports 0 for the current one).
+fn display_refresh_hz(display: u64) -> Option<f64> {
+    unsafe {
+        let mode = CGDisplayCopyDisplayMode(display as u32);
+        if !mode.is_null() {
+            let hz = CGDisplayModeGetRefreshRate(mode);
+            CGDisplayModeRelease(mode);
+            if hz > 0.0 {
+                return Some(hz);
+            }
+        }
+        let modes = CGDisplayCopyAllDisplayModes(display as u32, std::ptr::null());
+        if modes.is_null() {
+            return None;
+        }
+        let n = CFArrayGetCount(modes);
+        let mut best = 0.0f64;
+        for i in 0..n {
+            best = best.max(CGDisplayModeGetRefreshRate(CFArrayGetValueAtIndex(modes, i)));
+        }
+        CFRelease(modes);
+        (best > 0.0).then_some(best)
+    }
+}
+
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    fn CGDisplayCopyDisplayMode(display: u32) -> *mut std::ffi::c_void;
+    fn CGDisplayCopyAllDisplayModes(display: u32, options: *const std::ffi::c_void) -> *mut std::ffi::c_void;
+    fn CGDisplayModeGetRefreshRate(mode: *const std::ffi::c_void) -> f64;
+    fn CGDisplayModeRelease(mode: *mut std::ffi::c_void);
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    fn CFArrayGetCount(array: *const std::ffi::c_void) -> isize;
+    fn CFArrayGetValueAtIndex(array: *const std::ffi::c_void, idx: isize) -> *const std::ffi::c_void;
+    fn CFRelease(cf: *const std::ffi::c_void);
 }
 
 /// Borrow host state briefly. Never call CEF inside `f`.
@@ -796,6 +879,7 @@ fn serve(socket: &Path, listener: UnixListener, args: &Args) -> io::Result<()> {
             perms: HashMap::new(),
             quit: false,
             stats: BlitStats::open(profile_dir.parent().unwrap_or(&profile_dir)),
+            frame_rate: 60,
         })
     });
     if with_host(|h| h.blitter.is_none()).unwrap_or(true) {
@@ -974,6 +1058,7 @@ fn handle(m: AppToHost) {
                 }
             }
         }
+        M::SetDisplay { display } => set_display(display),
         M::Create { id, url, size, scale, profile } => {
             let exists = with_host(|h| h.browsers.contains_key(&id)).unwrap_or(false);
             if exists || herdr_browser_protocol::is_popup_id(&id) {
@@ -989,7 +1074,7 @@ fn handle(m: AppToHost) {
             };
             with_host(|h| h.browsers.insert(id.clone(), Entry::new(size, scale)));
             let window_info = WindowInfo { windowless_rendering_enabled: 1, shared_texture_enabled: 1, ..Default::default() };
-            let settings = BrowserSettings { windowless_frame_rate: 60, ..Default::default() };
+            let settings = BrowserSettings { windowless_frame_rate: frame_rate(), ..Default::default() };
             let mut client = handlers::client(&id);
             let url = CefString::from(url.as_deref().unwrap_or("about:blank"));
             // Async: a named profile's context may still be starting, and a synchronous create

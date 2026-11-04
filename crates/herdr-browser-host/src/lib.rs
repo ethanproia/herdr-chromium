@@ -44,6 +44,17 @@ pub fn media_kinds(mask: u32) -> Vec<&'static str> {
     out
 }
 
+/// The OSR paint rate for a display refresh of `hz` (CEF `windowless_frame_rate`): the real
+/// rate, rounded, clamped into the sane range 30..120. A missing or bogus read (0, negative)
+/// lands on 30 rather than disabling CEF's limiter with an out-of-range value.
+/// Used by `cef/mod.rs` under `HERDR_BROWSER_RATE_FIX`.
+pub fn frame_rate_for_refresh(hz: f64) -> i32 {
+    if !hz.is_finite() {
+        return 30;
+    }
+    hz.round().clamp(30.0, 120.0) as i32
+}
+
 /// The words for a permission prompt's bits (CEF `cef_permission_request_types_t`).
 pub fn prompt_kinds(mask: u32) -> Vec<&'static str> {
     let named: [(u32, &str); 6] = [(4, "camera"), (4096, "microphone"), (256, "geolocation"), (16, "clipboard-read"), (32768, "notifications"), (8192, "midi")];
@@ -70,6 +81,22 @@ mod permission_tests {
         assert!(asks(&media_kinds(3)) && asks(&prompt_kinds(256)));
         assert!(!asks(&media_kinds(2 | 8)), "screen capture has no picker yet");
         assert!(!asks(&prompt_kinds(32768)) && !asks(&prompt_kinds(8192)) && !asks(&prompt_kinds(1)) && !asks(&[]));
+    }
+}
+
+#[cfg(test)]
+mod rate_tests {
+    #[test]
+    fn display_refresh_clamps_into_cefs_windowless_range() {
+        use super::frame_rate_for_refresh as r;
+        assert_eq!(r(60.0), 60);
+        assert_eq!(r(59.94), 60, "a 59.94 Hz panel paints at 60");
+        assert_eq!(r(120.0), 120);
+        assert_eq!(r(144.0), 120, "never past the cap");
+        assert_eq!(r(24.0), 30, "never below the floor");
+        assert_eq!(r(0.0), 30);
+        assert_eq!(r(-1.0), 30);
+        assert_eq!(r(f64::NAN), 30, "a bogus read keeps the limiter on");
     }
 }
 

@@ -221,6 +221,10 @@ pub enum AppToHost {
     /// The app's appearance changed (or Hello was just sent): every page's prefers-color-scheme
     /// follows it, live. Applies to browsers created later too.
     SetColorScheme { dark: bool },
+    /// The display the app's window is on (a platform display id; macOS: CGDirectDisplayID).
+    /// Sent when a browser view first draws and again when the window changes displays; global
+    /// to the host. The CEF host paces OSR to that display's refresh (HERDR_BROWSER_RATE_FIX).
+    SetDisplay { display: u64 },
     /// Rects for an overlay; answered by `OverlayRects` with the same `req` and `epoch`.
     Overlay { id: BrowserId, req: u64, epoch: u64, query: OverlayQuery },
     /// Describe the element at page point (x, y) CSS px for a pick (S4); answered by `PickInfoResult`
@@ -412,6 +416,7 @@ mod tests {
         roundtrip_app(AppToHost::Eval { id: "b1".into(), req: 1, expr: "1+1".into() });
         roundtrip_app(AppToHost::Edit { id: "b1".into(), command: EditCommand::SelectAll });
         roundtrip_app(AppToHost::SetColorScheme { dark: true });
+        roundtrip_app(AppToHost::SetDisplay { display: 69732352 });
         roundtrip_app(AppToHost::Create { id: "b2".into(), url: None, size: Size { w: 10.0, h: 10.0 }, scale: 1.0, profile: Some("work".into()) });
         roundtrip_app(AppToHost::Overlay { id: "b1".into(), req: 3, epoch: 9, query: OverlayQuery::HitTest { x: 1.5, y: 2.5 } });
         roundtrip_app(AppToHost::Overlay { id: "b1".into(), req: 4, epoch: 9, query: OverlayQuery::Selector { selector: "#a > b".into() } });

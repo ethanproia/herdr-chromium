@@ -110,6 +110,8 @@ impl<A: SurfaceAlloc> StubHost<A> {
                 }
             }
             M::Shutdown => {}
+            // Only the CEF host paces paints by display; the stub ignores it.
+            M::SetDisplay { .. } => {}
             // No pages to recolour: say so, so tests see the message was handled, not dropped.
             M::SetColorScheme { dark } => {
                 let scheme = if dark { "dark" } else { "light" };
@@ -278,7 +280,7 @@ fn browser_id(m: &AppToHost) -> &str {
         | M::Stop { id } | M::Resize { id, .. } | M::Focus { id, .. } | M::SetZoom { id, .. } | M::Overlay { id, .. } | M::PickInfo { id, .. } | M::PickRelative { id, .. } | M::TextEdit { id, .. } | M::Styles { id, .. } | M::SetStyle { id, .. } | M::RevertStyle { id, .. } | M::SetVisible { id, .. } | M::SetDevice { id, .. } | M::MenuResult { id, .. } | M::Input { id, .. } | M::Edit { id, .. }
         | M::FrameAck { id, .. } | M::Find { id, .. } | M::StopFind { id, .. } | M::DevTools { id, .. } | M::Eval { id, .. }
         | M::Screenshot { id, .. } | M::FileChooserResult { id, .. } | M::DialogResult { id, .. } | M::PermissionResult { id, .. } => id,
-        M::Hello { .. } | M::SetColorScheme { .. } | M::Shutdown => "",
+        M::Hello { .. } | M::SetColorScheme { .. } | M::SetDisplay { .. } | M::Shutdown => "",
     }
 }
 

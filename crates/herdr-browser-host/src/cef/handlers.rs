@@ -500,6 +500,15 @@ wrap_app! {
             for sw in ["use-mock-keychain", "no-startup-window", "noerrdialogs", "hide-crash-restore-bubble", "disable-features=MacAppCodeSignClone"] {
                 cl.append_switch(Some(&sw.into()));
             }
+            // HERDR_BROWSER_RATE_FIX: synchronize every process's vsync rate to each browser's
+            // windowless_frame_rate — the pacing switch CEF documents for off-screen rendering
+            // (chromiumembedded/cef issue #1368, commit d0a45cf, appended by cefclient in OSR
+            // mode). Deliberately not --disable-frame-rate-limit or --disable-gpu-vsync: those
+            // uncap OnPaint (measured into the hundreds per second), the opposite of one frame
+            // per refresh.
+            if super::rate_fix() {
+                cl.append_switch(Some(&"enable-begin-frame-scheduling".into()));
+            }
             // CDP on fds 3 (in) and 4 (out), NUL-framed JSON; no TCP port (docs/browser-cdp-pipe.md).
             if super::CDP_PIPE.load(std::sync::atomic::Ordering::SeqCst) {
                 cl.append_switch(Some(&"remote-debugging-pipe".into()));
@@ -745,7 +754,7 @@ wrap_life_span_handler! {
                 {
                     *info = WindowInfo { windowless_rendering_enabled: 1, shared_texture_enabled: 1, ..Default::default() };
                     *client = Some(client_for(&id));
-                    settings.windowless_frame_rate = 60;
+                    settings.windowless_frame_rate = super::frame_rate();
                     send(HostToApp::PopupOpened { opener: self.id.clone(), id, url: s(target_url), w, h });
                     return 0;
                 }

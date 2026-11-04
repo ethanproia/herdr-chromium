@@ -15,6 +15,13 @@ fn cdp_pipe_wanted() -> bool {
     std::env::var("HERDR_BROWSER_CDP_PIPE").map_or(true, |v| v != "0") && std::env::var("HERDR_BROWSER_CDP_PORT").map_or(true, |v| v.is_empty())
 }
 
+/// `HERDR_BROWSER_RATE_FIX=1`: the window's display goes to the host (SetDisplay) so CEF paces
+/// off-screen paints at that display's real refresh, 120 Hz panels included. Off by default.
+fn rate_fix() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("HERDR_BROWSER_RATE_FIX").is_some_and(|v| v != "0"))
+}
+
 /// Start the host with CDP on fds 3/4 (macOS; elsewhere no pipe yet).
 #[cfg(target_os = "macos")]
 fn spawn_cdp(cmd: &mut Command) -> std::io::Result<(Child, Arc<CdpPipe>)> {
@@ -209,6 +216,8 @@ struct Shared {
     early: HashMap<BrowserId, Vec<HostToApp>>,
     /// Bumped each time a host connection ends; readers of an older one stay quiet.
     generation: u64,
+    /// The display last sent (`SetDisplay`), deduped and replayed into a new host.
+    display: Option<u64>,
     /// Hears every host message (the agent commands, part 5).
     tap: Option<Tap>,
     /// The current host's CDP pipe (None: a host the app didn't start, or a port was asked for).
@@ -310,6 +319,12 @@ impl HostLink for HostClient {
                         o.device = device.clone();
                     }
                 }
+                AppToHost::SetDisplay { display } => {
+                    if s.display == Some(*display) {
+                        return;
+                    }
+                    s.display = Some(*display);
+                }
                 _ => {}
             }
         }
@@ -347,7 +362,8 @@ impl Writer {
             }
             // Closing a page on a host that isn't running needs no host.
             let dead = self.conn.as_ref().is_none_or(|c| c.generation != self.shared.lock().unwrap().generation);
-            if dead && matches!(msg, AppToHost::Close { .. } | AppToHost::FrameAck { .. } | AppToHost::Focus { .. }) {
+            // A display move should never wake a dead host; the value replays at connect.
+            if dead && matches!(msg, AppToHost::Close { .. } | AppToHost::FrameAck { .. } | AppToHost::Focus { .. } | AppToHost::SetDisplay { .. }) {
                 continue;
             }
             if dead {
@@ -445,6 +461,10 @@ impl Writer {
             cdp_pipe: self.shared.lock().unwrap().cdp.as_ref().is_some_and(|p| !p.is_dead()),
         };
         conn.stream.write_all(format!("{}\n", protocol::encode(&hello)).as_bytes())?;
+        if let Some(display) = self.shared.lock().unwrap().display {
+            let msg = AppToHost::SetDisplay { display };
+            conn.stream.write_all(format!("{}\n", protocol::encode(&msg)).as_bytes())?;
+        }
         Ok(conn)
     }
 
@@ -710,6 +730,8 @@ pub struct BrowserView {
     _focus: [Subscription; 2],
     _address: Subscription,
     _visibility: Subscription,
+    /// Watches the window's display (HERDR_BROWSER_RATE_FIX; None when off).
+    _display_watch: Option<Subscription>,
     probe: Option<FrameProbe>,
     /// Page overlays (highlight, pick, find matches): epochs and hover coalescing (geometry.rs).
     overlay: OverlayState,
@@ -931,6 +953,18 @@ impl BrowserView {
             }
             _ => {}
         });
+        // HERDR_BROWSER_RATE_FIX: the window's display at open and whenever bounds move (a
+        // display move included): the host paces OSR at that display's refresh.
+        let display_watch = rate_fix().then(|| {
+            if let Some(d) = window.display(cx) {
+                link.send(AppToHost::SetDisplay { display: u64::from(d.id()) });
+            }
+            cx.observe_window_bounds(window, |v, window, cx| {
+                if let Some(d) = window.display(cx) {
+                    v.link.send(AppToHost::SetDisplay { display: u64::from(d.id()) });
+                }
+            })
+        });
         // Occluded, minimized, another Space, display asleep: the host stops painting until shown.
         let visibility = cx.observe_window_visibility(window, |v, visibility, _, cx| {
             let visible = visibility.is_visible();
@@ -978,6 +1012,7 @@ impl BrowserView {
             _focus: [on, off],
             _address: typed,
             _visibility: visibility,
+            _display_watch: display_watch,
             probe: None,
             overlay: OverlayState::default(),
             zoom_level: 0.0,
