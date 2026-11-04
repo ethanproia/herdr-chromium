@@ -1,0 +1,12 @@
+{
+  "name": "Trestle",
+  "slug": "trestle",
+  "bundle_id": "dev.trestle.app",
+  "cli": "trestle",
+  "home": ".config/trestle",
+  "session": "trestle",
+  "layout": "trestle",
+  "previous": [
+    { "name": "Herdr Labs", "bundle_id": "dev.herdr.app.labs", "cli": "herdr-labs", "home": ".config/herdr-labs", "session": "herdr-labs", "layout": "labs" }
+  ]
+}

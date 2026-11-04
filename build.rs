@@ -33,8 +33,31 @@ fn embed(base: &Path, folder: &str, name: &str, file: &str) {
     std::fs::write(Path::new(&std::env::var("OUT_DIR").unwrap()).join(file), code).unwrap();
 }
 
+/// HERDR: the fork's user-facing name, from brand.json (one file; docs/branding.md).
+fn brand(base: &Path) {
+    println!("cargo:rerun-if-changed=brand.json");
+    let text = std::fs::read_to_string(base.join("brand.json")).expect("brand.json");
+    let field = |key: &str| -> String {
+        let at = text.find(&format!("\"{key}\"")).unwrap_or_else(|| panic!("brand.json has no {key}"));
+        let rest = &text[at + key.len() + 2..];
+        let start = rest.find('"').unwrap() + 1;
+        let end = start + rest[start..].find('"').unwrap();
+        rest[start..end].to_string()
+    };
+    // The first occurrence of each key is the current brand (`previous` comes after).
+    let prev_layouts: Vec<String> = text.split("\"previous\"").nth(1).map(|p| {
+        p.split("\"layout\"").skip(1).filter_map(|s| { let s = &s[s.find('"')? + 1..]; Some(s[..s.find('"')?].to_string()) }).collect()
+    }).unwrap_or_default();
+    let code = format!(
+        "pub const NAME: &str = {:?};\npub const SLUG: &str = {:?};\npub const LAYOUT: &str = {:?};\n/// Layout names earlier brands used (homes may still name them).\npub const OLD_LAYOUTS: &[&str] = &{:?};\n",
+        field("name"), field("slug"), field("layout"), prev_layouts
+    );
+    std::fs::write(Path::new(&std::env::var("OUT_DIR").unwrap()).join("brand.rs"), code).unwrap();
+}
+
 fn main() {
     let base = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    brand(&base);
     embed(&base, "defaults/mods", "DEFAULT_MODS", "default_mods.rs");
     embed(&base, "defaults/icons", "DEFAULT_ICONS", "default_icons.rs");
     embed(&base, "defaults/frame", "FRAME_MODS", "frame_mods.rs");
