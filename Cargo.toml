@@ -183,6 +183,11 @@ path = "tests/browser_send_to.rs"
 harness = false
 
 [[test]]
+name = "browser_text_edit"
+path = "tests/browser_text_edit.rs"
+harness = false
+
+[[test]]
 name = "browser_annotations_agent"
 path = "tests/browser_annotations_agent.rs"
 harness = false
