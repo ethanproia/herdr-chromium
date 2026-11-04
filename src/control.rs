@@ -228,7 +228,20 @@ fn parse_args(rest: &[String]) -> Result<Value, String> {
     }
 }
 
-/// Encode before opening the destination: GPU errors must not truncate a good shot.
+/// Draws the window with sensitive browser pages covered, saves it, then draws it normally again.
+pub fn masked_shot(window: &mut gpui::Window, cx: &mut gpui::App, path: &std::path::Path) -> anyhow::Result<()> {
+    use std::sync::atomic::Ordering::SeqCst;
+    crate::browser::view::SHOT_MASK.store(true, SeqCst);
+    window.refresh();
+    window.draw(cx).clear(cx);
+    let r = save_shot(window, path);
+    crate::browser::view::SHOT_MASK.store(false, SeqCst);
+    window.refresh();
+    r
+}
+
+/// Encode before opening the destination: GPU errors must not truncate a good shot. The file is
+/// new and private (0600, created exclusively): an existing file is never replaced.
 pub fn save_shot(window: &gpui::Window, path: &std::path::Path) -> anyhow::Result<()> {
     let image = window.render_to_image()?;
     let mut bytes = Vec::new();
@@ -239,18 +252,24 @@ pub fn save_shot(window: &gpui::Window, path: &std::path::Path) -> anyhow::Resul
         encoder.set_source_srgb(png::SrgbRenderingIntent::Perceptual);
         encoder.write_header()?.write_image_data(image.as_raw())?;
     }
-    // A sibling temporary file keeps publication on the same filesystem.
-    let temporary = path.with_file_name(format!(".herdr-shot-{}.png", std::process::id()));
-    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&temporary)?;
+    write_new_private(path, &bytes)
+}
+
+/// Writes `bytes` to a file that must not exist yet (O_EXCL, 0600); a failed write removes it.
+pub fn write_new_private(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(path).map_err(|e| anyhow::anyhow!("{}: {e} (shots never replace a file)", path.display()))?;
     let result = (|| -> anyhow::Result<()> {
-        file.write_all(&bytes)?;
+        file.write_all(bytes)?;
         file.sync_all()?;
-        drop(file);
-        std::fs::rename(&temporary, path)?;
         Ok(())
     })();
     if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
+        drop(file);
+        let _ = std::fs::remove_file(path);
     }
     result
 }
@@ -263,6 +282,27 @@ fn fail(message: &str) -> i32 {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_shot_never_replaces_a_file_and_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("herdr-app-shot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fresh = dir.join("new.png");
+        write_new_private(&fresh, b"png").unwrap();
+        assert_eq!(std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777, 0o600);
+        let precious = dir.join("notes.txt");
+        std::fs::write(&precious, "keep me").unwrap();
+        assert!(write_new_private(&precious, b"png").is_err());
+        assert_eq!(std::fs::read_to_string(&precious).unwrap(), "keep me", "an existing file is untouched");
+        // A symlink at the destination is not followed.
+        let link = dir.join("link.png");
+        std::os::unix::fs::symlink(&precious, &link).unwrap();
+        assert!(write_new_private(&link, b"png").is_err());
+        assert_eq!(std::fs::read_to_string(&precious).unwrap(), "keep me");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_second_launch_raises_the_running_window() {

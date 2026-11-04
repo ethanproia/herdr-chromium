@@ -3695,13 +3695,12 @@ impl AppWindow {
                     let _ = reply.send(r.unwrap_or_else(|error| json!({ "error": error })));
                 }), window, cx);
             }
-            // HERDR: a headless window is never asked to display, so its picture stays the first
-            // frame ("Loading..."): draw it now, outside this view's update, then take the shot.
-            Request::Control { cmd, reply } if crate::control::headless() && cmd.get("shot").and_then(Value::as_str).is_some() => {
+            // HERDR: every window shot is drawn outside this view's update (a headless window is never
+            // asked to display, and a masked draw covers sensitive pages), then saved to a new private file.
+            Request::Control { cmd, reply } if cmd.get("shot").and_then(Value::as_str).is_some() => {
                 let path = PathBuf::from(cmd["shot"].as_str().unwrap_or_default());
                 window.defer(cx, move |window, cx| {
-                    window.draw(cx).clear(cx);
-                    let _ = reply.send(match crate::control::save_shot(window, &path) {
+                    let _ = reply.send(match crate::control::masked_shot(window, cx, &path) {
                         Ok(()) => json!({ "path": path }),
                         Err(error) => json!({ "error": format!("cannot save screenshot: {error:#}") }),
                     });
@@ -3717,12 +3716,6 @@ impl AppWindow {
         if let Some(name) = cmd.get("do").and_then(Value::as_str) {
             let args = cmd.get("args").cloned().unwrap_or(Value::Null);
             return self.run_as(name, args, false, window, cx);
-        }
-        if let Some(path) = cmd.get("shot").and_then(Value::as_str) {
-            return match crate::control::save_shot(window, std::path::Path::new(path)) {
-                Ok(()) => json!({ "path": path }),
-                Err(error) => json!({ "error": format!("cannot save screenshot: {error:#}") }),
-            };
         }
         if cmd.get("commands").is_some() {
             return crate::commands::listing();
@@ -5171,6 +5164,28 @@ fn changed_asset_paths(home: &std::path::Path, changed: &[std::path::PathBuf]) -
 #[cfg(test)]
 mod tests {
     #[test]
+    fn only_plain_local_http_counts_as_the_bridge_url() {
+        for ok in ["http://127.0.0.1:7123/?token=t&machine=box", "http://127.0.0.1:80", "http://127.0.0.1:65535/x#y"] {
+            assert!(super::is_local_http(ok), "{ok}");
+        }
+        for bad in [
+            "http://127.0.0.1:80@evil.example/",
+            "http://127.0.0.1:80@evil.example",
+            "https://127.0.0.1:7123/",
+            "http://127.0.0.1.evil.example:7123/",
+            "http://127.0.0.1:/",
+            "http://127.0.0.1:0/",
+            "http://127.0.0.1:99999/",
+            "http://127.0.0.1:12ab/",
+            "http://127.0.0.1:80\\@evil.example/",
+            "http://localhost:7123/",
+            " http://127.0.0.1:7123/",
+        ] {
+            assert!(!super::is_local_http(bad), "{bad}");
+        }
+    }
+
+    #[test]
     fn the_persons_browser_uses_their_profile_with_raw_chords_off() {
         let b = super::new_browser(Some("https://example.test/"), super::Via::Person);
         assert_eq!((b.url.as_str(), b.profile.as_str(), b.raw_chords, b.launch_url.is_none()), ("https://example.test/", "default", false, true));
@@ -5644,8 +5659,17 @@ fn remote_desktop_url(bridge: &std::path::Path, machine: Option<&str>) -> Result
         return Err(format!("the bridge failed ({}): {}", out.status, err.lines().last().unwrap_or("").chars().take(200).collect::<String>()));
     }
     let url = String::from_utf8_lossy(&out.stdout).lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("").to_owned();
-    if !url.starts_with("http://127.0.0.1:") {
+    if !is_local_http(&url) {
         return Err("the bridge printed no local url".into());
     }
     Ok(url)
+}
+
+/// Whether `url` is plain http to 127.0.0.1 on a numeric port, parsed rather than prefix-matched:
+/// no userinfo (`http://127.0.0.1:80@evil.example`), no other host, no backslash tricks.
+fn is_local_http(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("http://") else { return false };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let Some(port) = authority.strip_prefix("127.0.0.1:") else { return false };
+    !authority.contains(['@', '\\']) && !port.is_empty() && port.len() <= 5 && port.bytes().all(|b| b.is_ascii_digit()) && port.parse::<u16>().is_ok_and(|p| p > 0)
 }

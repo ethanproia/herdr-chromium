@@ -154,6 +154,12 @@ each to a labs branch and commit (`"ship": false` holds one back). To update:
 re-pin the commit, run `scripts/sync-bundled-mods.py` (any labs clone with the
 commit: `LABS_GIT=<clone>`), commit `defaults/`. `--check` fails if
 `defaults/mods/fork-*` or `defaults/layouts/labs.json` drifted from the pins.
+It covers everything `build.rs` embeds: every fork-* folder against its pin,
+every other folder against the digest recorded under `"stock"` (after an
+upstream merge, review the stock mods and run `--bless-stock`), and nothing
+else may sit in `defaults/mods`. Each pinned mod's literal `exec("<command>")`
+calls must be named in its lockfile `"exec"` list. `scripts/test-sync-check.sh`
+proves each of these fails.
 
 The sync also writes the `labs` layout (and its preview `labs.svg`) from the
 labs layout pinned under `"layout"` (Ethan's, `clones/mac/layouts/Labs.json`), with
