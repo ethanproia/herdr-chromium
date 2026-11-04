@@ -9,7 +9,8 @@ The fork's name is one file, `brand.json` at the repository root:
   "previous": [ { "name": "Herdr Labs", … } ] }
 ```
 
-Edit it and rebuild. `build.rs` turns it into the app's constants (`src/brand.rs`), and the
+Edit it, write the new name into `docs/fork-install.md` (the install guide names it;
+`scripts/test-brand.sh` says so if you forget), and rebuild. `build.rs` turns it into the app's constants (`src/brand.rs`), and the
 scripts read it through `scripts/brand.sh`. Before changing a released name, move the old one
 into `previous`, so installs under it are migrated (docs/fork-install.md). `scripts/test-brand.sh` checks that everything agrees with the file, and that no
 earlier name is written outside its allow-list.

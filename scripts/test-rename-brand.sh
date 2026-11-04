@@ -19,6 +19,9 @@ python3 - "$slug" <<'PY'
 import json, sys
 s = sys.argv[1]
 b = json.load(open("brand.json"))
+# The rename's one doc step (docs/branding.md): the install guide names the brand.
+guide = open("docs/fork-install.md").read().replace(b["name"], s.capitalize())
+open("docs/fork-install.md", "w").write(guide)
 b.update(name=s.capitalize(), slug=s, bundle_id=f"dev.{s}.app", cli=s, home=f".config/{s}", session=s)
 json.dump(b, open("brand.json", "w"), indent=2)
 PY
