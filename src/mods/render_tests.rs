@@ -744,9 +744,7 @@ fn shipped_layouts_and_keys() {
         let text = std::fs::read_to_string(&path).unwrap();
         serde_json::from_str::<Node>(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         references(&serde_json::from_str::<Value>(&text).unwrap(), &mods);
-        // HERDR: the fork's layout file stays labs.json (the sync writes it); it ships under brand.json's name.
-        let stem = path.file_stem().unwrap().to_str().unwrap();
-        layouts.insert(if stem == "labs" { crate::brand::LAYOUT } else { stem }.to_owned());
+        layouts.insert(path.file_stem().unwrap().to_str().unwrap().to_owned());
     }
     assert_eq!(layouts, crate::window::shipped_layouts().into_iter().map(str::to_owned).collect());
     // HERDR: the bundled notepad's own command (defaults/keys.macos.json).

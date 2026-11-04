@@ -44,14 +44,7 @@ fn brand(base: &Path) {
         let end = start + rest[start..].find('"').unwrap();
         rest[start..end].to_string()
     };
-    // The first occurrence of each key is the current brand (`previous` comes after).
-    let prev_layouts: Vec<String> = text.split("\"previous\"").nth(1).map(|p| {
-        p.split("\"layout\"").skip(1).filter_map(|s| { let s = &s[s.find('"')? + 1..]; Some(s[..s.find('"')?].to_string()) }).collect()
-    }).unwrap_or_default();
-    let code = format!(
-        "pub const NAME: &str = {:?};\npub const SLUG: &str = {:?};\npub const LAYOUT: &str = {:?};\n/// Layout names earlier brands used (homes may still name them).\npub const OLD_LAYOUTS: &[&str] = &{:?};\n",
-        field("name"), field("slug"), field("layout"), prev_layouts
-    );
+    let code = format!("pub const NAME: &str = {:?};\npub const SLUG: &str = {:?};\n", field("name"), field("slug"));
     std::fs::write(Path::new(&std::env::var("OUT_DIR").unwrap()).join("brand.rs"), code).unwrap();
 }
 

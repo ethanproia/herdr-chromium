@@ -13,21 +13,21 @@ bad() { echo "FAIL $1"; fails=$((fails + 1)); }
 
 # 1. One source: the shell snippet reads the same values.
 BRAND_FILE=$root/brand.json source "$root/scripts/brand.sh"
-want=$(python3 -c 'import json,sys; b=json.load(open(sys.argv[1])); print(b["name"], b["slug"], b["layout"])' brand.json)
-[[ "$BRAND_NAME $BRAND_SLUG $BRAND_LAYOUT" == "$want" ]] && ok "scripts/brand.sh reads brand.json ($BRAND_NAME)" || bad "scripts/brand.sh: $BRAND_NAME $BRAND_SLUG $BRAND_LAYOUT, want $want"
+want=$(python3 -c 'import json,sys; b=json.load(open(sys.argv[1])); print(b["name"], b["slug"], b["cli"], b["session"])' brand.json)
+[[ "$BRAND_NAME $BRAND_SLUG $BRAND_CLI $BRAND_SESSION" == "$want" ]] && ok "scripts/brand.sh reads brand.json ($BRAND_NAME)" || bad "scripts/brand.sh: $BRAND_NAME $BRAND_SLUG $BRAND_CLI $BRAND_SESSION, want $want"
 # The app's name strings come from src/brand.rs, never a literal of the current name.
 lit=$(git grep -n -I -F "\"$BRAND_NAME\"" -- 'src/*.rs' 'src/**/*.rs' | grep -v '^src/brand.rs' || true)
 [[ -z $lit ]] && ok "no literal \"$BRAND_NAME\" in src (it comes from brand.rs)" || bad "literal brand name in src: $lit"
 
-# 2. Earlier brands' names only where they belong.
-# brand.json lists them (migration); the installer, its scratch test and its doc are held
-# until the name is released (fork-lead 2026-11-04), then move to brand.sh; this test;
-# docs/branding.md explains them.
-allow=(brand.json scripts/test-brand.sh docs/branding.md
-       scripts/install-fork-macos scripts/test-install-fork.sh docs/fork-install.md)
+# The install guide names the current brand (it is written out there; a rename updates it).
+grep -q -F "$BRAND_NAME" docs/fork-install.md && ok "docs/fork-install.md names $BRAND_NAME" || bad "docs/fork-install.md doesn't name $BRAND_NAME"
+
+# 2. Earlier brands' names only where they belong: brand.json lists them (migration);
+# this test; docs/branding.md explains them; docs/fork-install.md tells a person moving over.
+allow=(brand.json scripts/test-brand.sh docs/branding.md docs/fork-install.md)
 pathspec=(-- . ':!vendor')
 for a in "${allow[@]}"; do pathspec+=(":!$a"); done
-while IFS=$'\t' read -r p_name p_id p_cli p_home p_session p_layout; do
+while IFS=$'\t' read -r p_name p_id p_cli p_home p_session; do
   [[ -n $p_name ]] || continue
   for old in "$p_name" "$p_id" "$p_cli"; do
     hits=$(git grep -n -I -F -e "$old" "${pathspec[@]}" | cut -c1-160 || true)

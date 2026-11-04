@@ -145,8 +145,8 @@ const LAYOUTS: &[(&str, &str)] = &[
     ("main", include_str!("../defaults/layouts/main.json")),
     ("terminals", include_str!("../defaults/layouts/terminals.json")),
     ("win98", include_str!("../defaults/layouts/win98.json")),
-    // HERDR: the fork's own layout (Ethan's), named by brand.json, built from the bundled fork-* mods (defaults/bundled-mods.lock.json).
-    (crate::brand::LAYOUT, include_str!("../defaults/layouts/labs.json")),
+    // HERDR: the fork's own layout "labs" (Ethan's), built from the bundled fork-* mods (defaults/bundled-mods.lock.json).
+    ("labs", include_str!("../defaults/layouts/labs.json")),
 ];
 
 /// Pictures shipped layouts name as their `preview`, written beside them.
@@ -156,12 +156,11 @@ const LAYOUT_PREVIEWS: &[(&str, &str)] = &[
     ("labs.svg", include_str!("../defaults/layouts/labs.svg")),
 ];
 
-// HERDR: the fork starts on its own layout (brand.json); homes left on an old name ("fork",
-// or an earlier brand's, such as "labs") open it.
-pub(crate) const FORK_DEFAULT_LAYOUT: &str = crate::brand::LAYOUT;
+// HERDR: the fork starts on its own layout; homes left on the old name "fork" open "labs".
+pub(crate) const FORK_DEFAULT_LAYOUT: &str = "labs";
 
 pub(crate) fn renamed_layout(name: String) -> String {
-    if name == "fork" || crate::brand::OLD_LAYOUTS.contains(&name.as_str()) { FORK_DEFAULT_LAYOUT.to_owned() } else { name }
+    if name == "fork" { FORK_DEFAULT_LAYOUT.to_owned() } else { name }
 }
 
 pub fn shipped_layouts() -> Vec<&'static str> {
@@ -3324,8 +3323,8 @@ impl AppWindow {
             }
             // ---- layout
             "layout.switch" => {
-                // HERDR: "fork" and earlier brands' names reach the fork's layout.
-                self.switch_layout(Self::arg(a, "name").map(|n| if n == "fork" || crate::brand::OLD_LAYOUTS.contains(&n) { FORK_DEFAULT_LAYOUT } else { n }), window, cx);
+                // HERDR: "fork" is the old name of "labs".
+                self.switch_layout(Self::arg(a, "name").map(|n| if n == "fork" { FORK_DEFAULT_LAYOUT } else { n }), window, cx);
                 return;
             }
             "layout.clone" => {

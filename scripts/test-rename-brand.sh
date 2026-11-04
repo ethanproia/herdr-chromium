@@ -19,7 +19,7 @@ python3 - "$slug" <<'PY'
 import json, sys
 s = sys.argv[1]
 b = json.load(open("brand.json"))
-b.update(name=s.capitalize(), slug=s, bundle_id=f"dev.{s}.app", cli=s, home=f".config/{s}", session=s, layout=s)
+b.update(name=s.capitalize(), slug=s, bundle_id=f"dev.{s}.app", cli=s, home=f".config/{s}", session=s)
 json.dump(b, open("brand.json", "w"), indent=2)
 PY
 git init -q . && git checkout -qb scratch/rename-brand && git add -A >/dev/null && git -c user.email=t@t -c user.name=t commit -qm scratch
