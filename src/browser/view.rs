@@ -115,6 +115,8 @@ enum PageAsk {
     Hover,
     /// A3: an arrow key's step from the current pick (PickRelative).
     Step,
+    /// HERDR: S13. The element under a double-click, to edit its text in place.
+    TextEdit,
 }
 
 use super::{BrowserRegistry, BrowserState, FrameSink, FrameView, HostLink};
@@ -695,6 +697,8 @@ pub struct BrowserView {
     annotations: annotate::Annotations,
     comment_on_pick: bool,
     comment_target: Option<annotate::Target>,
+    // HERDR: S13 inline text edit.
+    text_edit: super::text_edit::TextEdit,
     /// A2/A3: the element the pick is on (its label for the chip). `stepped`: an arrow key chose it,
     /// so the highlight and the next click use it, not the pointer's element.
     hovered: Option<annotate::Target>,
@@ -950,6 +954,7 @@ impl BrowserView {
             annotations: Default::default(),
             comment_on_pick: false,
             comment_target: None,
+            text_edit: Default::default(),
             hovered: None,
             stepped: false,
             hover_ask: None,
@@ -1190,6 +1195,8 @@ impl BrowserView {
                 }
             }
             H::ScreenshotDone { req, ok, .. } if self.attaching.contains_key(&req) => self.finish_attach(req, ok, cx),
+            // HERDR: S13 inline text edit.
+            H::TextEditResult { req, ok, before, after, .. } => self.text_edit_answer(req, ok, before, after, cx),
             H::PickInfoResult { req, ok, selector, label, rect, .. } if req >= VIEW_REQ_BASE => {
                 if let Some(ask) = self.asks.remove(&req) {
                     self.on_target(ask, ok.then_some((selector, label, rect)), cx);
@@ -1767,9 +1774,8 @@ impl BrowserView {
                                 i.escape();
                             });
                         } else {
-                            self.input.update(cx, |i, _| {
-                                i.escape();
-                            });
+                            // HERDR: S13. Pick ends after the double-click interval, unless a second click edits text.
+                            self.leave_pick_unless_double_click(cx);
                         }
                         cx.emit(BrowserEvent::Picked { x: cx_, y: cy });
                     }
@@ -1798,6 +1804,9 @@ impl BrowserView {
                 }
                 OverlayEvent::Refused => self.refused_at = Some(std::time::Instant::now()),
                 OverlayEvent::PickStep(step) => self.pick_step(*step),
+                // HERDR: S13 inline text edit.
+                OverlayEvent::DoubleClick { x, y } => self.text_edit_at(*x, *y, cx),
+                OverlayEvent::TextEditDone { commit } => self.text_edit_done(*commit),
                 _ => {}
             }
         }
@@ -1841,6 +1850,76 @@ impl BrowserView {
         }
     }
 
+    /// HERDR: S13. A plain pick click ends pick mode only once no second click came.
+    fn leave_pick_unless_double_click(&mut self, cx: &mut Context<Self>) {
+        let n = self.text_edit.wait_for_second_click();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(super::text_edit::DOUBLE_CLICK_MS)).await;
+            let _ = this.update(cx, |v, cx| {
+                if v.text_edit.wait_ran_out(n) && v.owner(cx) == Owner::Pick {
+                    v.input.update(cx, |i, _| {
+                        i.escape();
+                    });
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// HERDR: S13. A double-click while picking: the comment the first click opened closes, and the
+    /// element under the pointer is asked for (a pick, so the host lets it be edited).
+    fn text_edit_at(&mut self, x: f32, y: f32, cx: &mut Context<Self>) {
+        self.text_edit.exit_wait = None;
+        if self.owner(cx) == Owner::Comment {
+            self.input.update(cx, |i, _| {
+                i.escape();
+            });
+        }
+        self.ask_target(PageAsk::TextEdit, x, y);
+    }
+
+    /// HERDR: S13. Return saved or Esc (or a lease) cancelled: the host keeps or restores the text.
+    fn text_edit_done(&mut self, commit: bool) {
+        self.next_ask += 1;
+        let req = VIEW_REQ_BASE + self.next_ask;
+        let op = if commit { protocol::TextEditOp::Commit } else { protocol::TextEditOp::Cancel };
+        if let Some(selector) = self.text_edit.ask(req, op) {
+            self.link.send(AppToHost::TextEdit { id: self.id.clone(), req, selector, op });
+        }
+    }
+
+    fn text_edit_answer(&mut self, req: u64, ok: bool, before: String, after: String, cx: &mut Context<Self>) {
+        use super::text_edit::Next;
+        match self.text_edit.answered(req, ok, before, after) {
+            Next::Edit => {
+                let entered = self.input.update(cx, |i, _| i.enter(Owner::TextEdit));
+                // Picking ended (or a lease came) before the host answered: put the text back.
+                if !entered {
+                    self.text_edit_done(false);
+                }
+            }
+            Next::Pin { target, before, after } => {
+                self.annotations.add_text_edit(target, &before, &after);
+            }
+            // The "only plain text" hint goes after a few seconds.
+            Next::Refused => {
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(Duration::from_secs(3)).await;
+                    let _ = this.update(cx, |v, cx| {
+                        if v.text_edit.hint == Some(super::text_edit::HINT_REFUSED) {
+                            v.text_edit.hint = None;
+                            cx.notify();
+                        }
+                    });
+                })
+                .detach();
+            }
+            Next::Nothing => {}
+        }
+        cx.notify();
+    }
+
     /// A3: an arrow key steps from the current pick to its parent, first child or a sibling.
     fn pick_step(&mut self, step: PickStep) {
         let Some(from) = self.hovered.as_ref().map(|t| t.selector.clone()) else { return };
@@ -1875,6 +1954,18 @@ impl BrowserView {
                 }
             }
             // ok false keeps the current pick.
+            // HERDR: S13. The double-clicked element: ask the host to make it editable.
+            PageAsk::TextEdit => {
+                if let Some(t) = target {
+                    self.hovered = Some(t.clone());
+                    self.text_edit.target = Some(t);
+                    self.next_ask += 1;
+                    let req = VIEW_REQ_BASE + self.next_ask;
+                    if let Some(selector) = self.text_edit.ask(req, protocol::TextEditOp::Begin) {
+                        self.link.send(AppToHost::TextEdit { id: self.id.clone(), req, selector, op: protocol::TextEditOp::Begin });
+                    }
+                }
+            }
             PageAsk::Step => {
                 if let Some(t) = target {
                     self.hovered = Some(t);
@@ -1973,6 +2064,11 @@ impl BrowserView {
         cx.notify();
     }
 
+    // HERDR: S13. What the strip says about a text edit (for tests and the chrome).
+    pub fn text_edit_hint(&self) -> Option<&'static str> {
+        self.text_edit.hint
+    }
+
     pub fn annotations(&self) -> &annotate::Annotations {
         &self.annotations
     }
@@ -2026,7 +2122,7 @@ impl BrowserView {
             picture: None,
             region: region.as_ref().map(|(anchor, r)| RegionInfo { anchor: anchor.clone(), rect: r.map(|r| (r.x, r.y, r.w, r.h)).unwrap_or_default(), detached: r.is_none() }),
             scale: 1.0,
-            untrusted: ["url", "title", "annotations.target.label", "annotations.target.selector", "annotations.target.rect", "region.anchor", "css_was"].iter().map(|s| s.to_string()).collect(),
+            untrusted: ["url", "title", "annotations.target.label", "annotations.target.selector", "annotations.target.rect", "annotations.text_edit", "region.anchor", "css_was"].iter().map(|s| s.to_string()).collect(),
         };
         self.attaching.insert(req, Attach { batch, page: page.clone(), to });
         self.link.send(AppToHost::Screenshot { id: self.id.clone(), req, path: page.to_string_lossy().into_owned() });
@@ -2285,7 +2381,8 @@ impl BrowserView {
         let state = design_bar::StripState { owner, tool: self.markup.read(cx).tool, styles_on: self.styles_on_pick, comment_on: self.comment_on_pick, count };
         let strip = design_bar::strip(&state, FIND_HEIGHT, cx, |v, a, _, cx| v.design_action(a, cx))?;
         // S27: the Send chip beside the badge, and the recipient list under it.
-        let chip = self.send_to.chip_line(&send_to_root(&self.link.config().dir), now_ms());
+        // HERDR: S13. While editing (or when an edit was refused) the strip says so.
+        let chip = self.text_edit.hint.map(str::to_owned).or_else(|| self.send_to.chip_line(&send_to_root(&self.link.config().dir), now_ms()));
         let popover = send_to::popover(&self.send_to, count, cx, |v, choice, _, cx| {
             match choice {
                 Some(t) => v.choose_recipient(&t, cx),

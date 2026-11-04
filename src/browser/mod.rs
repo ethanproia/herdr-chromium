@@ -30,6 +30,8 @@ pub mod handoff;
 pub mod inbox;
 // HERDR: part 4, S27 addressed Send (recipient popover, Queued/Read chip).
 pub mod send_to;
+// HERDR: part 4, S13 inline text edit (the view's bookkeeping).
+pub mod text_edit;
 pub mod input;
 // HERDR: part 4, site permission prompts (camera, microphone, location, clipboard).
 pub mod permissions;
