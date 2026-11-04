@@ -1,0 +1,147 @@
+#!/bin/bash
+# Installs the fork as "Herdr Labs", beside stock Herdr, which it never touches
+# (docs/fork-install.md). Stock's app, CLI link and home are only read, to copy
+# the home once on first install.
+#
+#   scripts/install-fork-macos                install or update Herdr Labs
+#   scripts/install-fork-macos --remove       quit it and move its app and CLI link to the Trash
+#   scripts/install-fork-macos --remove --purge   also move its home to the Trash
+#
+# Builds release herdr-app and the browser host bundle, unless HERDR_APP_BIN
+# (a herdr-app binary) and HERDR_HOST_APP (a herdr-browser-host.app) are given.
+# Run builds through the build slot on Ethan's Mac.
+set -euo pipefail
+
+[[ $(uname -s) == Darwin ]] || { echo 'This installer requires macOS.' >&2; exit 1; }
+here=$(cd "$(dirname "$0")/.." && pwd)
+
+name="Herdr Labs"
+bundle_id=dev.herdr.app.labs
+session=herdr-labs
+app="$HOME/Applications/$name.app"
+cli="$HOME/.local/bin/herdr-labs"
+labs_home="$HOME/.config/herdr-labs"
+stock_home="$HOME/.config/herdr-app"
+stock_app="$HOME/Applications/Herdr.app"
+stock_cli="$HOME/.local/bin/herdr-app"
+
+trash() { # move to the user's Trash under a unique name; never delete outright
+  local src=$1 dest="$HOME/.Trash/$(basename "$1") $(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$HOME/.Trash"
+  mv "$src" "$dest"
+  echo "moved $src to $dest"
+}
+
+remove() {
+  if [[ -x $cli ]]; then
+    HERDR_APP_HOME=$labs_home HC_SESSION=$session HERDR_APP_ID=$session "$cli" do app.quit >/dev/null 2>&1 || true
+  fi
+  [[ -e $app ]] && trash "$app"
+  [[ -L $cli || -e $cli ]] && trash "$cli"
+  if [[ ${1:-} == --purge && -e $labs_home ]]; then trash "$labs_home"; fi
+  echo "Herdr Labs removed. Stock Herdr was not touched."
+}
+
+if [[ ${1:-} == --remove ]]; then
+  remove "${2:-}"
+  exit 0
+fi
+
+# Never write over stock: refuse if any of our paths is one of stock's.
+for p in "$app" "$cli" "$labs_home"; do
+  case $p in "$stock_app"|"$stock_cli"|"$stock_home") echo "refusing: $p is stock Herdr's" >&2; exit 1 ;; esac
+done
+
+bin=${HERDR_APP_BIN:-}
+host=${HERDR_HOST_APP:-}
+if [[ -z $bin ]]; then
+  (cd "$here" && cargo build --release --locked)
+  bin="${CARGO_TARGET_DIR:-$here/target}/release/herdr-app"
+fi
+if [[ -z $host ]]; then
+  exe=$("$here/scripts/fork-host-bundle.sh" release)
+  host=${exe%/Contents/MacOS/*}
+fi
+[[ -x $bin ]] || { echo "no herdr-app binary at $bin" >&2; exit 1; }
+[[ -x $host/Contents/MacOS/herdr-browser-host ]] || { echo "no browser host bundle at $host" >&2; exit 1; }
+
+# Assemble beside the app, then swap it in, so a failed step never leaves half an app.
+new="$app.new"
+rm -rf "$new"
+mkdir -p "$new/Contents/MacOS" "$new/Contents/Resources" "$new/Contents/Frameworks" "$HOME/.local/bin"
+cp "$bin" "$new/Contents/MacOS/$name"
+chmod +x "$new/Contents/MacOS/$name"
+cp -R "$host" "$new/Contents/Frameworks/herdr-browser-host.app"
+cp "$here/assets/icons/Herdr.icns" "$new/Contents/Resources/Herdr.icns"
+# A copy of this script, so `herdr-labs uninstall` works after the checkout is gone.
+cp "$0" "$new/Contents/Resources/install-fork-macos"
+host_exe="$app/Contents/Frameworks/herdr-browser-host.app/Contents/MacOS/herdr-browser-host"
+
+cat > "$new/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>CFBundleExecutable</key><string>$name</string>
+    <key>CFBundleIdentifier</key><string>$bundle_id</string>
+    <key>CFBundleName</key><string>$name</string>
+    <key>CFBundleDisplayName</key><string>$name</string>
+    <key>CFBundleIconFile</key><string>Herdr</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleShortVersionString</key><string>0.0.1</string>
+    <key>CFBundleVersion</key><string>1</string>
+    <key>NSMicrophoneUsageDescription</key><string>Terminal programs running in Herdr can use the microphone, for example for voice input.</string>
+    <key>NSCameraUsageDescription</key><string>Terminal programs running in Herdr can use the camera.</string>
+    <key>NSAppleEventsUsageDescription</key><string>Terminal programs running in Herdr can use AppleScript to control other apps.</string>
+    <key>NSPrincipalClass</key><string>NSApplication</string>
+    <key>NSHighResolutionCapable</key><true/>
+    <key>LSEnvironment</key><dict/></dict></plist>
+PLIST
+# Finder launches get no shell environment: the fork's own home, core session, app id and host go in the bundle.
+pb() { /usr/libexec/PlistBuddy -c "$1" "$new/Contents/Info.plist"; }
+pb "Add :LSEnvironment:PATH string $HOME/.local/bin:/opt/homebrew/bin:$PATH"
+pb "Add :LSEnvironment:HERDR_APP_HOME string $labs_home"
+pb "Add :LSEnvironment:HC_SESSION string $session"
+pb "Add :LSEnvironment:HERDR_APP_ID string $session"
+pb "Add :LSEnvironment:HERDR_BROWSER_HOST string $host_exe"
+# Ad hoc, for this Mac only; a public build needs Developer ID, notarization and the CEF sandbox.
+codesign --force --deep --sign - "$new" >/dev/null 2>&1
+
+if [[ -e $app ]]; then trash "$app"; fi
+mv "$new" "$app"
+
+# The CLI sets the same environment, so `herdr-labs do ...` talks to Herdr Labs, never stock.
+cat > "$cli.new" <<SH
+#!/bin/sh
+export HERDR_APP_HOME='$labs_home' HC_SESSION='$session' HERDR_APP_ID='$session' HERDR_BROWSER_HOST='$host_exe'
+if [ "\${1:-}" = uninstall ]; then shift; exec '$app/Contents/Resources/install-fork-macos' --remove "\$@"; fi
+exec '$app/Contents/MacOS/$name' "\$@"
+SH
+chmod +x "$cli.new"
+mv -f "$cli.new" "$cli"
+
+# First install: a copy of stock's home (read only; sockets and layout state left out).
+if [[ ! -e $labs_home ]]; then
+  mkdir -p "$labs_home"
+  if [[ -d $stock_home ]]; then
+    rsync -a --exclude '*.sock' --exclude 'layouts/.state' --exclude 'keys.json.bak' "$stock_home/" "$labs_home/"
+  fi
+  python3 - "$labs_home/shared.json" <<'PY'
+import json, os, sys
+p = sys.argv[1]
+d = json.load(open(p)) if os.path.exists(p) else {}
+d["layout"] = "labs"
+json.dump(d, open(p, "w"), indent=2)
+PY
+  # Notepad: one copy of the stock note, never written back (a non-default home keeps notes in data/notepad).
+  if [[ -f $HOME/Notes/notepad.md ]]; then
+    mkdir -p "$labs_home/data/notepad"
+    cp "$HOME/Notes/notepad.md" "$labs_home/data/notepad/notepad.md"
+  fi
+  echo "made $labs_home from a copy of $stock_home"
+fi
+
+# FORK_INSTALL_NO_REGISTER=1 (tests on a scratch HOME) leaves LaunchServices alone.
+if [[ -z ${FORK_INSTALL_NO_REGISTER:-} ]]; then
+  /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$app" || true
+fi
+echo "Installed $app (CLI: herdr-labs). Stock Herdr was not touched. Remove with: herdr-labs uninstall"
