@@ -3966,6 +3966,8 @@ impl AppWindow {
                 .chain(self.documents.iter().filter_map(|(m, s)| s.error.as_ref().map(|e| format!("layout {}: {e}", if m.is_empty() { "local" } else { m }))))
                 .collect();
             return json!({
+                // HERDR: the fork's version line (brand.json).
+                "app": crate::brand::version_line(),
                 "zoom": round(settings::zoom()),
                 "font_size": round(settings::font_size()),
                 "ui_font_size": round(settings::ui_font_size()),
