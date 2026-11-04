@@ -91,6 +91,9 @@ impl FrameView {
         #[cfg(target_os = "macos")]
         {
             let frame = self.frame.as_ref()?;
+            if self.drawn != Some(frame.seq) {
+                super::trace::line("drawn", format_args!("seq={}", frame.seq));
+            }
             self.drawn = Some(frame.seq);
             Some(surface(frame.buffer.clone()).size_full().object_fit(ObjectFit::Fill).into_any_element())
         }
@@ -120,6 +123,7 @@ impl FrameView {
         if let (Some(stats), Some(f)) = (&mut self.stats, self.frame.as_ref().filter(|f| f.seq == seq)) {
             stats.painted(seq, f.arrived);
         }
+        super::trace::line("presented", format_args!("seq={seq}"));
         self.presented = Some(seq);
     }
 
@@ -158,6 +162,7 @@ impl FrameSink for FrameView {
         if self.frame.as_ref().is_some_and(|f| f.seq >= seq) {
             return Ok(());
         }
+        super::trace::line("arrive", format_args!("seq={seq}"));
         let imported = import(&surface)?;
         #[cfg(target_os = "macos")]
         let buffer = cv::wrap(&imported)?;
