@@ -955,8 +955,6 @@ fn module(inst: Instance, copy: u64) -> HostModule {
         .async_function("hc", |a| Ok(exec_future("hc".into(), strings(a.get(0)), None, None)))
         .function("home", |_| Ok(home().to_string_lossy().into_owned().into()))
         .function("appHome", |_| Ok(app_dir().to_string_lossy().into_owned().into()))
-        // HERDR: the fork's build (name, versions, sha, bundled mod pins); mods feature-detect it.
-        .function("appInfo", |_| Ok(to_host(&crate::brand::app_info())))
         .function("fonts", |_| Ok(to_host(&json!(*FONTS.lock().unwrap()))))
         .function("updates", |_| Ok(to_host(&crate::update::status())))
         .function("presentUpdateNotes", |a| {
