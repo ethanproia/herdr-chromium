@@ -476,10 +476,32 @@ wrap_life_span_handler! {
 
         fn on_before_close(&self, _browser: Option<&mut Browser>) {
             super::OPEN.set(super::OPEN.get().saturating_sub(1));
+            super::on_closed(&self.id);
         }
 
-        fn on_before_popup(&self, _browser: Option<&mut Browser>, _frame: Option<&mut Frame>, _popup_id: ::std::os::raw::c_int, target_url: Option<&CefString>, _target_frame_name: Option<&CefString>, target_disposition: WindowOpenDisposition, _user_gesture: ::std::os::raw::c_int, _popup_features: Option<&PopupFeatures>, _window_info: Option<&mut WindowInfo>, _client: Option<&mut Option<Client>>, _settings: Option<&mut BrowserSettings>, _extra_info: Option<&mut Option<DictionaryValue>>, _no_javascript_access: Option<&mut ::std::os::raw::c_int>) -> ::std::os::raw::c_int {
+        // A real popup (window.open with features, after a click) is made by CEF itself, off-screen
+        // like a block, so window.opener, postMessage and window.close work and it shares the
+        // opener's profile; the app shows it over the opener. One without a click is refused.
+        // Tabs, `_blank` and the rest stay the app's (a new block).
+        fn on_before_popup(&self, _browser: Option<&mut Browser>, _frame: Option<&mut Frame>, _popup_id: ::std::os::raw::c_int, target_url: Option<&CefString>, _target_frame_name: Option<&CefString>, target_disposition: WindowOpenDisposition, user_gesture: ::std::os::raw::c_int, popup_features: Option<&PopupFeatures>, window_info: Option<&mut WindowInfo>, client: Option<&mut Option<Client>>, settings: Option<&mut BrowserSettings>, _extra_info: Option<&mut Option<DictionaryValue>>, _no_javascript_access: Option<&mut ::std::os::raw::c_int>) -> ::std::os::raw::c_int {
             let disposition = disposition_name(&target_disposition);
+            if disposition == "new_popup" {
+                if user_gesture == 0 {
+                    send(HostToApp::PopupBlocked { id: self.id.clone(), url: s(target_url) });
+                    return 1;
+                }
+                let (w, h) = popup_features.map_or((None, None), |f| ((f.width_set != 0).then_some(f.width as f32), (f.height_set != 0).then_some(f.height as f32)));
+                if let (Some(info), Some(client), Some(settings)) = (window_info, client, settings)
+                    && let Some(id) = super::adopt_popup(&self.id, w, h)
+                {
+                    *info = WindowInfo { windowless_rendering_enabled: 1, shared_texture_enabled: 1, ..Default::default() };
+                    *client = Some(client_for(&id));
+                    settings.windowless_frame_rate = 60;
+                    send(HostToApp::PopupOpened { opener: self.id.clone(), id, url: s(target_url), w, h });
+                    return 0;
+                }
+                return 1;
+            }
             send(HostToApp::NewWindow { id: self.id.clone(), url: s(target_url), disposition: disposition.into() });
             1 // the app decides; CEF never opens its own window
         }
@@ -908,6 +930,11 @@ wrap_dev_tools_message_observer! {
 
 pub fn devtools_observer(id: &str) -> DevToolsMessageObserver {
     DevToolsTarget::new(id.to_string())
+}
+
+/// `client` under another name, for callbacks whose parameter is called `client`.
+fn client_for(id: &str) -> Client {
+    client(id)
 }
 
 /// A client for browser `id`: every callback it gets is tagged with that id.

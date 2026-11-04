@@ -541,6 +541,9 @@ fn target(msg: &HostToApp) -> Option<&BrowserId> {
         | H::FileChooser { id, .. }
         | H::Dialog { id, .. }
         | H::Permission { id, .. }
+        | H::PopupClosed { id, .. }
+        | H::PopupBlocked { id, .. }
+        | H::PopupOpened { opener: id, .. }
         | H::ImeCaret { id, .. }
         | H::FindResult { id, .. }
         | H::Console { id, .. }
