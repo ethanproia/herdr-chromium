@@ -83,6 +83,11 @@ path = "tests/browser_shot_mask.rs"
 harness = false
 
 [[test]]
+name = "browser_popups_cef"
+path = "tests/browser_popups_cef.rs"
+harness = false
+
+[[test]]
 name = "browser_popups"
 path = "tests/browser_popups.rs"
 harness = false
