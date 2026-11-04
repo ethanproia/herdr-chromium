@@ -14,6 +14,8 @@ mod pane_size;
 mod titlebar;
 // HERDR: toasts as a Sonner-style deck.
 mod toasts;
+// HERDR: the welcome when no space is open.
+mod welcome;
 
 use crate::layout::{Axis, Background as Paint, Content, Fit, HeaderContent, Kind, Line, Node, PaneFrame, Size as Span};
 use crate::model::{self, Tab, Model};
@@ -498,6 +500,9 @@ pub struct AppWindow {
     /// What's waiting, in words (`update_label`).
     update_ready: Option<String>,
     update_dismissed: Option<String>,
+    /// HERDR: when the main area started waiting for this computer's spaces (the welcome's clock).
+    welcome_loading_since: RefCell<Option<Instant>>,
+    welcome_timeout_drawn: std::cell::Cell<bool>,
     /// HERDR: the bell's history (src/notifications.rs); saved from the poll when it changed.
     notes: crate::notifications::Store,
     /// HERDR: the history file was read (once, when settings first load with `history` on).
@@ -598,6 +603,8 @@ impl AppWindow {
             polls: 0,
             update_ready: None,
             update_dismissed: None,
+            welcome_loading_since: RefCell::default(),
+            welcome_timeout_drawn: Default::default(),
             // Loaded with the person's settings (reload_config), not before: `history: false` reads nothing.
             notes: crate::notifications::Store::default(),
             notes_loaded: false,
@@ -4082,6 +4089,7 @@ impl AppWindow {
         }
         // HERDR: the bell's history is written at most once a poll; `history: false` keeps it in memory.
         self.flush_notes();
+        self.tick_welcome(cx);
         let now = Instant::now();
         // HERDR: toasts wait while the pointer is over the deck; a timed-out one fades, then goes.
         if self.deck_hover.is_none() {
@@ -4364,18 +4372,8 @@ impl AppWindow {
             },
             Content::Context { .. } => match self.model.active_tab() {
                 Some(c) => self.render_node(c.shown(), focused, self.pane_frame(), cx),
-                None if self.documents.get("").is_some_and(|s| s.layout() == "loading") => div().size_full().into_any_element(),
-                None => {
-                    let key = crate::keys::listing().into_iter().find(|(_, _, a)| a == "space.new").map(|(_, k, _)| format!(" ({k})"));
-                    div()
-                        .size_full()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_color(c("dim"))
-                        .child(format!("No space open. Make one{}.", key.unwrap_or_default()))
-                        .into_any_element()
-                }
+                // HERDR: a welcome (and a loading state that times out with a reason), not a blank area.
+                None => self.render_welcome(cx),
             },
         }
     }
