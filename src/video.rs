@@ -1,12 +1,14 @@
 //! HERDR: mods' `video(path, options)` (the element is gpui-shell's; this plays it).
 //!
-//! A clip is keyed by its element's `.id()` (window-wide: prefix it with the mod's name). Until it
+//! A clip is keyed by the mod copy that draws it and its element's `.id()`. Until it
 //! plays it is a still: the first frame (or the frame at the last seek), decoded once, so 50 idle
 //! clips cost about 50 images and hold no player. Playing makes a player; pausing, ending or
 //! leaving the screen releases it and keeps the last frame as the still. At most `MAX_PLAYING`
-//! play at once (the longest playing pauses). A clip whose element stops painting (its mod closed,
-//! or it left the layout) is dropped after `GONE`. Paths follow `image`'s rule: inside the app
-//! directory (`gpui_shell::AppAssets::checked_path`).
+//! play at once (the longest playing pauses); a playing clip outside its window's visible area for
+//! `OFFSCREEN` pauses. A clip that stops rendering (its mod closed, or it left the layout) is
+//! dropped after `GONE` while it holds a player, or `GONE_IDLE` as a still (a cached view may skip
+//! renders while it stays on screen). Paths follow `image`'s rule: inside the app directory
+//! (`gpui_shell::AppAssets::checked_path`).
 //!
 //! Mods drive clips with herdr's `videoPlay(id)`, `videoPause(id)`, `videoSeek(id, seconds)` and
 //! read `nextVideoEvent(id)`: `{id, type, time, duration, error?}` with type `ready`, `time` (4 a
@@ -23,8 +25,10 @@ use std::time::{Duration, Instant};
 pub const MAX_PLAYING: usize = 4;
 /// A playing clip not on screen this long pauses.
 pub const OFFSCREEN: Duration = Duration::from_secs(1);
-/// A clip whose element has not painted this long is dropped (player, still and all).
+/// A clip with a player that has not rendered this long is dropped (player, still and all).
 pub const GONE: Duration = Duration::from_secs(3);
+/// A still (no player) that has not rendered this long is dropped.
+pub const GONE_IDLE: Duration = Duration::from_secs(60);
 /// How often `time` events go out while playing.
 const TIME_EVERY: Duration = Duration::from_millis(250);
 /// Events kept per clip for a slow reader; older ones are dropped.
@@ -34,6 +38,8 @@ mod backend;
 pub use backend::{Backend, PlayerState};
 
 struct Clip<P, Pic> {
+    /// The script's `.id()` (events carry it; the map key adds the mod copy).
+    name: String,
     spec: VideoSpec,
     /// Where the player is (or would start).
     time: f64,
@@ -43,10 +49,13 @@ struct Clip<P, Pic> {
     player: Option<P>,
     started: Option<Instant>,
     autoplayed: bool,
-    painted: Instant,
-    visible: Instant,
+    rendered: Instant,
+    /// Last seen inside the window's visible area (layout says so, not a guess).
+    visible: Option<Instant>,
     last_time_event: Option<Instant>,
     ready_sent: bool,
+    /// This clip's events; dropping the clip closes them (waiting readers get an error).
+    events: (async_channel::Sender<Value>, async_channel::Receiver<Value>),
 }
 
 /// All clips of this process, on GPUI's main thread.
@@ -54,71 +63,72 @@ pub struct Clips<B: Backend> {
     backend: B,
     root: std::path::PathBuf,
     clips: HashMap<String, Clip<B::Player, B::Picture>>,
-    events: HashMap<String, (async_channel::Sender<Value>, async_channel::Receiver<Value>)>,
+}
+
+/// The map key of clip `id` drawn by the mod copy `scope`.
+pub fn key(scope: usize, id: &str) -> String {
+    format!("{scope}/{id}")
 }
 
 impl<B: Backend> Clips<B> {
     pub fn new(backend: B, root: std::path::PathBuf) -> Self {
-        Self { backend, root, clips: HashMap::new(), events: HashMap::new() }
-    }
-
-    fn channel(&mut self, id: &str) -> &(async_channel::Sender<Value>, async_channel::Receiver<Value>) {
-        self.events.entry(id.to_owned()).or_insert_with(|| async_channel::bounded(EVENTS_KEPT))
+        Self { backend, root, clips: HashMap::new() }
     }
 
     fn emit(&mut self, id: &str, kind: &str, error: Option<&str>) {
-        let (time, duration) = self.clips.get(id).map_or((0.0, None), |c| (c.time, c.duration));
-        let mut e = json!({ "id": id, "type": kind, "time": time, "duration": duration });
+        let Some(clip) = self.clips.get(id) else { return };
+        let mut e = json!({ "id": clip.name, "type": kind, "time": clip.time, "duration": clip.duration });
         if let Some(error) = error {
             e["error"] = json!(error);
         }
-        let (tx, rx) = self.channel(id).clone();
+        let (tx, rx) = &clip.events;
         if tx.is_full() {
             let _ = rx.try_recv();
         }
         let _ = tx.try_send(e);
     }
 
-    /// The next event of clip `id` (for `nextVideoEvent`).
-    pub fn events_of(&mut self, id: &str) -> async_channel::Receiver<Value> {
-        self.channel(id).1.clone()
+    /// The events of clip `id` (for `nextVideoEvent`); None when no such clip is on screen.
+    pub fn events_of(&self, id: &str) -> Option<async_channel::Receiver<Value>> {
+        self.clips.get(id).map(|c| c.events.1.clone())
     }
 
     fn path(&self, spec: &VideoSpec) -> Result<std::path::PathBuf, String> {
         gpui_shell::AppAssets::new(self.root.clone()).checked_path(&spec.path).map_err(|e| format!("{e:#}"))
     }
 
-    /// The element painted this frame (`visible`: inside the window's content mask). Makes the clip
-    /// and its still on first sight, starts autoplay, and returns the picture to show.
-    pub fn painted(&mut self, id: &str, spec: &VideoSpec, visible: bool, now: Instant) -> Option<B::Picture> {
+    /// The element rendered this frame (clip `id` named `name` by its script). Makes the clip and its
+    /// still on first sight (a new path replaces the clip, closing its events), advances a playing
+    /// one, and returns the picture to show.
+    pub fn rendered(&mut self, id: &str, name: &str, spec: &VideoSpec, now: Instant) -> Option<B::Picture> {
         let fresh = self.clips.get(id).is_none_or(|c| c.spec.path != spec.path);
         if fresh {
-            if let Some(old) = self.clips.remove(id) {
-                drop(old);
+            // Dropping the old clip closes its events and releases its player.
+            self.clips.remove(id);
+            let still = self.path(spec).and_then(|p| self.backend.still(&p, 0.0));
+            self.clips.insert(id.to_owned(), Clip::new(name, spec.clone(), still.as_ref().ok().cloned(), now));
+            if let Err(e) = still {
+                self.emit(id, "error", Some(&e));
+                return None;
             }
-            let still = match self.path(spec).and_then(|p| self.backend.still(&p, 0.0)) {
-                Ok(s) => Some(s),
-                Err(e) => {
-                    self.clips.insert(id.to_owned(), Clip::new(spec.clone(), None, now));
-                    self.emit(id, "error", Some(&e));
-                    return None;
-                }
-            };
-            self.clips.insert(id.to_owned(), Clip::new(spec.clone(), still, now));
         }
         let clip = self.clips.get_mut(id).expect("made above");
         clip.spec = spec.clone();
-        clip.painted = now;
-        if visible {
-            clip.visible = now;
-        }
-        if spec.autoplay && !clip.autoplayed && visible {
-            clip.autoplayed = true;
-            let _ = self.play(id, now);
-        }
+        clip.rendered = now;
         self.advance(id, now);
         let clip = self.clips.get(id)?;
         clip.still.clone()
+    }
+
+    /// Layout placed clip `id` inside its window's visible area this frame. Autoplay starts here, on
+    /// the first sighting, never on a guess.
+    pub fn seen(&mut self, id: &str, now: Instant) {
+        let Some(clip) = self.clips.get_mut(id) else { return };
+        clip.visible = Some(now);
+        if clip.spec.autoplay && !clip.autoplayed {
+            clip.autoplayed = true;
+            let _ = self.play(id, now);
+        }
     }
 
     /// Playing, position and length of clip `id` (the controls bar shows these).
@@ -126,13 +136,14 @@ impl<B: Backend> Clips<B> {
         self.clips.get(id).map(|c| (c.player.is_some(), c.time, c.duration))
     }
 
-    /// Whether any clip is playing (the window keeps drawing frames while one is).
+    /// Whether any clip is playing.
+    #[cfg(test)]
     pub fn any_playing(&self) -> bool {
         self.clips.values().any(|c| c.player.is_some())
     }
 
     pub fn play(&mut self, id: &str, now: Instant) -> Result<(), String> {
-        let Some(clip) = self.clips.get(id) else { return Err(format!("no video {id:?} on screen")) };
+        let Some(clip) = self.clips.get(id) else { return Err(format!("no video {:?} on screen", id.split_once('/').map_or(id, |(_, n)| n))) };
         if clip.player.is_some() {
             return Ok(());
         }
@@ -171,7 +182,7 @@ impl<B: Backend> Clips<B> {
 
     pub fn seek(&mut self, id: &str, to: f64) -> Result<(), String> {
         let to = to.max(0.0);
-        let path = { let clip = self.clips.get(id).ok_or_else(|| format!("no video {id:?} on screen"))?; self.path(&clip.spec)? };
+        let path = { let clip = self.clips.get(id).ok_or_else(|| format!("no video {:?} on screen", id.split_once('/').map_or(id, |(_, n)| n)))?; self.path(&clip.spec)? };
         let clip = self.clips.get_mut(id).expect("checked above");
         let to = clip.duration.map_or(to, |d| to.min(d));
         clip.time = to;
@@ -232,16 +243,20 @@ impl<B: Backend> Clips<B> {
         }
     }
 
-    /// Off screen too long: pause. Not painted too long (its mod closed): drop it entirely.
+    /// Off screen too long: pause. Not rendered too long (its mod closed): drop it entirely, which
+    /// releases its player and closes its events.
     pub fn sweep(&mut self, now: Instant) {
-        let offscreen: Vec<String> = self.clips.iter().filter(|(_, c)| c.player.is_some() && now.duration_since(c.visible) >= OFFSCREEN).map(|(k, _)| k.clone()).collect();
+        // Gone first: a closed mod's playing clips go with their players, before the pause below
+        // would turn them into stills that wait GONE_IDLE.
+        self.clips.retain(|_, c| now.duration_since(c.rendered) < if c.player.is_some() { GONE } else { GONE_IDLE });
+        let offscreen: Vec<String> = self
+            .clips
+            .iter()
+            .filter(|(_, c)| c.player.is_some() && c.visible.or(c.started).is_none_or(|v| now.duration_since(v) >= OFFSCREEN))
+            .map(|(k, _)| k.clone())
+            .collect();
         for id in offscreen {
             self.pause(&id);
-        }
-        let gone: Vec<String> = self.clips.iter().filter(|(_, c)| now.duration_since(c.painted) >= GONE).map(|(k, _)| k.clone()).collect();
-        for id in gone {
-            self.clips.remove(&id);
-            self.events.remove(&id);
         }
     }
 
@@ -254,12 +269,33 @@ impl<B: Backend> Clips<B> {
 }
 
 impl<P, Pic> Clip<P, Pic> {
-    fn new(spec: VideoSpec, still: Option<Pic>, now: Instant) -> Self {
-        Self { spec, time: 0.0, duration: None, still, player: None, started: None, autoplayed: false, painted: now, visible: now, last_time_event: None, ready_sent: false }
+    fn new(name: &str, spec: VideoSpec, still: Option<Pic>, now: Instant) -> Self {
+        Self {
+            name: name.to_owned(),
+            spec,
+            time: 0.0,
+            duration: None,
+            still,
+            player: None,
+            started: None,
+            autoplayed: false,
+            rendered: now,
+            visible: None,
+            last_time_event: None,
+            ready_sent: false,
+            events: async_channel::bounded(EVENTS_KEPT),
+        }
     }
 }
 
 // --- The app's clips, the element and herdr's functions --------------------------------------
+
+/// Where a backend's clips live and how its pictures are shown: the app's AVFoundation clips, or a
+/// test's fake ones (the element and its frame loop are the same either way).
+pub trait Host: Backend + Sized + 'static {
+    fn with<R>(f: impl FnOnce(&mut Clips<Self>) -> R) -> R;
+    fn show(picture: Self::Picture) -> AnyElement;
+}
 
 #[cfg(target_os = "macos")]
 type Native = mac::AvFoundation;
@@ -271,58 +307,57 @@ thread_local! {
     static SWEEPING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-fn with_clips<R>(f: impl FnOnce(&mut Clips<Native>) -> R) -> R {
-    CLIPS.with_borrow_mut(|c| f(c.get_or_insert_with(|| Clips::new(Native::default(), crate::mods::app_dir()))))
+impl Host for Native {
+    fn with<R>(f: impl FnOnce(&mut Clips<Self>) -> R) -> R {
+        CLIPS.with_borrow_mut(|c| f(c.get_or_insert_with(|| Clips::new(Native::default(), crate::mods::app_dir()))))
+    }
+    #[cfg(target_os = "macos")]
+    fn show(picture: Self::Picture) -> AnyElement {
+        gpui::surface(picture).absolute().size_full().object_fit(ObjectFit::Contain).into_any_element()
+    }
+    #[cfg(not(target_os = "macos"))]
+    fn show(_: ()) -> AnyElement {
+        let _ = ObjectFit::Contain;
+        div().into_any_element()
+    }
 }
 
 /// Installs the renderer (before any window draws).
 pub fn install() {
-    gpui_shell::video::set_renderer(render);
+    gpui_shell::video::set_renderer(|spec, element, key, scope, refinement, window, cx| render::<Native>(spec, element, key, scope, refinement, window, cx));
 }
 
-fn render(spec: &VideoSpec, element: ElementId, key: Option<SharedString>, refinement: StyleRefinement, window: &mut Window, cx: &mut App) -> AnyElement {
-    let id = key.map(|k| k.to_string()).unwrap_or_else(|| spec.path.clone());
+fn render<H: Host>(spec: &VideoSpec, element: ElementId, key: Option<SharedString>, scope: usize, refinement: StyleRefinement, window: &mut Window, cx: &mut App) -> AnyElement {
+    let name = key.map(|k| k.to_string()).unwrap_or_else(|| spec.path.clone());
+    let id = self::key(scope, &name);
     if !SWEEPING.get() {
         SWEEPING.set(true);
         cx.spawn(async move |cx| loop {
             cx.background_executor().timer(Duration::from_millis(500)).await;
-            cx.update(|_| with_clips(|c| c.sweep(Instant::now())));
+            cx.update(|_| H::with(|c| c.sweep(Instant::now())));
         })
         .detach();
     }
-    let visible = std::rc::Rc::new(std::cell::Cell::new(false));
-    // Shown last frame: what the clip had; this frame's visibility counts from the next paint.
-    let picture = with_clips(|c| {
-        let was_visible = c.clips.get(&id).is_none_or(|clip| Instant::now().duration_since(clip.visible) < OFFSCREEN);
-        c.painted(&id, spec, was_visible, Instant::now())
-    });
-    if with_clips(|c| c.any_playing()) {
-        // Frames come from the player on each draw.
-        window.refresh();
+    let picture = H::with(|c| c.rendered(&id, &name, spec, Instant::now()));
+    if H::with(|c| c.status(&id).is_some_and(|(playing, _, _)| playing)) {
+        // A playing clip renders again next frame (its view, not a refresh: a refresh during a
+        // draw is dropped), pulling the next picture, time and end on its own.
+        window.request_animation_frame();
     }
     let mut el = div().id(element).relative();
     el.style().refine(&refinement);
-    #[cfg(target_os = "macos")]
     if let Some(p) = picture {
-        el = el.child(gpui::surface(p).absolute().size_full().object_fit(ObjectFit::Contain));
+        el = el.child(H::show(p));
     }
-    #[cfg(not(target_os = "macos"))]
-    let _ = (picture, ObjectFit::Contain);
     if spec.controls {
-        el = el.child(controls(&id));
+        el = el.child(controls::<H>(&id));
     }
     let probe_id = id.clone();
     el.child(
         canvas(
             move |bounds, window, _| {
-                let mask = window.content_mask().bounds;
-                visible.set(mask.intersects(&bounds));
-                if visible.get() {
-                    with_clips(|c| {
-                        if let Some(clip) = c.clips.get_mut(&probe_id) {
-                            clip.visible = Instant::now();
-                        }
-                    });
+                if window.content_mask().bounds.intersects(&bounds) {
+                    H::with(|c| c.seen(&probe_id, Instant::now()));
                 }
             },
             |_, _, _, _| {},
@@ -335,14 +370,14 @@ fn render(spec: &VideoSpec, element: ElementId, key: Option<SharedString>, refin
 
 /// `controls: true`: a bar along the bottom with play/pause, a scrub track (click or drag to seek)
 /// and the time. It drives the clip the way `videoPlay` / `videoPause` / `videoSeek` do.
-fn controls(id: &str) -> AnyElement {
+fn controls<H: Host>(id: &str) -> AnyElement {
     use gpui::{MouseButton, Pixels, hsla, px, relative};
-    let Some((playing, time, duration)) = with_clips(|c| c.status(id)) else { return div().into_any_element() };
+    let Some((playing, time, duration)) = H::with(|c| c.status(id)) else { return div().into_any_element() };
     let track = std::rc::Rc::new(std::cell::Cell::new(gpui::Bounds::<Pixels>::default()));
     let (toggle, down) = (id.to_owned(), id.to_owned());
     let seek_at = std::rc::Rc::new(move |id: &str, x: Pixels, bounds: gpui::Bounds<Pixels>| {
         if let Some(d) = duration {
-            let _ = with_clips(|c| c.seek(id, fraction_at(f32::from(x), f32::from(bounds.origin.x), f32::from(bounds.size.width)) * d));
+            let _ = H::with(|c| c.seek(id, fraction_at(f32::from(x), f32::from(bounds.origin.x), f32::from(bounds.size.width)) * d));
         }
     });
     let (seek_down, seek_drag) = (seek_at.clone(), seek_at);
@@ -370,7 +405,7 @@ fn controls(id: &str) -> AnyElement {
                 .child(if playing { "❚❚" } else { "▶" })
                 .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                     cx.stop_propagation();
-                    with_clips(|c| if playing { c.pause(&toggle) } else { let _ = c.play(&toggle, Instant::now()); });
+                    H::with(|c| if playing { c.pause(&toggle) } else { let _ = c.play(&toggle, Instant::now()); });
                     window.refresh();
                 }),
         )
@@ -461,29 +496,37 @@ fn clock(seconds: f64) -> String {
     if s >= 3600 { format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60) } else { format!("{}:{:02}", s / 60, s % 60) }
 }
 
-/// herdr's `videoPlay`, `videoPause`, `videoSeek`, `nextVideoEvent`.
+/// herdr's `videoPlay`, `videoPause`, `videoSeek`, `nextVideoEvent`: each acts on the clip with that
+/// `.id()` drawn by the calling mod copy, and redraws its window.
 pub fn functions(module: gpui_shell::HostModule) -> gpui_shell::HostModule {
     use gpui_shell::{HostError, HostValue};
+    fn clip(a: &gpui_shell::HostArguments) -> Result<String, HostError> {
+        let scope = gpui_shell::video::current_scope().ok_or_else(|| HostError::new("video functions are for mods"))?;
+        Ok(key(scope, a.string(0)?))
+    }
     module
         .function("videoPlay", |a| {
-            let id = a.string(0)?.to_owned();
-            with_clips(|c| c.play(&id, Instant::now())).map_err(HostError::new)?;
+            let id = clip(a)?;
+            Native::with(|c| c.play(&id, Instant::now())).map_err(HostError::new)?;
+            gpui_shell::video::invalidate_current();
             Ok(HostValue::Null)
         })
         .function("videoPause", |a| {
-            let id = a.string(0)?.to_owned();
-            with_clips(|c| c.pause(&id));
+            let id = clip(a)?;
+            Native::with(|c| c.pause(&id));
+            gpui_shell::video::invalidate_current();
             Ok(HostValue::Null)
         })
         .function("videoSeek", |a| {
-            let id = a.string(0)?.to_owned();
-            let to = a.number(1)?;
-            with_clips(|c| c.seek(&id, to)).map_err(HostError::new)?;
+            let (id, to) = (clip(a)?, a.number(1)?);
+            Native::with(|c| c.seek(&id, to)).map_err(HostError::new)?;
+            gpui_shell::video::invalidate_current();
             Ok(HostValue::Null)
         })
         .async_function("nextVideoEvent", |a| {
-            let id = a.string(0)?.to_owned();
-            let rx = with_clips(|c| c.events_of(&id));
+            let id = clip(a)?;
+            let name = a.string(0)?.to_owned();
+            let rx = Native::with(|c| c.events_of(&id)).ok_or_else(|| HostError::new(format!("no video {name:?} on screen")))?;
             Ok(async move { rx.recv().await.map(|e| crate::mods::to_host(&e)).map_err(|_| HostError::new("the video is gone")) })
         })
 }
