@@ -1739,6 +1739,11 @@ impl BrowserView {
         cx.notify();
     }
 
+    /// Whether the shield's grants panel is open.
+    pub fn shield_open(&self) -> bool {
+        self.shield_open
+    }
+
     pub fn toggle_shield(&mut self, cx: &mut Context<Self>) {
         self.shield_open = !self.shield_open;
         cx.notify();
@@ -2886,9 +2891,14 @@ impl BrowserView {
                     .px_1()
                     .rounded_sm()
                     .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .gap_1()
                     .when(granted, |d| d.bg(rgb(0x0a84ff)).text_color(rgb(0xffffff)))
                     .when(!granted, |d| d.hover(|d| d.bg(hsla(0., 0., 0.5, 0.15))))
-                    .child(if driving { "🛡 Agent" } else { "🛡" })
+                    // Drawn, not an emoji: it shows whatever the fonts, display or theme.
+                    .child(shield_icon(if granted { SHIELD_ON } else { SHIELD_OFF }))
+                    .when(driving, |d| d.child("Agent"))
                     .on_click(cx.listener(|v, _, _, cx| v.toggle_shield(cx)))
             })
     }
@@ -3231,6 +3241,36 @@ pub fn broker_authorizer(agent: Arc<Mutex<Agent>>, states: Arc<Mutex<HashMap<Bro
 
 /// Room for the device label and its gap above the letterboxed frame (DIPs).
 const DEVICE_LABEL_SPACE: f32 = 24.0;
+
+/// The shield's colours: white on the blue tile while a grant is on, mid-gray (seen on light
+/// and dark bars) while none is.
+pub const SHIELD_ON: u32 = 0xffffff;
+pub const SHIELD_OFF: u32 = 0x8e8e93;
+
+/// S29's shield, drawn as a filled path (12×14 DIPs): no font or emoji needed.
+fn shield_icon(color: u32) -> impl IntoElement {
+    canvas(
+        |_, _, _| (),
+        move |b: Bounds<Pixels>, _, window, _| {
+            let (x, y, w, h) = (b.origin.x, b.origin.y, b.size.width, b.size.height);
+            let p = |fx: f32, fy: f32| point(x + w * fx, y + h * fy);
+            let mut path = PathBuilder::fill();
+            path.move_to(p(0.5, 0.0));
+            path.line_to(p(1.0, 0.16));
+            path.line_to(p(1.0, 0.5));
+            path.curve_to(p(0.5, 1.0), p(1.0, 0.84));
+            path.curve_to(p(0.0, 0.5), p(0.0, 0.84));
+            path.line_to(p(0.0, 0.16));
+            path.close();
+            if let Ok(path) = path.build() {
+                window.paint_path(path, rgb(color));
+            }
+        },
+    )
+    .flex_none()
+    .w(px(12.))
+    .h(px(14.))
+}
 
 /// Set while `herdr-app shot` renders the window: blocks marked sensitive draw a cover instead of the page.
 pub static SHOT_MASK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
