@@ -95,19 +95,19 @@
     "preview": "projects/herdr-mods/clones/mac/layouts/labs.svg"
   },
   "stock": {
-    "agents": "09c89201c4a39944",
+    "agents": "b0e2d92fafb0f91e",
     "changes": "87b5c7bf576cab0e",
     "confirm": "c3c5e99c42bfb7c2",
-    "files": "5c8f8f5dbb56984a",
+    "files": "114b0daefa620292",
     "help": "bda54340f8f99a4f",
-    "machine-add": "94ba64971e67cb5e",
+    "machine-add": "fc0d3c7283eb6b86",
     "menu": "b306b52329864d0e",
     "new-menu": "26c2c996b53c6d4c",
     "pane": "4af182fe5751a96d",
     "peek": "dcb2cca951488605",
     "picker": "d5183ad58247fe3a",
     "prompt": "f69767163714eba3",
-    "spaces": "607b6c0651b5591a",
+    "spaces": "408da9a61185a792",
     "tabs": "2bfd3d2c54497c52",
     "terminals-bar": "2959e52e89528b33",
     "terminals-pane": "b049ae39286a0a89",
@@ -115,6 +115,6 @@
     "win98": "f12f2010539e0996",
     "workspace-chrome": "cf1673749eee9578",
     "workspace-status": "39244abc10f76527",
-    "worktree": "dc989d09e30827a2"
+    "worktree": "19e431504e4d75bd"
   }
 }
