@@ -1383,7 +1383,8 @@ fn write_png(s: &Surface, path: &Path) -> Result<(), String> {
     for p in rgba.chunks_exact_mut(4) {
         p.swap(0, 2);
     }
-    let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
+    // A new file only: never truncate one that exists, never follow a symlink at the path (O_EXCL).
+    let file = std::fs::OpenOptions::new().write(true).create_new(true).open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut enc = png::Encoder::new(io::BufWriter::new(file), px.w, px.h);
     enc.set_color(png::ColorType::Rgba);
     enc.set_depth(png::BitDepth::Eight);

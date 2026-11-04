@@ -196,10 +196,17 @@ impl Agent {
                 None => reply(Err("browser.eval needs expr".into())),
             },
             "browser.screenshot" => {
-                let path = arg(a, "path").map(PathBuf::from).unwrap_or_else(|| self.cdp.dir.join("shots").join(format!("{id}-{}.png", now_ms())));
-                if let Some(dir) = path.parent() {
-                    let _ = std::fs::create_dir_all(dir);
-                }
+                // Agent captures land only in the app's shots dir, as new files (the host opens them O_EXCL):
+                // a caller's `path` is just a file name there, never a path elsewhere to write or truncate.
+                let shots = self.cdp.dir.join("shots");
+                let path = match shot_path(&shots, arg(a, "path"), &id) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        reply(Err(e));
+                        return Step::Done;
+                    }
+                };
+                let _ = std::fs::create_dir_all(&shots);
                 let path = path.to_string_lossy().into_owned();
                 let req = self.park(&id, Op::Screenshot, Box::new({
                     let path = path.clone();
@@ -622,11 +629,28 @@ pub fn canonical_profile(name: &str) -> String {
     }
 }
 
+/// Where an agent's screenshot goes: an app-made name in `shots`, or the caller's plain file name there
+/// (`name.png`; a name that already exists is refused by the host). Any other path is refused.
+fn shot_path(shots: &Path, asked: Option<&str>, id: &BrowserId) -> Result<PathBuf, String> {
+    let Some(asked) = asked else { return Ok(shots.join(format!("{id}-{}.png", now_ms()))) };
+    let p = Path::new(asked);
+    let name = match (p.parent(), p.file_name().and_then(|n| n.to_str())) {
+        // A bare name, or a path whose folder is the shots dir itself.
+        (Some(dir), Some(n)) if dir.as_os_str().is_empty() || dir == shots => n,
+        _ => return Err(format!("browser.screenshot: path must be a file name in {}; leave it out for one made for you", shots.display())),
+    };
+    if name.starts_with('.') || !name.ends_with(".png") || name.contains(['/', '\\']) {
+        return Err("browser.screenshot: path must be a plain .png file name".into());
+    }
+    Ok(shots.join(name))
+}
+
 pub fn needs(name: &str, a: &Value, sensitive: bool) -> Vec<Grant> {
     let named_point = a.get("x").is_some() && a.get("y").is_some();
     match name {
         "browser.pick" if !named_point => vec![],
-        "browser.screenshot" if sensitive => vec![Grant::Control, Grant::Capture],
+        // A pick at a point the agent names returns a screenshot crop: the same rule as a screenshot.
+        "browser.screenshot" | "browser.pick" if sensitive => vec![Grant::Control, Grant::Capture],
         _ => vec![Grant::Control],
     }
 }
@@ -1177,6 +1201,40 @@ mod tests {
         assert_eq!(run(&mut a, &reg, "browser.screenshot", json!({})), None, "parked for the host");
         // annotations is not per-block: never gated.
         assert!(!matches!(run(&mut a, &reg, "browser.annotations", json!({})), Some(Err(e)) if e.contains("hasn't allowed")));
+    }
+
+    // HERDR: a pick at a point the agent names is a screenshot crop: on a sensitive page it needs Capture
+    // like a screenshot, with Control alone refused; the person's own pick (no point) stays theirs to share.
+    #[test]
+    fn an_agent_named_pick_on_a_sensitive_page_needs_capture() {
+        let (_d, mut a) = agent();
+        let reg = reg();
+        a.grants.set(&"b1".into(), Grant::Sensitive, true);
+        a.grants.set(&"b1".into(), Grant::Control, true);
+        let r = run(&mut a, &reg, "browser.pick", json!({ "x": 5, "y": 5 }));
+        assert!(r.unwrap().unwrap_err().contains("sensitive"), "Control alone must not capture a sensitive page");
+        assert!(sent(&reg).is_empty(), "nothing reaches the host");
+        a.grants.set(&"b1".into(), Grant::Capture, true);
+        assert!(!matches!(run(&mut a, &reg, "browser.pick", json!({ "x": 5, "y": 5 })), Some(Err(_))), "with Capture it goes ahead");
+    }
+
+    // HERDR: agent screenshots only go to new files in the app's shots dir.
+    #[test]
+    fn screenshot_paths_stay_in_the_shots_dir() {
+        let shots = Path::new("/app/browser/shots");
+        let id: BrowserId = "b1".into();
+        assert!(shot_path(shots, None, &id).unwrap().starts_with(shots), "no path: an app-made name there");
+        assert_eq!(shot_path(shots, Some("mine.png"), &id).unwrap(), shots.join("mine.png"));
+        assert_eq!(shot_path(shots, Some("/app/browser/shots/mine.png"), &id).unwrap(), shots.join("mine.png"));
+        for bad in ["/Users/x/.zshrc", "/tmp/a.png", "../a.png", "sub/a.png", "/app/browser/shots/../a.png", ".hidden.png", "a.txt", "/app/browser/shots"] {
+            assert!(shot_path(shots, Some(bad), &id).is_err(), "{bad} must be refused");
+        }
+        // Through the command: refused before anything reaches the host.
+        let (_d, mut a) = agent();
+        let reg = reg();
+        let r = run(&mut a, &reg, "browser.screenshot", json!({ "path": "/tmp/victim.txt" }));
+        assert!(r.unwrap().unwrap_err().contains("file name in"));
+        assert!(sent(&reg).is_empty());
     }
 
     /// Every agent `browser.*` command but the window's (new, remote) and the ungated ones (open, annotations).
