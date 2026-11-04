@@ -15,12 +15,13 @@ ok() { echo "ok   $*"; }
 bad() { echo "FAIL $*"; fails=$((fails + 1)); }
 field() { python3 -c "import json,sys; print(json.dumps(json.load(sys.stdin).get(sys.argv[1])))" "$1"; }
 
-# A fresh home that has seen the welcome (it would cover the window).
+# A fresh home that has seen the welcome and this version's What's new (either would cover the window).
 fresh() {
   local name=$1 shared=$2 root=$HOME/.herdr-fork-home/$1
   if [[ -e $root ]]; then echo "fork home $root exists; pick another name or remove it" >&2; exit 2; fi
   mkdir -p "$root/home"
   printf '%s\n' "$shared" > "$root/home/shared.json"
+  printf '{ "last_run": "999.0.0" }\n' > "$root/home/update-notes.json"
 }
 
 # 1. Fresh home: labs is the default layout; each bundled mod renders with errors [].
@@ -31,6 +32,7 @@ sleep 4
 [[ $(R status | field layout) == '"labs"' ]] && ok "labs is the default layout" || bad "default layout: $(R status | field layout)"
 R do space.new >/dev/null
 sleep 2
+[[ $(R status | field overlays) == "[]" ]] && ok "nothing covers the window" || bad "overlays open: $(R status | field overlays)"
 [[ -n $shots ]] && R shot "$shots/labs.png" >/dev/null
 surfaces=(
   "fork-notepad|{}"

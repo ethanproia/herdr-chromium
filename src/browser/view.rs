@@ -79,6 +79,13 @@ pub struct AnnotationBatch {
     pub untrusted: Vec<String>,
 }
 
+/// A Send waiting for its screenshot: the batch, the page shot's path and the recipient.
+struct Attach {
+    batch: AnnotationBatch,
+    page: std::path::PathBuf,
+    to: Option<Recipient>,
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RegionInfo {
     pub anchor: Option<String>,
@@ -638,8 +645,6 @@ pub struct BrowserView {
     _events: Task<()>,
     /// S27: the recipient popover and the last addressed send.
     send_to: send_to::SendTo,
-    /// The agent the Send in flight goes to (taken by finish_attach).
-    send_target: Option<Recipient>,
     /// Re-checks the Send chip once a second while the batch is unread.
     chip_poll: Option<Task<()>>,
     _focus: [Subscription; 2],
@@ -692,7 +697,7 @@ pub struct BrowserView {
     /// Regions anchored to the document (for the attach picture), with the anchor selector if any.
     region_docs: Vec<(region::Region, Option<String>)>,
     /// Sends waiting for their screenshot: the batch and the page picture's path.
-    attaching: HashMap<u64, (AnnotationBatch, std::path::PathBuf)>,
+    attaching: HashMap<u64, Attach>,
     style_panel: Option<Entity<StylePanelView>>,
     style_results: Vec<(u64, bool, Vec<herdr_browser_protocol::StyleRow>)>,
     /// JS dialogs, the file chooser and download notices (dialogs.rs, fork-host's).
@@ -898,7 +903,6 @@ impl BrowserView {
             states,
             _events: events,
             send_to: send_to::SendTo::default(),
-            send_target: None,
             chip_poll: None,
             _focus: [on, off],
             _address: typed,
@@ -981,9 +985,20 @@ impl BrowserView {
     }
 
     /// The layout changed the block (another url typed into the document): follow it.
+    /// The block's profile, fixed when the view was made.
+    pub fn profile(&self) -> &str {
+        &self.block.profile
+    }
+
     pub fn set_block(&mut self, mut block: BrowserBlock, cx: &mut Context<Self>) {
         // The launch url is the view's, used once: the document's copy never brings it back.
         block.launch_url = self.block.launch_url.clone();
+        // A live block's profile is fixed at creation (its cookies, its grants policy): a layout
+        // update can't move it to another profile or turn the person's block into an agent's.
+        if block.profile != self.block.profile {
+            tracing::warn!("browser {}: layout asked to change its profile; ignored (close and reopen the block instead)", self.id);
+            block.profile = self.block.profile.clone();
+        }
         if block == self.block {
             return;
         }
@@ -1767,6 +1782,12 @@ impl BrowserView {
     /// into it, crops it to the newest region, and emits the batch with the picture. A failed
     /// screenshot still sends the batch, without a picture.
     pub fn send_annotations(&mut self, cx: &mut Context<Self>) {
+        self.send_annotations_to(None, cx);
+    }
+
+    /// Send bound to one request: the recipient (None: the legacy pull path), the batch and the
+    /// page it was taken from travel with the screenshot request, so two sends never mix.
+    fn send_annotations_to(&mut self, to: Option<Recipient>, cx: &mut Context<Self>) {
         let annotations = self.annotations.send();
         if annotations.is_empty() {
             cx.notify();
@@ -1802,26 +1823,42 @@ impl BrowserView {
             scale: 1.0,
             untrusted: ["url", "title", "annotations.target.label", "annotations.target.selector", "annotations.target.rect", "region.anchor", "css_was"].iter().map(|s| s.to_string()).collect(),
         };
-        self.attaching.insert(req, (batch, page.clone()));
+        self.attaching.insert(req, Attach { batch, page: page.clone(), to });
         self.link.send(AppToHost::Screenshot { id: self.id.clone(), req, path: page.to_string_lossy().into_owned() });
         cx.notify();
     }
 
     /// The host wrote the page screenshot for a Send: finish the picture and emit the batch.
     fn finish_attach(&mut self, req: u64, ok: bool, cx: &mut Context<Self>) {
-        let Some((mut batch, page)) = self.attaching.remove(&req) else { return };
+        let Some(Attach { mut batch, page, to }) = self.attaching.remove(&req) else { return };
         let width = self.geometry().size.x.max(1.0);
-        let made = ok
-            .then(|| image::open(&page).ok())
-            .flatten()
-            .map(|img| {
+        // The picture must show what was sent: the same document, and the region if there is one.
+        let mut picture_note = None;
+        let made = if !ok {
+            picture_note = Some("the screenshot failed".to_owned());
+            None
+        } else if self.state.url != batch.url {
+            picture_note = Some("the page changed before the picture was taken".to_owned());
+            None
+        } else {
+            image::open(&page).ok().and_then(|img| {
                 let img = img.to_rgba8();
                 let scale = img.width() as f32 / width;
                 let burned = self.markup.read(cx).burn(&img, scale);
                 let rect = batch.region.as_ref().filter(|r| !r.detached).map(|r| region::Rect { x: r.rect.0, y: r.rect.1, w: r.rect.2, h: r.rect.3 });
-                let pic = rect.and_then(|r| region::crop(&burned, r, scale)).unwrap_or(burned);
-                (pic, scale)
-            });
+                match rect {
+                    // A region that cannot be cut is left out, never widened to the whole viewport.
+                    Some(r) => match region::crop(&burned, r, scale) {
+                        Some(pic) => Some((pic, scale)),
+                        None => {
+                            picture_note = Some("the region was off screen".to_owned());
+                            None
+                        }
+                    },
+                    None => Some((burned, scale)),
+                }
+            })
+        };
         let _ = std::fs::remove_file(&page);
         if let Some((pic, scale)) = made {
             let out = page.with_file_name(format!("{}-{}.png", self.id, batch.id));
@@ -1830,12 +1867,19 @@ impl BrowserView {
                 batch.scale = scale;
             }
         }
-        if let Some(to) = self.send_target.take() {
-            let r = send_to::deliver(&self.link.config().dir, &batch, &to, now_ms()).map(|_| (to, batch.id));
-            self.send_to.delivered(r, now_ms());
-            self.poll_chip(cx);
+        match to {
+            // Addressed: that agent's inbox only, never the global pull path.
+            Some(to) => {
+                let r = send_to::deliver(&self.link.config().dir, &batch, &to, now_ms()).map(|_| (to, batch.id));
+                if r.is_err() {
+                    let ns: Vec<u32> = batch.annotations.iter().map(|a| a.n).collect();
+                    self.annotations.restore(&ns);
+                }
+                self.send_to.delivered(r, now_ms(), picture_note);
+                self.poll_chip(cx);
+            }
+            None => cx.emit(BrowserEvent::Annotations(batch)),
         }
-        cx.emit(BrowserEvent::Annotations(batch));
         cx.notify();
     }
 
@@ -1848,8 +1892,7 @@ impl BrowserView {
     /// S27: the person picked `terminal` in the popover (the consent): Send goes to its inbox.
     pub fn choose_recipient(&mut self, terminal: &str, cx: &mut Context<Self>) {
         if let Some(to) = self.send_to.choose(terminal) {
-            self.send_target = Some(to);
-            self.send_annotations(cx);
+            self.send_annotations_to(Some(to), cx);
         }
         cx.notify();
     }
@@ -2020,7 +2063,7 @@ impl BrowserView {
         let state = design_bar::StripState { owner, tool: self.markup.read(cx).tool, styles_on: self.styles_on_pick, comment_on: self.comment_on_pick, count };
         let strip = design_bar::strip(&state, FIND_HEIGHT, cx, |v, a, _, cx| v.design_action(a, cx))?;
         // S27: the Send chip beside the badge, and the recipient list under it.
-        let chip = self.send_to.chip(&send_to_root(&self.link.config().dir), now_ms()).map(|c| c.text());
+        let chip = self.send_to.chip_line(&send_to_root(&self.link.config().dir), now_ms());
         let popover = send_to::popover(&self.send_to, count, cx, |v, choice, _, cx| {
             match choice {
                 Some(t) => v.choose_recipient(&t, cx),

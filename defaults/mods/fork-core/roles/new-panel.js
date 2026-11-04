@@ -41,7 +41,7 @@ export default class NewPanel {
       ...toolsFor(this.reg.tools, "split").map((tool) => [`tool-${tool.id}`, toolIcon(tool), tool.name, (d, pane) => openInSplit(tool, d, pane),
         tool.open.mod ? (p) => p.mod === tool.open.mod : tool.open.terminal ? (p) => p.terminal != null : () => true]),
       ...this.agents.filter((a) => a.installed).map((a) =>
-        [`agent-${a.key}`, a.tint ? svg(a.icon).size(16).text_color(t.foreground) : image(a.icon).size(16), a.name, (d, pane) => run("pane.split", { direction: d, pane, argv: a.run }), (p) => p.terminal != null]),
+        [`agent-${a.key}`, a.tint ? svg(a.icon).size(15).text_color(t.foreground) : image(a.icon).size(15), a.name, (d, pane) => run("pane.split", { direction: d, pane, argv: a.run }), (p) => p.terminal != null]),
     ];
   }
 

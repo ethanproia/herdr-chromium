@@ -6,11 +6,12 @@ import { div, svg } from "gpui-kit";
 import { v_flex } from "gpui-base";
 import { theme, props, closeOverlay, shared, notify } from "herdr";
 import { menuRow, icon, runCopy, runPaneCopy, runHeaderAction } from "../look.js";
-import { menuHeight, headerMenuEntries, headerMenuElId, COPY_FILE_STRIPPED } from "../pure.js";
+import { menuHeight, headerMenuEntries, headerMenuElId, headerMenuChoose, COPY_FILE_STRIPPED } from "../pure.js";
 
 export default class HeaderMenu {
   init(_p, cx) {
     this.at = 0;
+    this.busy = false;
     this.handle = cx.focus_handle();
     this.handle.focus();
   }
@@ -22,11 +23,18 @@ export default class HeaderMenu {
 
   choose(entry, cx) {
     const p = props() ?? {};
-    // A note copy flushes the open note first, so this view has to stay up until that handshake finishes.
-    if (entry.kind === "copy" && entry.copy?.[0] === COPY_FILE_STRIPPED) {
+    const step = headerMenuChoose(entry, this.busy, COPY_FILE_STRIPPED);
+    // A note copy flushes the open note first, so this view stays up until that handshake finishes.
+    // busy blocks click and Enter for the whole handshake: a second flush would replace notepad.flushReq.
+    if (step === "ignore") return;
+    if (step === "hold") {
+      this.busy = true;
       runPaneCopy(entry.copy[0], entry.copy[1], p.mod, cx).then((ok) => {
+        this.busy = false;
         if (ok) notify({ title: "Copied", timeout: 1500 });
         closeOverlay(p.overlay);
+      }, () => {
+        this.busy = false;
       });
       return;
     }
@@ -59,7 +67,10 @@ export default class HeaderMenu {
         if (!list.length) return;
         if (e.key === "down") this.at = (this.at + 1) % list.length;
         else if (e.key === "up") this.at = (this.at + list.length - 1) % list.length;
-        else if (e.key === "enter") this.choose(list[this.at], cx);
+        else if (e.key === "enter") {
+          if (headerMenuChoose(list[this.at], this.busy, COPY_FILE_STRIPPED) === "ignore") return;
+          this.choose(list[this.at], cx);
+        }
         else return;
         cx.notify();
       })

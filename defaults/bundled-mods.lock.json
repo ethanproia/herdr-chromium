@@ -3,7 +3,7 @@
   "mods": {
     "agents-named": {
       "branch": "ethan/herdr-core-retire",
-      "commit": "c254604b8036db14c04685cbfdea1f293f2947eb",
+      "commit": "1a7094a94a2ddd66677d7a477767a55a58f0a7ab",
       "version": "0.1.0",
       "pr": "essexlabs/labs#1303 (on #1298)",
       "path": "projects/herdr-mods/clones/mac/agents-named"
@@ -30,7 +30,7 @@
     },
     "core": {
       "branch": "ethan/herdr-core-retire",
-      "commit": "c254604b8036db14c04685cbfdea1f293f2947eb",
+      "commit": "1a7094a94a2ddd66677d7a477767a55a58f0a7ab",
       "version": "0.1.0",
       "pr": "essexlabs/labs#1303 (on #1298)",
       "path": "projects/herdr-mods/core",
@@ -42,10 +42,10 @@
     },
     "notepad": {
       "branch": "ethan/herdr-mods",
-      "commit": "06cb848eb980cf99fc4c4f238c75141bee540cf4",
+      "commit": "8d50bcaf1147ed2fdd5278a97378dc82af272a3d",
       "path": "projects/herdr-mods/notepad",
       "version": "0.1.0",
-      "pr": "essexlabs/labs#1294 (merged)",
+      "pr": "essexlabs/labs#1314",
       "exec": [
         "cp",
         "curl",
@@ -77,7 +77,7 @@
     },
     "spaces-browser": {
       "branch": "ethan/herdr-core-retire",
-      "commit": "c254604b8036db14c04685cbfdea1f293f2947eb",
+      "commit": "1a7094a94a2ddd66677d7a477767a55a58f0a7ab",
       "version": "0.1.0",
       "pr": "essexlabs/labs#1303 (on #1298)",
       "path": "projects/herdr-mods/clones/mac/spaces-browser",
@@ -88,7 +88,7 @@
   },
   "layout": {
     "branch": "ethan/herdr-core-retire",
-    "commit": "c254604b8036db14c04685cbfdea1f293f2947eb",
+    "commit": "1a7094a94a2ddd66677d7a477767a55a58f0a7ab",
     "version": "0.1.0",
     "pr": "essexlabs/labs#1303 (on #1298)",
     "path": "projects/herdr-mods/clones/mac/layouts/Labs.json",
