@@ -1,0 +1,5 @@
+<!doctype html><title>auth</title>
+<button id="allow" style="position:absolute;left:20px;top:20px;width:200px;height:60px">Allow</button>
+<script>
+document.getElementById("allow").onclick = () => { window.opener.postMessage({ token: "abc123" }, location.origin); window.close(); };
+</script>

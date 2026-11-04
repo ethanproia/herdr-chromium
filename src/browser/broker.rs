@@ -306,6 +306,15 @@ mod tests {
         // The agent's own block needs no Control, but file upload is never allowed.
         assert_eq!(ask(&mut s, 25, "theirs", "Runtime.evaluate"), "no browser host is running");
         assert!(ask(&mut s, 26, "theirs", "DOM.setFileInputFiles").contains("not available"));
+        // A popup answers to its opener: the person's popup needs the person's grants on the
+        // opener (it has none of its own), an agent popup is the agent's.
+        states.lock().unwrap().insert("mine-pop1".into(), BrowserState { profile: "default".into(), opener: Some("mine".into()), ..Default::default() });
+        states.lock().unwrap().insert("theirs-pop1".into(), BrowserState { profile: "default".into(), opener: Some("theirs".into()), ..Default::default() });
+        assert!(ask(&mut s, 40, "mine-pop1", "Runtime.evaluate").contains("hasn't allowed"), "the person's popup with Control off");
+        agent.lock().unwrap().grants.set(&"mine-pop1".into(), Grant::Control, true);
+        assert!(ask(&mut s, 41, "mine-pop1", "Runtime.evaluate").contains("hasn't allowed"), "a grant on the popup id itself doesn't count");
+        assert_eq!(ask(&mut s, 42, "theirs-pop1", "Runtime.evaluate"), "no browser host is running", "an agent's popup is the agent's");
+        assert!(ask(&mut s, 43, "theirs-pop1", "DOM.setFileInputFiles").contains("not available"));
         // The agent's own block holds only its own traffic: network needs no Cdp there.
         assert_eq!(ask(&mut s, 27, "theirs", "Network.enable"), "no browser host is running");
         // Only the exact "agent" profile: padded, other-case or the person's still need Control and Cdp.

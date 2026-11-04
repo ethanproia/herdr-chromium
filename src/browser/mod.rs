@@ -67,6 +67,8 @@ pub struct BrowserState {
     pub load_error: Option<(String, i32)>,
     /// The block's profile ("agent": an agent opened it; "default": the person's).
     pub profile: String,
+    /// A popup's opener (window.open): grants and listing follow the opener.
+    pub opener: Option<BrowserId>,
 }
 
 /// Looks up a live browser by block id; part 1 provides it, part 5 uses it for `browser.*` commands.
