@@ -1016,6 +1016,7 @@ impl BrowserView {
                 // The host denied what the old page asked for; the bar goes with it.
                 if url != self.state.url {
                     self.prompts.clear();
+                    self.prompt_remember = false;
                 }
                 self.annotations.set_page(&url);
                 if url != self.state.url {
@@ -1164,6 +1165,10 @@ impl BrowserView {
                 cx.spawn(async move |this, cx| {
                     cx.background_executor().timer(Duration::from_secs(60)).await;
                     let _ = this.update(cx, |v, cx| {
+                        // "Remember" belonged to the prompt that ran out, not to the next one.
+                        if v.prompts.front().is_some_and(|(r, _, _)| *r == req) {
+                            v.prompt_remember = false;
+                        }
                         v.prompts.retain(|(r, _, _)| *r != req);
                         cx.notify();
                     });
@@ -2492,7 +2497,13 @@ impl Render for BrowserView {
                 });
             });
         }
+        // A window shot covers a page the person marked sensitive (its pixels never reach the file).
+        let masked = SHOT_MASK.load(std::sync::atomic::Ordering::SeqCst) && self.grant(Grant::Sensitive);
+        let frame = if masked { None } else { frame };
         let page = match (&self.crashed, frame) {
+            _ if masked => page.child(
+                div().absolute().size_full().flex().items_center().justify_center().bg(rgb(0x202020)).text_color(rgb(0x909090)).text_sm().child("Hidden in screenshots: marked sensitive"),
+            ),
             (None, Some(frame)) => page.child(div().absolute().size_full().child(frame)).children(self.load_error_card(cx)).children(self.permission_bar(cx)),
             (None, None) => page.child(
                 div().absolute().size_full().flex().items_center().justify_center().text_color(rgb(0x606060)).text_sm().child(self.shown_url()),
@@ -2672,6 +2683,9 @@ pub fn broker_authorizer(agent: Arc<Mutex<Agent>>, states: Arc<Mutex<HashMap<Bro
         agent.lock().unwrap().broker_allowed(&block.to_string(), method, profile.as_deref())
     })
 }
+
+/// Set while `herdr-app shot` renders the window: blocks marked sensitive draw a cover instead of the page.
+pub static SHOT_MASK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// One `BrowserView` per browser block in the layouts. A view lives while its block does (shown
 /// or not: a hidden tab keeps its page); the host page is made at the block's first paint.

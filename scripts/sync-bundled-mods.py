@@ -5,7 +5,13 @@ start). Labs projects/herdr-mods stays the source of record: edit there,
 re-pin here, run this, commit the result.
 
   scripts/sync-bundled-mods.py            copy every pinned mod (lockfile)
-  scripts/sync-bundled-mods.py --check    exit 1 if defaults/mods differs from the lockfile's copy
+  scripts/sync-bundled-mods.py --check    exit 1 if anything under defaults/mods differs from the lockfile
+  scripts/sync-bundled-mods.py --bless-stock   record the stock (non-fork) mods' digests after an upstream merge
+
+build.rs embeds every file under defaults/mods, so --check covers all of it:
+each fork-* folder must match its pin, each other folder must match the
+digest recorded under "stock", and nothing else may be there. Each pinned
+mod's literal exec("<command>") calls must be named in its "exec" list.
 
 The lockfile (defaults/bundled-mods.lock.json) names, per mod: the labs
 branch and commit, the folder in labs, "ship": false to hold one back,
@@ -122,6 +128,44 @@ def digest(files):
     return h.hexdigest()[:16]
 
 
+EXEC_CALL = re.compile(rb'(?<![.\w$])exec\(\s*["\']([A-Za-z0-9_.+-]+)["\']')
+
+
+def exec_commands(files):
+    """Commands a mod runs through exec("<name>", ...): the literal first argument only."""
+    return sorted({c.decode() for rel, data in files.items() if rel.endswith((".js", ".mjs")) for c in EXEC_CALL.findall(data)})
+
+
+IMPORT = re.compile(rb'(?:\bfrom\s*|\bimport\s*\(?\s*)["\'](\.{1,2}/[^"\']+)["\']')
+
+
+def escaping_imports(name, files):
+    """Relative imports that leave the mod's own folder: nothing outside it is installed with it."""
+    bad = []
+    for rel, data in files.items():
+        if not rel.endswith((".js", ".mjs")):
+            continue
+        for spec in IMPORT.findall(data):
+            target = os.path.normpath(os.path.join(os.path.dirname(rel), spec.decode()))
+            if target.startswith(".."):
+                bad.append(f"{name}/{rel} imports {spec.decode()}")
+    return bad
+
+
+def folder_files(d):
+    have = {}
+    for dirpath, _, fs in os.walk(d):
+        for f in fs:
+            p = os.path.join(dirpath, f)
+            have[os.path.relpath(p, d)] = open(p, "rb").read()
+    return have
+
+
+def stock_digests():
+    return {d: digest(folder_files(os.path.join(MODS, d))) for d in sorted(os.listdir(MODS))
+            if not d.startswith(PREFIX) and os.path.isdir(os.path.join(MODS, d))}
+
+
 def main():
     lock = json.load(open(LOCK))
     git = os.path.expanduser(os.environ.get("LABS_GIT", "~/work.noindex/herdr-fork/labs-pins"))
@@ -135,17 +179,39 @@ def main():
                     if rel.endswith((".js", ".mjs")) and b"structuredClone" in data)
     if clones:
         sys.exit("sync-bundled-mods: structuredClone isn't in Herdr's script engine: " + ", ".join(clones))
+    undeclared = []
+    for name, files in out.items():
+        declared = {c.split()[0] for c in lock["mods"][name[len(PREFIX):]].get("exec", [])}
+        undeclared += [f"{name} runs {c}" for c in exec_commands(files) if c not in declared]
+    escaping = [b for name, files in out.items() for b in escaping_imports(name, files)]
+    if escaping:
+        sys.exit("sync-bundled-mods: imports outside the mod's own folder (not installed with it): " + "; ".join(escaping))
+    if undeclared:
+        sys.exit("sync-bundled-mods: commands not declared in the lockfile's exec lists: " + "; ".join(undeclared))
+    if "--bless-stock" in sys.argv:
+        lock["stock"] = stock_digests()
+        open(LOCK, "w").write(json.dumps(lock, indent=2) + "\n")
+        print(f"sync-bundled-mods: recorded {len(lock['stock'])} stock mods")
+        return
     if "--check" in sys.argv:
         bad = []
         for name, files in out.items():
-            have = {}
-            d = os.path.join(MODS, name)
-            for dirpath, _, fs in os.walk(d):
-                for f in fs:
-                    p = os.path.join(dirpath, f)
-                    have[os.path.relpath(p, d)] = open(p, "rb").read()
-            if digest(have) != digest(files):
+            if not os.path.isdir(os.path.join(MODS, name)) or digest(folder_files(os.path.join(MODS, name))) != digest(files):
                 bad.append(name)
+        stock = lock.get("stock", {})
+        for d in sorted(os.listdir(MODS)):
+            p = os.path.join(MODS, d)
+            if d in out:
+                continue
+            if not os.path.isdir(p):
+                bad.append(f"extra file {d}")
+            elif d.startswith(PREFIX):
+                bad.append(f"extra folder {d} (not in the lockfile)")
+            elif d not in stock:
+                bad.append(f"extra folder {d} (not recorded under stock)")
+            elif digest(folder_files(p)) != stock[d]:
+                bad.append(f"stock {d} changed (review, then --bless-stock)")
+        bad += [f"stock {d} missing" for d in stock if not os.path.isdir(os.path.join(MODS, d))]
         if open(LABS).read() != fork_layout(lock, git):
             bad.append("layouts/labs.json")
         if open(LABS_SVG, "rb").read() != show(git, lock["layout"]["commit"], lock["layout"]["preview"]):
