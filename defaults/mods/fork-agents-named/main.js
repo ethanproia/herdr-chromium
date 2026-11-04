@@ -4,6 +4,7 @@
 import { View, div, image, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { scroller, fadeLabel, over } from "./scroll.js";
+import { nextPinMigration } from "./pins.js";
 import { agents, terminals, panes, focused, spaces, run, theme, shared, setShared, setAgentOrder, openOverlay, closeOverlay, props, window, layout, settings } from "herdr";
 // With the fork's "glass" setting the sidebar's layout background draws translucent over a blurred window; painting
 // our own opaque chrome here would hide it, so sidebar roots leave the background to the layout then.
@@ -76,10 +77,12 @@ export default class Agents extends View {
     if (props()?.sortMenu) return;
     this.folded = new Set();
     // Each agent's last state and when it changed (ms), kept across restarts.
-    this.changed = JSON.parse(localStorage.getItem("changed") ?? "{}");
-    this.pendingPins = JSON.parse(localStorage.getItem("pins") ?? "[]");
+    // Corrupt or wrong-shaped storage starts empty instead of breaking the list.
+    const stored = (key, ok, empty) => { try { const v = JSON.parse(localStorage.getItem(key) ?? "null"); return ok(v) ? v : empty; } catch { return empty; } };
+    this.changed = stored("changed", (v) => v && typeof v === "object" && !Array.isArray(v), {});
+    this.pendingPins = stored("pins", (v) => Array.isArray(v), []).filter((a) => typeof a === "string");
     if (!this.pendingPins.length) localStorage.removeItem("pins");
-    this.migratingPins = new Set();
+    this.migratingPins = new Map(); // address -> { at, n } while a pin migration is still being applied
     cx.timer.every(30000, (cx) => cx.notify());
   }
 
@@ -100,23 +103,17 @@ export default class Agents extends View {
     localStorage.setItem("changed", JSON.stringify(this.changed));
   }
 
-  // Keep offline pins until their terminal returns, and keep each pending until
-  // core echoes the label so a failed write doesn't erase the old pin.
+  // Keep offline pins until their terminal returns. A live one is retried a few
+  // times, then dropped: a terminal that will not take the label must not be
+  // pinned again on every pass. A label that appears still clears the pin first.
   migratePins(all) {
-    const listed = new Map(all.filter((t) => t.state === "live").map((t) => [t.address, t]));
-    const pending = this.pendingPins.filter((address) => {
-      const terminal = listed.get(address);
-      if (!terminal) return true;
-      if (terminal.labels?.["herdr.pinned"]) return false;
-      if (!this.migratingPins.has(address)) {
-        this.migratingPins.add(address);
-        run("terminal.pin", { terminal: address, pinned: true });
-      }
-      return true;
-    });
-    if (pending.length === this.pendingPins.length) return;
-    this.pendingPins = pending;
-    if (pending.length) localStorage.setItem("pins", JSON.stringify(pending));
+    const step = nextPinMigration(this.pendingPins, all, this.migratingPins, Date.now());
+    this.migratingPins = step.attempts;
+    for (const address of step.commands) run("terminal.pin", { terminal: address, pinned: true });
+    for (const address of step.gaveUp) console.log(`agents-named: stopped retrying pin for ${address}`);
+    if (step.pending.length === this.pendingPins.length && step.pending.every((address, i) => address === this.pendingPins[i])) return;
+    this.pendingPins = step.pending;
+    if (step.pending.length) localStorage.setItem("pins", JSON.stringify(step.pending));
     else localStorage.removeItem("pins");
   }
 

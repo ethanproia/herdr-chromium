@@ -1,5 +1,6 @@
 // Pure helpers: no host imports, so `node core/test.mjs` can load them.
 import { RUN_ALLOW } from "./registry.js";
+import { runOverlayItem } from "./overlay-action.js";
 
 export const ROLES = ["tabs", "pane-header", "menu", "plus", "new-panel", "side-strip", "sidebar-footer", "status", "sidebar-header", "header-menu", "inbox"];
 
@@ -22,16 +23,49 @@ export function keysym(k) {
   return first.split("-").map((p) => KEYSYM[p] ?? (p.length === 1 ? p.toUpperCase() : p)).join("");
 }
 
-// Copy scripts. The producer writes a temp file and the clipboard is only touched when it exited 0 (so a failing
-// producer never leaves a half copy or an empty clipboard, and the exit code is the producer's or pbcopy's).
-// $1 = what to copy (terminal address, file path or text), $2 = temp folder (optional: TMPDIR when absent).
-// Callers that run [script, $1] with no temp dir still work, hence the $2 fallback.
+// Copy scripts for a file or a string. The producer writes a temp file and the clipboard is only touched when it
+// exited 0 (so a failing producer never leaves a half copy or an empty clipboard, and the exit code is the
+// producer's or pbcopy's). $1 = what to copy, $2 = temp folder (optional: TMPDIR when absent). Callers that run
+// [script, $1] with no temp dir still work, hence the $2 fallback.
+// Terminal scrollback is not a script. `hc` is not on PATH when Herdr is opened from the Dock or Finder, so a
+// shell `hc read` exits 127 and every terminal Copy fails. COPY_TERMINAL is the marker runCopyPlan recognizes.
 const guarded = (producer) =>
-  'd="${2:-${TMPDIR:-/tmp}}"; mkdir -p "$d" && t="$d/copy.$$" && ' + producer + ' > "$t" && pbcopy < "$t"; rc=$?; rm -f "$t"; exit $rc';
-export const COPY_TERMINAL = guarded('hc read "$1" --lines 100000');
+  // umask 077 and mktemp: the temp file is new (never an existing file or a symlink) and only the user can read it.
+  'umask 077; d="${2:-${TMPDIR:-/tmp}}"; mkdir -p "$d" && t=$(mktemp "$d/copy.XXXXXX") || exit 1; trap \'rm -f "$t"\' EXIT; ' + producer + ' > "$t" && pbcopy < "$t"';
+export const COPY_TERMINAL = "copy-terminal";
 export const COPY_FILE = guarded('cat "$1"');
 export const COPY_FILE_STRIPPED = guarded("awk 'NR==1&&/^---$/{f=1;next} f&&/^---$/{f=0;next} !f' \"$1\"");
 export const COPY_TEXT = guarded('printf %s "$1"');
+const TERMINAL_READ_LINES = "100000";
+
+// Read scrollback with the host hc() API, then pbcopy a file. A failed read (or a thrown hc) never
+// touches the clipboard. An empty successful read is a real empty scrollback and is copied.
+export async function copyTerminalScrollback(address, io) {
+  let read;
+  try {
+    read = await io.hc(["read", String(address), "--lines", TERMINAL_READ_LINES]);
+  } catch (e) {
+    return { code: 1, stderr: e instanceof Error ? e.message : String(e), stdout: "" };
+  }
+  if (!read || read.code !== 0) return { code: read?.code ?? 1, stderr: read?.stderr || "", stdout: "" };
+  const dir = io.tmpDir();
+  const name = `${dir}/copy.${io.stamp()}`;
+  const made = await io.exec("mkdir", ["-p", dir]);
+  if (!made || made.code !== 0) return { code: made?.code ?? 1, stderr: made?.stderr || "Could not make a temp folder", stdout: "" };
+  try {
+    await io.writeTextFile(name, read.stdout ?? "", null);
+    const copied = await io.exec("sh", ["-c", 'pbcopy < "$1"', "sh", name]);
+    return copied ?? { code: 1, stderr: "", stdout: "" };
+  } finally {
+    await io.exec("rm", ["-f", name]).catch(() => {});
+  }
+}
+
+// File and text plans stay shell scripts. A terminal plan never reaches the shell.
+export function runCopyPlan(script, arg, io) {
+  if (script === COPY_TERMINAL) return copyTerminalScrollback(arg, io);
+  return io.exec("sh", ["-c", script, "sh", arg, io.tmpDir()]);
+}
 
 // Directory a pane header labels, before ~ shortening.
 // A file viewer uses the open file's parent ("" until a path is published).
@@ -111,15 +145,27 @@ export function headerMenuElId(entry) {
   return entry?.kind === "copy" ? "hm-copy" : `hm-act-${entry?.id}`;
 }
 
-// What one header-menu choose does. A stripped note copy ("hold") leaves the popup
-// up for the flush handshake. A second choose in that window ("ignore") must not
-// start another flush: both click and Enter share this, and a new flush would
-// overwrite notepad.flushReq so the first handshake can miss its ack. Every other
-// row ("run") closes the popup and runs immediately. `busy` is the menu's flag.
-export function headerMenuChoose(entry, busy, strippedScript) {
+// What one header-menu choose does. Every copy row ("hold") leaves the popup up until
+// the copy settles: closing first can tear the view down, and a promise awaiting in
+// that view never finishes, so the clipboard write and its notification are lost.
+// A second choose in that window ("ignore") must not start another copy. Both click
+// and Enter share this, and a second note flush would overwrite notepad.flushReq so
+// the first handshake can miss its ack. Every other row ("run") closes the popup and
+// runs immediately, so Export still opens the next popup. `busy` is the menu's flag.
+export function headerMenuChoose(entry, busy) {
   if (busy) return "ignore";
-  if (entry?.kind === "copy" && entry.copy?.[0] === strippedScript) return "hold";
+  if (entry?.kind === "copy") return "hold";
   return "run";
+}
+
+// Start the chosen row. A held copy starts before the popup closes and closes when
+// the promise settles (or the overlay wait expires). A run row closes first.
+export function beginHeaderMenuChoice(step, { copy, action, close, sleep }) {
+  if (step === "ignore") return undefined;
+  if (step === "hold") return runOverlayItem(() => copy(), close, true, undefined, sleep);
+  close();
+  action();
+  return undefined;
 }
 
 // The wide Copy button. A stripped note file holds the button until its flush
@@ -133,9 +179,11 @@ export function paneNoteCopyClaim(src, copying, strippedScript) {
 
 // Rows in the narrow-pane ••• menu: Copy (when the plan produced a script), then each real header action.
 // A button with no typed action is left out; Copy is left out when there is nothing to copy.
+// The copy script must be one of core's own (props can come from any caller of tab.new / pane.split).
+const COPY_SCRIPTS = new Set([COPY_TERMINAL, COPY_FILE, COPY_FILE_STRIPPED, COPY_TEXT]);
 export function headerMenuEntries(header, copy) {
   const rows = [];
-  if (Array.isArray(copy) && typeof copy[0] === "string" && copy[0] && (typeof copy[1] === "string" || typeof copy[1] === "number"))
+  if (Array.isArray(copy) && COPY_SCRIPTS.has(copy[0]) && (typeof copy[1] === "string" || typeof copy[1] === "number"))
     rows.push({ kind: "copy", id: "copy", label: "Copy Contents", copy: [copy[0], String(copy[1])] });
   if (Array.isArray(header)) {
     for (const h of header) {
@@ -154,6 +202,55 @@ export function headerMenuEntries(header, copy) {
 
 // Menu height: rows are 32px, a hairline group break is 9px, 4px padding top and bottom.
 export const menuHeight = (rows, breaks) => 8 + rows * 32 + breaks * 9;
+
+// groupLabel in the right-click menu (6 top + 12 text + 6 bottom). The tab-bar menu always
+// reserves it, the same way the menu role adds it for tab "tabbar".
+export const MENU_GROUP_LABEL_H = 30;
+
+// Right-click on the tab bar's empty space. Same rows the menu role renders: New Tab, tab tools
+// (not Terminal), side tools as pin checks, Rename Space. `tools` is the shared registry list.
+export function tabbarMenuItems(tools, space) {
+  const list = Array.isArray(tools) ? tools : [];
+  const tabTools = list.filter((x) => (x.places ?? []).includes("tab") && x.id !== "terminal");
+  const sideTools = list.filter((x) => (x.places ?? []).includes("side"));
+  return [
+    ["New Tab", "tab.new", { space }],
+    ...tabTools.map((x) => [x.name, "tool.open", { id: x.id, icon: x.icon }]),
+    ...sideTools.map((x) => [x.name, "panel.pin", { tool: x.id, icon: x.icon }]),
+    ["Rename Space…", "space.rename", { id: space }],
+  ];
+}
+
+// A hairline sits before some items, which groups them. Shared with the menu role so a popup
+// states the same height the menu root draws.
+export const breaksBefore = (list, i) => i > 0 && ((list[i][1] === "sidebar.toggle" && list[i - 1][1] === "sidebar.collapse") || (list[i][1] === "tool.open" && list[i - 1][1] !== "tool.open") || (list[i][1] === "panel.pin" && list[i - 1][1] !== "panel.pin") || (list[i][1] === "space.rename" && list[i - 1][1] === "panel.pin") || list[i][1] === "machine.add" || list[i][1].endsWith(".close") || list[i][1] === "app.help" || list[i][1] === "terminal.right_click" || list[i][1] === "copy-link" || (list[i][1] === "space.move" && list[i - 1][1] !== "space.move") || list[i][1] === "tab.rename" || (list[i][1] === "app.theme" && list[i - 1][1] !== "app.theme") || list[i][1] === "notifications.clear_all");
+
+// Popup height for the tab-bar menu: the menu root's own formula, from the rows it will render.
+export function tabbarMenuHeight(tools, space) {
+  const list = tabbarMenuItems(tools, space);
+  const breaks = list.filter((_, i) => breaksBefore(list, i)).length;
+  return menuHeight(list.length, breaks) + MENU_GROUP_LABEL_H;
+}
+
+// Pinned tools drawn on the tab bar. A stale id (no registry entry) is left out. A tool with no
+// icon still shows, as the first letter of its name, the same mark the side strip uses.
+export function tabBarPins(pins, tools) {
+  if (!Array.isArray(pins)) return [];
+  const list = Array.isArray(tools) ? tools : [];
+  const out = [];
+  for (const id of pins) {
+    const tool = list.find((x) => x && x.id === id);
+    if (!tool) continue;
+    const icon = tool.icon ? tool.icon : "";
+    // An empty name is not a mark. Fall through to the id so the button is not a blank box.
+    const source = tool.name || tool.id || "";
+    const letter = icon ? "" : String(source).charAt(0).toUpperCase();
+    if (!icon && !letter) continue;
+    const name = tool.name || String(tool.id);
+    out.push({ id: tool.id, name, icon, letter });
+  }
+  return out;
+}
 
 // A header button's command arguments. The pane the button sits on wins over anything the
 // descriptor put in args (a plugin must not close or split some other pane).

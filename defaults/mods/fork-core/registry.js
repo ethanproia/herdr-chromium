@@ -235,7 +235,9 @@ export async function loadRegistry(io) {
   const inst = io.installed ? new Set(await io.installed()) : null;
   // unlessInstalled: a stand-in that steps aside only when that mod is installed and enabled
   // (the fork's native Browser vs the browser mod). Switched off, the stand-in stays: the mod's own entry is dropped too.
-  const usable = (t) => (!t.unlessInstalled || !inst || !inst.has(t.unlessInstalled) || disabled.has(t.unlessInstalled))
+  const hostCmds = io.commands ? io.commands() : null;
+  const usable = (t) => (!t.open.command || !hostCmds || hostCmds.includes(t.open.command))
+    && (!t.unlessInstalled || !inst || !inst.has(t.unlessInstalled) || disabled.has(t.unlessInstalled))
     && (!t.open.mod || t.open.mod === io.self || ((!inst || inst.has(t.open.mod)) && !disabled.has(t.open.mod)));
   const kept = bundled.filter(usable);
   // Stand-ins for tools that will ship their own tool.json: used while an installed folder has none.

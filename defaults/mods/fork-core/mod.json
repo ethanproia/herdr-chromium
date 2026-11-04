@@ -12,8 +12,8 @@
   "version": "0.1.0",
   "source": {
     "repo": "essexlabs/labs",
-    "branch": "ethan/herdr-core-retire",
-    "commit": "f3ab809ed6c5aaffa42ca54f4e5bc14bc5f936a4",
+    "branch": "main",
+    "commit": "ec71dee685393fa2476e4c75eb1c0d864d418f0c",
     "path": "projects/herdr-mods/core"
   }
 }

@@ -8,7 +8,7 @@ import { theme, props, closeOverlay, run } from "herdr";
 import { icon, groupLabel } from "../look.js";
 import { scroller, fadeLabel, over } from "../scroll.js";
 import { inboxSnapshot, markRead, clearNotifications, setDnd } from "../notes.js";
-import { groupByDay, relTime, rowState, rowIcon, rowClickPlan, inboxHeight, HEAD_H, ROW_H, ROW_H_ONE, PAD } from "../inbox-pure.js";
+import { groupByDay, relTime, rowState, rowIcon, rowClickPlan, actionAllowed, inboxHeight, HEAD_H, ROW_H, ROW_H_ONE, PAD } from "../inbox-pure.js";
 
 const TONE = (t, tone) => (tone === "error" ? t.blocked : tone === "warning" ? (t.ansi3 ?? t.blocked) : tone === "success" ? t.done : null);
 
@@ -25,7 +25,9 @@ export default class Inbox {
 
   click(it) {
     const plan = rowClickPlan(it);
-    if (plan.run) run(plan.run.name, plan.run.args);
+    // rowClickPlan already drops names outside the allow-list. Check again at the run() call so a
+    // plan that was built some other way cannot start terminal.kill or any other command.
+    if (plan.run && actionAllowed(plan.run.name)) run(plan.run.name, plan.run.args);
     markRead(plan.markRead);
     if (plan.close) this.close();
   }

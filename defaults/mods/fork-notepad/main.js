@@ -9,10 +9,10 @@ import { theme, settings, home, appHome, exec, readTextFile, writeTextFile, watc
 import { hasCopy, flushNote, flushAck, errorAfterWatch } from "./copy-clip.js";
 import { headerMenuCopyAction } from "./header-copy.js";
 import { runOverlayItem } from "./overlay-action.js";
-import { finishExport, exportFileTest } from "./export-finish.js";
+import { finishExport, exportFileTest, publishNew } from "./export-finish.js";
 import { splitRows, joinRows, isFence, parseRow, filterTypes, setType, continuePrefix, isEmptyItem, toggleTask,
   parseInline, titleOf, slugOf, toPlain, toHtml, splitFront, iconOf, withIcon, TYPES, linkSpans, replaceLinkAt,
-  mergeAppend as joinAppend, draftRestore, loadedAfterRestore, savePlan, BY_MARK, prefixOffsets, visibleRange,
+  mergeAppend as joinAppend, activeAfterAppend, draftRestore, loadedAfterRestore, savePlan, loadAction, watchLoad, draftOffer, restoreChoice, BY_MARK, prefixOffsets, visibleRange,
   caretAfterEdit, spliceHeights, moveHeight } from "./rows.js";
 import { IconPicker, iconElement } from "./iconpicker.js";
 import { loadItems, openHref, KIND_ICON } from "./mentions.js";
@@ -38,6 +38,9 @@ setShared("notepad.dir", NOTES_DIR);   // the pane header shows this resolved fo
 const LOCK = NOTE_PATH + ".lock";               // shared with bin/notepad: one writer at a time
 const DRAFT = NOTES_DIR + "/.notepad.draft.md";  // unsaved text kept when the pane closes mid-conflict
 const DRAFT_BASE = NOTES_DIR + "/.notepad.draft.base.json";  // the text that draft was edited from (null: no file yet)
+// Shown while notepad.md exists but cannot be read. Cleared only when a later read returns the text.
+const UNREAD_NOTE = `Can't open ${NOTE_PATH}: it may be over 1 MB or unreadable. Nothing will be saved from this pane.`;
+
 function clearDraftFiles() {
   exec("rm", ["-f", DRAFT, DRAFT_BASE]).catch(() => {});
 }
@@ -140,21 +143,22 @@ export default class Notes extends View {
     cx.spawn(async (cx) => {
       try { await exec("mkdir", ["-p", NOTES_DIR]); } catch (e) { this.error = `Cannot create ${NOTES_DIR}: ${e}`; }
       const text = await readTextFile(NOTE_PATH).catch(() => null);
-      this.cur = { path: NOTE_PATH, text: text ?? "", loaded: text, dirty: false, conflict: false, front: "" };
-      const { front, body } = splitFront(text ?? "");
-      this.cur.front = front;
-      this.replaceRows(body ? splitRows(body) : ["", ""]);
-      if (!text) this.activate(0, cx, true);
-      this.publishLinks();
+      // A note that exists but can't be read (over Herdr's 1 MiB read limit, or no permission) must not open as an
+      // empty page: typing there would look like the note was lost. Show why and stay read-only (no cur, no saves)
+      // until a later read succeeds. The draft is still offered, and the folder watch retries the read.
+      const exists = text === null && (await exec("test", ["-e", NOTE_PATH]).catch(() => null))?.code === 0;
+      if (loadAction(text, exists) === "unread") {
+        this.error = UNREAD_NOTE;
+        cx.notify();
+        await this.offerDraft(cx);
+        this.watch(cx);
+        this.retryUnread(cx);
+        return;
+      }
+      this.openLoaded(text, cx);
       cx.notify();
       this.watch(cx);
-      // A draft left by a pane that closed with unsaved changes: offer it back.
-      const draft = await readTextFile(DRAFT).catch(() => null);
-      if (draft !== null && draft !== this.cur.text) {
-        this.draft = draft;
-        this.draftBase = await readDraftBase();
-        cx.notify();
-      } else if (draft !== null) clearDraftFiles();
+      await this.offerDraft(cx);
     });
     cx.spawn(async (cx) => {
       for (;;) {
@@ -182,7 +186,7 @@ export default class Notes extends View {
           failures = 0;
           this.error = errorAfterWatch(this.error, watchError);
           watchError = null;
-          await this.refreshCurrent();
+          await this.refreshCurrent(cx);
           cx.notify();
         } catch (e) {
           if (failures === 0) {
@@ -199,9 +203,27 @@ export default class Notes extends View {
 
   // The open note changed on disk. Our own saves match what we have and are ignored; an outside edit
   // is taken only while nothing is being typed, otherwise it shows the Reload / Overwrite banner.
-  async refreshCurrent() {
+  // With no note yet (the file was unreadable), a later successful read opens it. A failed re-read of an
+  // open note leaves that note up.
+  async refreshCurrent(cx) {
+    if (!this.cur) {
+      if (this.opening) return;
+      this.opening = true;
+      try {
+        const text = await readTextFile(NOTE_PATH).catch(() => null);
+        const exists = text === null && (await exec("test", ["-e", NOTE_PATH]).catch(() => null))?.code === 0;
+        // hold: still unreadable. open: the text arrived, or the file is gone (same as a missing note at startup).
+        if (watchLoad(false, text, exists) !== "open" || this.cur) {
+          if (!this.cur && !this.error) this.error = UNREAD_NOTE;
+          return;
+        }
+        this.openLoaded(text, cx);
+        if (this.draft === undefined) await this.offerDraft(cx);
+      } finally { this.opening = false; }
+      return;
+    }
     const c = this.cur;
-    if (!c || !c.path) return;
+    if (!c.path) return;
     const disk = await readTextFile(c.path).catch(() => null);
     if (disk === null || disk === c.writing || this.cur !== c) return;
     // Disk already matches what we have. Catch the baseline up; leaving it stale makes the
@@ -220,16 +242,67 @@ export default class Notes extends View {
   }
 
   // Add what was appended on disk after our base to our text, with a line break only when the base had one.
+  // The text box stays on the same logical row: a trailing empty caret moves past the new lines,
+  // and a row whose text changed is left (commit) so the box cannot write the old text back over them.
   mergeAppend(disk) {
     const c = this.cur;
+    const prev = this.rows;
+    const active = this.active;
     c.text = joinAppend(c.loaded, c.text, disk);
     c.loaded = disk;
     c.dirty = c.text !== disk;
     const { front, body } = splitFront(c.text);
     c.front = front;
     this.replaceRows(splitRows(body));
-    if (this.active >= this.rows.length) this.active = -1;
+    const at = activeAfterAppend(prev, this.rows, active);
+    if (at < 0) this.commit();
+    else this.active = at;
     this.publishLinks();
+  }
+
+  // `text` null: the file is not there yet (loaded stays null so an empty pane does not write one).
+  openLoaded(text, cx) {
+    this.cur = { path: NOTE_PATH, text: text ?? "", loaded: text, dirty: false, conflict: false, front: "" };
+    const { front, body } = splitFront(text ?? "");
+    this.cur.front = front;
+    this.replaceRows(body ? splitRows(body) : ["", ""]);
+    if (!text) this.activate(0, cx, true);
+    this.publishLinks();
+    if (this.error === UNREAD_NOTE) this.error = null;
+    if (typeof this.draft === "string" && this.draft === this.cur.text) {
+      this.draft = null;
+      this.draftBase = undefined;
+      this.restoreWhenOpen = false;
+      clearDraftFiles();
+    } else if (this.restoreWhenOpen && typeof this.draft === "string") {
+      this.restoreWhenOpen = false;
+      this.restoreDraft(true, cx);
+    }
+  }
+
+  // A draft left by a pane that closed with unsaved changes. Compared to the open note when there is one.
+  async offerDraft(cx) {
+    const draft = await readTextFile(DRAFT).catch(() => null);
+    const action = draftOffer(draft, this.cur ? this.cur.text : undefined);
+    if (action === "offer") {
+      this.draft = draft;
+      this.draftBase = await readDraftBase();
+      cx.notify();
+    } else if (action === "clear") clearDraftFiles();
+  }
+
+  // While the note is still unreadable, try the read again. A folder watch also calls refreshCurrent;
+  // this covers a transient failure that does not change the file.
+  retryUnread(cx) {
+    const again = (cx) => {
+      cx.spawn(async (cx) => {
+        if (this.cur) return;
+        await this.refreshCurrent(cx);
+        cx.notify();
+        if (!this.cur) cx.timer.after(2000, again);
+      });
+    };
+    cx.timer.after(2000, again);
   }
 
   adopt(text) {
@@ -342,6 +415,10 @@ export default class Notes extends View {
   }
 
   restoreDraft(keep, cx) {
+    if (restoreChoice(keep, Boolean(this.cur)) === "defer") {
+      this.restoreWhenOpen = true;
+      return;
+    }
     if (keep && this.cur) {
       const draft = this.draft;
       const base = this.draftBase;
@@ -356,10 +433,12 @@ export default class Notes extends View {
       // A conflict only banners (Reload / Keep mine); it does not write.
       this.cur.loaded = loadedAfterRestore(action, base, this.cur.loaded, draft);
       if (action === "conflict") this.cur.conflict = true;
-      else { this.save(false, cx); clearDraftFiles(); }
+      // Keep the draft until the save has landed: a failed save must still leave the recovery copy on disk.
+      else this.save(false, cx).then(() => { if (!this.cur.dirty) clearDraftFiles(); });
     } else clearDraftFiles();
     this.draft = null;
     this.draftBase = undefined;
+    this.restoreWhenOpen = false;
     cx.notify();
   }
 
@@ -447,7 +526,9 @@ export default class Notes extends View {
 
     // FORK: Enter can't be intercepted; the newline it types is how a row ends. A code block keeps its newlines.
     if (v.includes("\n") && !isFence(full)) {
-      if (this.menu) { this.choose(v.replace("\n", ""), cx); return; }
+      // Enter in an open menu picks; a pasted block with more lines closes the menu and is kept as typed.
+      if (this.menu && v.indexOf("\n") === v.length - 1) { this.choose(v.slice(0, -1), cx); return; }
+      this.menu = null;
       const parts = v.split("\n");
       const first = this.prefix + parts[0] + this.suffix;
       if (parts.length === 2 && parts[1] === "" && isEmptyItem(first)) { this.setRow("", cx); cx.notify(); return; }
@@ -538,7 +619,7 @@ export default class Notes extends View {
   // Enter in an open menu: apply the highlighted / type or @ mention.
   choose(value, cx) {
     const item = this.menu.items[this.menu.at];
-    if (this.menu.type === "at") return item ? this.mention(item, value, cx) : (this.menu = null, cx.notify());
+    if (this.menu.type === "at") return item ? this.mention(item, value, cx) : (this.menu = null, this.focusText(cx), cx.notify());
     return this.pick(item?.id, value, cx);
   }
 
@@ -996,17 +1077,18 @@ export default class Notes extends View {
         const folder = await pickFolder({ prompt: kind === "pdf" ? "Export PDF to" : "Export Markdown to" });
         if (!folder) outcome = { cancelled: true };
         else if (kind === "md") {
-          const src = `${work}/note.md`, dest = `${folder}/${name}.md`;
+          const src = `${work}/note.md`;
           await writeTextFile(src, text, null);
-          await must("Saving the Markdown", "cp", [src, dest]);
-          await must("Checking the saved file", "test", [exportFileTest("md"), dest]);
+          await must("Checking the saved file", "test", [exportFileTest("md"), src]);
+          const dest = await publishNew(exec, must, src, folder, name, "md");
           outcome = { title: "Exported", body: dest };
         } else {
-          const dest = `${folder}/${name}.pdf`;
+          const pdf = `${work}/note.pdf`;
           await writeTextFile(`${work}/note.html`, toHtml(text, titleOf(text)), null);
           await must("Making the PDF", CHROME, ["--headless=new", "--disable-gpu", "--no-pdf-header-footer", `--user-data-dir=${work}/profile`,
-            `--print-to-pdf=${dest}`, `file://${work}/note.html`]);
-          await must("Checking the PDF", "test", [exportFileTest("pdf"), dest]);
+            `--print-to-pdf=${pdf}`, `file://${work}/note.html`]);
+          await must("Checking the PDF", "test", [exportFileTest("pdf"), pdf]);
+          const dest = await publishNew(exec, must, pdf, folder, name, "pdf");
           outcome = { title: "Exported PDF", body: dest };
         }
       }
