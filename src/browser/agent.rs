@@ -70,6 +70,8 @@ pub struct Agent {
     finds: HashMap<BrowserId, u64>,
     pub cdp: CdpFile,
     pub grants: Grants,
+    /// The blocks' live states (the app's record of profile and opener), set by `Browsers`.
+    pub states: Option<std::sync::Arc<std::sync::Mutex<HashMap<BrowserId, super::BrowserState>>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,6 +215,8 @@ impl Agent {
     /// block's shield); a screenshot of a page they marked sensitive needs Capture. Picks the person answers stay
     /// open: the person chooses what they share.
     fn allowed(&self, name: &str, a: &Value, id: &BrowserId, reg: &dyn BrowserRegistry) -> Result<(), String> {
+        // A popup is its opener's for grants: the person's popup needs the person's grants.
+        let id = &reg.state(id).and_then(|s| s.opener).unwrap_or_else(|| id.clone());
         let opened_by_agent = reg.state(id).is_some_and(|s| s.profile == AGENT_PROFILE);
         for grant in needs(name, a, self.grants.get(id, Grant::Sensitive)) {
             if grant == Grant::Control && opened_by_agent {
@@ -272,6 +276,13 @@ impl Agent {
                     self.new_generation("the browser host restarted");
                 }
                 self.cdp.set_ready(*cdp_port, *cdp_pipe)
+            }
+            // A popup is listed to agents only when its opener is an agent's own block.
+            HostToApp::PopupOpened { opener, id, .. } => {
+                let agents = self.states.as_ref().and_then(|s| s.lock().unwrap().get(opener).map(|o| o.profile == AGENT_PROFILE)).unwrap_or(false);
+                if !agents {
+                    self.cdp.hide(id);
+                }
             }
             HostToApp::CdpTarget { id, target_id } => self.cdp.set_target(id, target_id),
             HostToApp::EvalResult { id, req, ok: true, value } => self.answer(*req, id, Op::Eval, Ok(json!({ "value": value }))),
@@ -509,6 +520,8 @@ pub struct CdpFile {
     /// The host serves CDP on the app's pipe: agents go through the broker (agent.sock), never a port.
     pipe: bool,
     targets: BTreeMap<BrowserId, String>,
+    /// Blocks agents don't see in cdp.json (the person's popups); the broker still knows their target.
+    hidden: std::collections::HashSet<BrowserId>,
 }
 
 impl CdpFile {
@@ -543,7 +556,14 @@ impl CdpFile {
         self.write();
     }
 
+    /// Keep block `id` out of the listing agents read.
+    pub fn hide(&mut self, id: &BrowserId) {
+        self.hidden.insert(id.clone());
+        self.write();
+    }
+
     pub fn remove(&mut self, id: &BrowserId) {
+        self.hidden.remove(id);
         if self.targets.remove(id).is_some() {
             self.write();
         }
@@ -554,10 +574,13 @@ impl CdpFile {
         // On the pipe: where the broker is and which blocks it serves; no port, no target ids.
         let body = match (self.pipe, self.port) {
             (true, _) => {
-                let blocks: BTreeMap<&BrowserId, bool> = self.targets.keys().map(|b| (b, true)).collect();
+                let blocks: BTreeMap<&BrowserId, bool> = self.targets.keys().filter(|b| !self.hidden.contains(*b)).map(|b| (b, true)).collect();
                 json!({ "broker": super::broker::Broker::socket(&self.dir), "token_file": super::broker::Broker::token_file(&self.dir), "targets": blocks })
             }
-            (false, Some(port)) => json!({ "port": port, "targets": self.targets }),
+            (false, Some(port)) => {
+                let listed: BTreeMap<&BrowserId, &String> = self.targets.iter().filter(|(b, _)| !self.hidden.contains(*b)).collect();
+                json!({ "port": port, "targets": listed })
+            }
             (false, None) => {
                 let _ = std::fs::remove_file(&path);
                 return;
@@ -1138,6 +1161,25 @@ mod tests {
 
     /// Every agent `browser.*` command but the window's (new, remote) and the ungated ones (open, annotations).
     const COMMANDS_COVERED: [&str; 12] = ["navigate", "back", "forward", "reload", "stop", "devtools", "eval", "screenshot", "find", "lock", "close", "pick"];
+
+    #[test]
+    fn the_persons_popups_are_not_listed_to_agents() {
+        let (_d, mut a) = agent();
+        let states: std::sync::Arc<std::sync::Mutex<HashMap<BrowserId, crate::browser::BrowserState>>> = Default::default();
+        states.lock().unwrap().insert("mine".into(), crate::browser::BrowserState { profile: "default".into(), ..Default::default() });
+        states.lock().unwrap().insert("theirs".into(), crate::browser::BrowserState { profile: "agent".into(), ..Default::default() });
+        a.states = Some(states);
+        a.on_host(&HostToApp::Ready { version: herdr_browser_protocol::PROTOCOL_VERSION, cef_version: "t".into(), cdp_port: None, cdp_pipe: true });
+        for (opener, id) in [("mine", "mine-pop1"), ("theirs", "theirs-pop1"), ("gone", "gone-pop1")] {
+            a.on_host(&HostToApp::PopupOpened { opener: opener.into(), id: id.into(), url: "http://127.0.0.1:1/".into(), w: None, h: None });
+            a.on_host(&HostToApp::CdpTarget { id: id.into(), target_id: format!("T-{id}") });
+        }
+        let listed: Value = serde_json::from_str(&std::fs::read_to_string(a.cdp.path()).unwrap()).unwrap();
+        assert!(listed["targets"].get("theirs-pop1").is_some(), "an agent's own popup is listed");
+        assert!(listed["targets"].get("mine-pop1").is_none(), "the person's popup is not");
+        assert!(listed["targets"].get("gone-pop1").is_none(), "nor one whose opener is unknown");
+        assert_eq!(a.cdp.target_of("mine-pop1").as_deref(), Some("T-mine-pop1"), "the broker still knows it (grants decide)");
+    }
 
     #[test]
     fn the_table_covers_every_browser_command() {
