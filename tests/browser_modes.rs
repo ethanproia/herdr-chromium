@@ -51,9 +51,24 @@ fn main() {
     p.click(210.0, 130.0);
     p.pump();
     assert!(p.events().iter().any(|e| matches!(e, BrowserEvent::Picked { x, y } if (*x - 210.0).abs() < 0.5 && (*y - 130.0).abs() < 0.5)), "picked at (210, 130): {:?}", p.events());
+    // HERDR: S13. Pick waits out the double-click window (350 ms) before it ends.
+    assert_eq!(owner(&mut p), Owner::Pick, "still picking inside the double-click window");
+    // The harness clock is simulated: move it past the window.
+    p.cx.advance_clock(Duration::from_millis(400));
+    p.pump();
     assert_eq!(owner(&mut p), Owner::Browse, "a pick ends pick mode");
-    p.run_for(Duration::from_millis(200));
     assert_eq!(mouse_lines(&mut p), before, "the page saw none of the pick");
+    // A double-click inside the window is a text edit, not a second pick: pick mode doesn't end
+    // under it. (The stub host answers no element, so the edit itself is browser_text_edit's, on CEF.)
+    p.cx.update(|cx| v.update(cx, |v, cx| v.toggle_mode(Owner::Pick, cx)));
+    p.double_click(210.0, 130.0);
+    p.cx.advance_clock(Duration::from_millis(400));
+    p.pump();
+    assert_eq!(owner(&mut p), Owner::Pick, "the double-click cancelled the exit");
+    assert_eq!(mouse_lines(&mut p), before, "the page saw none of the double-click");
+    p.cx.update(|cx| v.update(cx, |v, cx| v.toggle_mode(Owner::Pick, cx)));
+    p.pump();
+    assert_eq!(owner(&mut p), Owner::Browse);
     // Lease: the strip names the agent; the user's click is refused; Take Control ends it.
     let input = p.cx.update(|cx| v.read(cx).input().clone());
     p.cx.update(|cx| input.update(cx, |i, _| i.grant_lease("claude")));

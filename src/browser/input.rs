@@ -82,6 +82,9 @@ pub enum OverlayEvent {
     PickStep(PickStep),
     // HERDR: S13. The text edit ended: save it (Return) or put the text back (Esc, an agent lease).
     TextEditDone { commit: bool },
+    // HERDR: S13. A double-click while picking (or on the comment the first click opened): the
+    // view asks for the element under it and edits its text in place.
+    DoubleClick { x: f32, y: f32 },
 }
 
 /// The comment field's text: committed text, an open IME composition and undo history.
@@ -423,6 +426,10 @@ impl BrowserInput {
                 NavigationDirection::Back => AppToHost::Back { id },
                 NavigationDirection::Forward => AppToHost::Forward { id },
             });
+            return;
+        }
+        if ev.click_count == 2 && ev.button == MouseButton::Left && matches!(self.owner(), Owner::Pick | Owner::Comment) && !self.space_held {
+            self.overlay.push(OverlayEvent::DoubleClick { x, y });
             return;
         }
         if !self.pointer(MouseKind::Down, x, y, ev.modifiers.shift) {
