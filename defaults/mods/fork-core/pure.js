@@ -1,7 +1,7 @@
 // Pure helpers: no host imports, so `node core/test.mjs` can load them.
 import { RUN_ALLOW } from "./registry.js";
 
-export const ROLES = ["tabs", "pane-header", "menu", "plus", "new-panel", "side-strip", "sidebar-footer", "status", "sidebar-header", "header-menu"];
+export const ROLES = ["tabs", "pane-header", "menu", "plus", "new-panel", "side-strip", "sidebar-footer", "status", "sidebar-header", "header-menu", "inbox"];
 
 // Which role a copy of core plays. An explicit props.role wins; otherwise Herdr's own shapes decide:
 // terminal_menu passes { tab, target }; pane.split passes { direction }; a pane header block passes { pane }.

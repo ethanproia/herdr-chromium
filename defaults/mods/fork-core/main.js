@@ -6,6 +6,7 @@
 //   new-panel    the chooser a split opens            replaced: split-chooser
 //   side-strip   the side panel's tab strip (separate worker)
 //   header-menu  a narrow pane's folded header buttons
+//   inbox        the bell's notification panel (popup)
 // A role is a plain class with init(props, cx), render(cx) and an optional close(cx); this View creates it once and
 // delegates. Roles reach each other only through this folder's own name (SELF), never an old folder id.
 import { View, div } from "gpui-kit";
@@ -21,8 +22,9 @@ import SidebarFooter from "./roles/sidebar-footer.js";
 import Status from "./roles/status.js";
 import SidebarHeader from "./roles/sidebar-header.js";
 import HeaderMenu from "./roles/header-menu.js";
+import Inbox from "./roles/inbox.js";
 
-const ROLE_CLASSES = { "tabs": Tabs, "pane-header": PaneHeader, "menu": Menu, "plus": Plus, "new-panel": NewPanel, "side-strip": SideStrip, "sidebar-footer": SidebarFooter, "status": Status, "sidebar-header": SidebarHeader, "header-menu": HeaderMenu };
+const ROLE_CLASSES = { "tabs": Tabs, "pane-header": PaneHeader, "menu": Menu, "plus": Plus, "new-panel": NewPanel, "side-strip": SideStrip, "sidebar-footer": SidebarFooter, "status": Status, "sidebar-header": SidebarHeader, "header-menu": HeaderMenu, "inbox": Inbox };
 
 export default class Core extends View {
   init(p, cx) {

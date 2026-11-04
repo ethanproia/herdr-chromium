@@ -8,6 +8,8 @@ import { spaces, panes, run, openOverlay, theme, window, shared, setShared, layo
 import { SELF } from "../self.js";
 import { fadeLabel, over } from "../scroll.js";
 import { icon, openInTab, openRegistry } from "../look.js";
+import { inboxSnapshot } from "../notes.js";
+import { badgeState, inboxHeight, INBOX_W, BELL_MENU_H } from "../inbox-pure.js";
 
 const SIDE = (id) => `panels.side.${id}`;
 
@@ -140,6 +142,16 @@ export default class Tabs {
           else { run("layout.select", { stack: "panel-body", child: id }); run("layout.show", { id: "panel" }); }
         }).child(tool?.icon ? svg(tool.icon).size(14) : div().size(14));
     };
+    // The notification bell, before the pinned tools: a dot while anything is unread (the blocked colour when an
+    // error is waiting), bell-off under Do Not Disturb. Stock Herdr has no notification API: no bell at all.
+    const snap = inboxSnapshot(), badge = badgeState(snap);
+    const bell = () => div().id("inbox-bell").size(26).flex_none().relative().flex().items_center().justify_center().rounded(6)
+      .text_color(t.muted).hover((s) => s.bg(t.hover).text_color(t.foreground)).on_mouse_down("left", stop)
+      .tooltip(badge.dnd ? "Notifications (Do Not Disturb)" : "Notifications")
+      .on_mouse_down("right", (_e, cx) => { cx.stop_propagation(); openOverlay({ mod: SELF, kind: "popup", width: 260, height: BELL_MENU_H, props: { role: "menu", tab: "inbox", target: {} } }); })
+      .on_click(() => { const h = inboxHeight(inboxSnapshot(), Date.now()); openOverlay({ mod: SELF, kind: "popup", width: INBOX_W, height: h, props: { role: "inbox", height: h } }); })
+      .child(svg(icon(badge.dnd ? "bell-off" : "bell")).size(15))
+      .when(badge.dot, (el) => el.child(div().absolute().top(4).right(4).size(5).rounded_full().bg(badge.tone === "error" ? t.blocked : t.accent)));
     // Stock 0.1.12's rule: in a windowed macOS (titlebar none) the window buttons sit over the layout at
     // traffic_lights; when the sidebar is narrower than them (the 44px rail), the tabs start after them.
     const root = layout(), bar = find(root, "sidebar"), w = window();
@@ -154,6 +166,7 @@ export default class Tabs {
       // + sits right after the last tab, as in Chrome, Figma and Paper (it scrolls with the tabs).
       .child(h_flex().id("tab-scroll").flex_1().min_w(0).h_full().items_center().gap(3).overflow_x_scrollbar().children(shown.map(item))
         .child(button("tab-new", "+", () => openOverlay({ mod: SELF, kind: "popup", width: 260, height: 575, props: { role: "plus" } }))))
+      .when(badge.show, (el) => el.child(bell()))
       .children(pins.map((id) => panelButton(id)))
       .when(window()?.buttons, (el) => el.child(button("minimize", "−", () => run("window.minimize")))
         .child(button("maximize", "□", () => run("window.maximize")))
