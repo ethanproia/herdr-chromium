@@ -893,14 +893,27 @@ fn serve(socket: &Path, listener: UnixListener, args: &Args) -> io::Result<()> {
         if drained == DRAIN_MAX {
             continue;
         }
-        let now = std::time::Instant::now();
-        let due = PUMP_DUE.lock().unwrap().map_or(now + PUMP_FALLBACK, |d| d.min(now + PUMP_FALLBACK));
-        let wait = due.saturating_duration_since(now);
-        if !wait.is_zero() {
+        // Wait for CEF's deadline. A frame ack is handled as it comes (it only promotes the next
+        // frame; no CEF work) without pumping early, so CEF keeps its own capture rhythm; input,
+        // anything else and CEF asking sooner end the wait.
+        loop {
+            let now = std::time::Instant::now();
+            let due = PUMP_DUE.lock().unwrap().map_or(now + PUMP_FALLBACK, |d| d.min(now + PUMP_FALLBACK));
+            let wait = due.saturating_duration_since(now);
+            if wait.is_zero() {
+                break;
+            }
             match rx.recv_timeout(wait) {
-                Ok(m) => woke = Some(m),
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => woke = Some(Incoming::Gone),
+                Ok(Incoming::Msg(m @ AppToHost::FrameAck { .. })) => handle(m),
+                Ok(m) => {
+                    woke = Some(m);
+                    break;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    woke = Some(Incoming::Gone);
+                    break;
+                }
             }
         }
     }
