@@ -1292,9 +1292,6 @@ impl BrowserView {
         }
         self.device = mode;
         self.device_menu = false;
-        let off = self.device.is_some();
-        self.input.update(cx, |i, _| i.set_annotate_off(off));
-        self.drain_overlay(cx);
         self.link.send(AppToHost::SetDevice { id: self.id.clone(), device: self.device.as_ref().map(|d| d.device()) });
         if let Some((size, scale)) = self.measured {
             self.laid_out(size, scale);
@@ -2119,12 +2116,25 @@ impl BrowserView {
         }));
     }
 
+    /// Responsive mode: how much the page is scaled to fit its block (1 when off).
+    fn fit(&self) -> f32 {
+        match (&self.device, self.measured) {
+            (Some(d), Some((area, _))) => d.fit(area.w, area.h),
+            _ => 1.0,
+        }
+    }
+
+    /// A page-DIP rect where overlays draw it (`geometry::to_drawn` at this block's fit).
+    fn drawn(&self, r: (f32, f32, f32, f32)) -> (f32, f32, f32, f32) {
+        super::geometry::to_drawn(r, self.fit())
+    }
+
     fn annotation_layer(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut out: Vec<AnyElement> = self
             .annotations
             .visible()
             .map(|a| {
-                let (x, y, _, _) = self.pin_rect(a);
+                let (x, y, _, _) = self.drawn(self.pin_rect(a));
                 let n = a.n;
                 div()
                     .id(("pin", n as usize))
@@ -2152,7 +2162,7 @@ impl BrowserView {
             .collect();
         // A9: the open pin's popover beside it.
         if let Some(pin) = self.open_pin.and_then(|n| self.annotations.visible().find(|p| p.n == n).cloned()) {
-            let (x, y, _, _) = self.pin_rect(&pin);
+            let (x, y, _, _) = self.drawn(self.pin_rect(&pin));
             let popover = design_bar::pin_popover(pin.n, &pin.comment, cx, |v, a, _, cx| v.pin_action(a, cx));
             out.push(
                 div()
@@ -2173,6 +2183,8 @@ impl BrowserView {
         if let Some((size, _)) = self.sized {
             let pins: Vec<(u32, (f32, f32, f32, f32))> = self.annotations.visible().map(|a| (a.n, self.pin_rect(a))).collect();
             let o = design_bar::offscreen(&pins, (size.w, size.h));
+            let (_, _, dw, dh) = self.drawn((0.0, 0.0, size.w, size.h));
+            let size = Dips { w: dw, h: dh };
             for (id, text) in design_bar::offscreen_labels(&o) {
                 let m = div().id(id).absolute().px_1().rounded_full().text_xs().bg(rgb(0xff3b30)).text_color(rgb(0xffffff)).child(text);
                 let m = match id {
@@ -2185,12 +2197,14 @@ impl BrowserView {
             }
         }
         if let Some(r) = self.rubber {
+            let (x, y, w, h) = self.drawn((r.x, r.y, r.w, r.h));
+            let r = Rect { x, y, w, h };
             out.push(div().absolute().left(px(r.x)).top(px(r.y)).w(px(r.w)).h(px(r.h)).border_1().border_color(rgb(0x3b82f6)).bg(hsla(0.6, 0.9, 0.6, 0.12)).into_any_element());
         }
         if let Some(t) = &self.comment_target {
             let input = self.input.read(cx);
             let typed = input.comment().text.clone() + input.comment().marked.as_deref().unwrap_or("");
-            let (x, y, _, h) = t.rect;
+            let (x, y, _, h) = self.drawn(t.rect);
             out.push(
                 div()
                     .id("comment-field")
@@ -2622,12 +2636,7 @@ impl BrowserView {
             .child(div().flex_1().min_w_0().overflow_hidden().child(Input::new(&self.address)))
             .when(self.state.loading, |d| d.child("loading"))
             // A1: one Design button; the strip under the bar holds every design control.
-            .child(if self.device.is_some() {
-                // Pick and markup overlays assume an unscaled page: off while a device is previewed.
-                button("Design", false).tooltip(|_, cx| cx.new(|_| Hint("Turn off device mode to annotate")).into())
-            } else {
-                button("Design", true).on_click(cx.listener(|v, _, _, cx| v.toggle_mode(Owner::Pick, cx)))
-            })
+            .child(button("Design", true).on_click(cx.listener(|v, _, _, cx| v.toggle_mode(Owner::Pick, cx))))
             // The zoom label shows only off 100 %; a click resets it.
             .when(self.zoom_level.abs() > 1e-6, |d| {
                 d.child(div().id("zoom-label").px_1().rounded_sm().cursor_pointer().bg(hsla(0., 0., 0.5, 0.15)).child(zoom::percent(self.zoom_level)).on_click(cx.listener(|v, _, _, cx| v.set_zoom(0.0, cx))))
@@ -2744,6 +2753,35 @@ impl Render for BrowserView {
         // A window shot covers a page the person marked sensitive (its pixels never reach the file).
         let masked = SHOT_MASK.load(std::sync::atomic::Ordering::SeqCst) && self.grant(Grant::Sensitive);
         let frame = if masked { None } else { frame };
+        // Current overlay rects (stale ones are already gone), outlined over the frame.
+        // A3: a stepped pick draws its own box (the pointer's hit test is not it).
+        let stepped = self.hovered.as_ref().filter(|_| self.stepped).map(|t| Rect { x: t.rect.0, y: t.rect.1, w: t.rect.2, h: t.rect.3 });
+        let boxes: Vec<Rect> = match stepped {
+            Some(r) => vec![r],
+            None => self.overlay.shown().to_vec(),
+        };
+        let boxes: Vec<Rect> = boxes.iter().map(|r| { let (x, y, w, h) = self.drawn((r.x, r.y, r.w, r.h)); Rect { x, y, w, h } }).collect();
+        // Every overlay goes in `over`: drawn over the frame, inside the letterboxed box in
+        // responsive mode (positions already through `drawn`).
+        let mut over: Vec<AnyElement> = Vec::new();
+        over.extend(boxes.iter().map(|r| {
+            div().absolute().left(px(r.x)).top(px(r.y)).w(px(r.w)).h(px(r.h)).border_2().border_color(rgb(0x3b82f6)).bg(hsla(0.6, 0.9, 0.6, 0.15)).into_any_element()
+        }));
+        // A2: the label chip on the hover box while picking ("element · W×H" until the label comes).
+        let chip = (self.owner(cx) == Owner::Pick).then(|| boxes.first().copied()).flatten().map(|r| {
+            let label = self.hovered.as_ref().map(|t| t.label.as_str()).unwrap_or("");
+            let (x, y) = design_bar::chip_origin((r.x, r.y, r.w, r.h));
+            div().absolute().left(px(x)).top(px(y)).child(design_bar::chip(design_bar::chip_text(label, r.w, r.h)))
+        });
+        over.extend(chip.map(IntoElement::into_any_element));
+        // S6/S7: pins, the rubber band and the comment field over the frame.
+        over.extend(self.annotation_layer(cx));
+        // Markup above the frame and the highlights, while marking up or when shapes exist.
+        let marking = self.owner(cx) == Owner::Markup || !self.markup.read(cx).shapes().is_empty();
+        if marking {
+            over.push(markup::element(self.markup.clone(), self.fit()).into_any_element());
+        }
+        let mut over_slot = Some(over);
         let page = match (&self.crashed, frame) {
             _ if masked => page.child(
                 div().absolute().size_full().flex().items_center().justify_center().bg(rgb(0x202020)).text_color(rgb(0x909090)).text_sm().child("Hidden in screenshots: marked sensitive"),
@@ -2767,7 +2805,8 @@ impl Render for BrowserView {
                                 .h(px(d.h * fit))
                                 .bg(rgb(0xffffff))
                                 .child(div().absolute().size_full().child(frame))
-                                .child(canvas(|_, _, _| (), move |bounds, _, window, cx| input::paint(&box_input, &box_focus, bounds, window, cx)).absolute().size_full()),
+                                .child(canvas(|_, _, _| (), move |bounds, _, window, cx| input::paint(&box_input, &box_focus, bounds, window, cx)).absolute().size_full())
+                                .children(over_slot.take().into_iter().flatten()),
                         ),
                 )
                 .children(self.load_error_card(cx))
@@ -2804,29 +2843,8 @@ impl Render for BrowserView {
                     ),
             ),
         };
-        // Current overlay rects (stale ones are already gone), outlined over the frame.
-        // A3: a stepped pick draws its own box (the pointer's hit test is not it).
-        let stepped = self.hovered.as_ref().filter(|_| self.stepped).map(|t| Rect { x: t.rect.0, y: t.rect.1, w: t.rect.2, h: t.rect.3 });
-        let boxes: Vec<Rect> = match stepped {
-            Some(r) => vec![r],
-            None => self.overlay.shown().to_vec(),
-        };
-        let page = page.children(boxes.iter().map(|r| {
-            div().absolute().left(px(r.x)).top(px(r.y)).w(px(r.w)).h(px(r.h)).border_2().border_color(rgb(0x3b82f6)).bg(hsla(0.6, 0.9, 0.6, 0.15))
-        }));
-        // A2: the label chip on the hover box while picking ("element · W×H" until the label comes).
-        let chip = (self.owner(cx) == Owner::Pick).then(|| boxes.first().copied()).flatten().map(|r| {
-            let label = self.hovered.as_ref().map(|t| t.label.as_str()).unwrap_or("");
-            let (x, y) = design_bar::chip_origin((r.x, r.y, r.w, r.h));
-            div().absolute().left(px(x)).top(px(y)).child(design_bar::chip(design_bar::chip_text(label, r.w, r.h)))
-        });
-        let page = page.children(chip);
-        // S6/S7: pins, the rubber band and the comment field over the frame.
-        let layer = self.annotation_layer(cx);
-        let page = page.children(layer);
-        // Markup above the frame and the highlights, while marking up or when shapes exist.
-        let marking = self.owner(cx) == Owner::Markup || !self.markup.read(cx).shapes().is_empty();
-        let page = page.when(marking, |p| p.child(markup::element(self.markup.clone())));
+        // In responsive mode the device's box took the overlays; otherwise they go over the page.
+        let page = page.children(over_slot.take().into_iter().flatten());
         // The context menu over everything in the page; it takes the mouse first (occlude).
         let menu = self.menu_element(cx);
         let page = page.children(menu);
@@ -2977,15 +2995,6 @@ pub fn broker_authorizer(agent: Arc<Mutex<Agent>>, states: Arc<Mutex<HashMap<Bro
         };
         agent.lock().unwrap().broker_allowed(&grants_of, method, profile.as_deref())
     })
-}
-
-/// A small tooltip.
-struct Hint(&'static str);
-
-impl Render for Hint {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div().px_2().py_1().rounded_sm().text_xs().bg(rgb(0x1f1f1f)).text_color(rgb(0xf2f2f2)).child(self.0)
-    }
 }
 
 /// Set while `herdr-app shot` renders the window: blocks marked sensitive draw a cover instead of the page.
