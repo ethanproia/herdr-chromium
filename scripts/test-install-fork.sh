@@ -73,7 +73,8 @@ HOME=$H "$CLI" uninstall --purge >"$scratch/purge.log" 2>&1 && ok "uninstall --p
 [[ $(ls "$H/.Trash" | grep -c "^$BRAND_CLI ") -ge 1 && $(ls "$H/.Trash" | grep -c "^$(basename "$BRAND_HOME") ") -ge 1 ]] && ok "CLI and home both in the Trash" || bad "Trash: $(ls "$H/.Trash")"
 [[ $(stock_sum) == "$before" ]] && ok "stock untouched after --purge" || bad "stock changed by --purge"
 
-# Refuses to write over stock.
+# Refuses to write over stock (a copy of the installer, with the name files beside it as in an app).
+cp scripts/brand.sh brand.json "$scratch/"
 out=$(HOME=$H HERDR_APP_BIN=$HERDR_APP_BIN HERDR_HOST_APP=$host FORK_INSTALL_NO_REGISTER=1 bash -c 'sed "s|^cli=.*|cli=\"\$HOME/.local/bin/herdr-app\"|" scripts/install-fork-macos > "'"$scratch"'/evil" && bash "'"$scratch"'/evil"' 2>&1)
 [[ $out == *"refusing"* ]] && ok "refuses to write over stock's CLI" || bad "no refusal: $out"
 [[ $(stock_sum) == "$before" ]] && ok "stock untouched at the end" || bad "stock changed"

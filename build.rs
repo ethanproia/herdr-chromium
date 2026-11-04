@@ -44,7 +44,29 @@ fn brand(base: &Path) {
         let end = start + rest[start..].find('"').unwrap();
         rest[start..end].to_string()
     };
-    let code = format!("pub const NAME: &str = {:?};\npub const SLUG: &str = {:?};\n", field("name"), field("slug"));
+    // Build info (shown once its place is settled): the fork's version, the Herdr version it is
+    // built on (this crate's), and the commit it was built from.
+    let sha = std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .current_dir(base)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|| "unknown".into());
+    // A new commit is a new GIT_SHA: watch this checkout's own HEAD (a worktree's lives in the
+    // main repository), and its branch ref.
+    let git = |args: &[&str]| std::process::Command::new("git").args(args).current_dir(base).output().ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    if let Some(head) = git(&["rev-parse", "--absolute-git-dir"]) {
+        println!("cargo:rerun-if-changed={head}/HEAD");
+        if let Some(r) = git(&["symbolic-ref", "-q", "HEAD"]) {
+            println!("cargo:rerun-if-changed={head}/{r}");
+        }
+    }
+    let code = format!(
+        "pub const NAME: &str = {:?};\npub const SLUG: &str = {:?};\n/// The fork's own version (brand.json).\npub const VERSION: &str = {:?};\n/// The stock Herdr version this build is based on.\npub const HERDR_BASE: &str = {:?};\n/// The commit this build was made from (short sha, \"unknown\" outside git).\npub const GIT_SHA: &str = {:?};\n",
+        field("name"), field("slug"), field("version"), std::env::var("CARGO_PKG_VERSION").unwrap(), sha
+    );
     std::fs::write(Path::new(&std::env::var("OUT_DIR").unwrap()).join("brand.rs"), code).unwrap();
 }
 

@@ -1,6 +1,7 @@
 {
   "name": "Trestle",
   "slug": "trestle",
+  "version": "0.2.0",
   "bundle_id": "dev.trestle.app",
   "cli": "trestle",
   "home": ".config/trestle",
