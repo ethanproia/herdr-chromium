@@ -658,7 +658,33 @@ fn send_frame(id: &str, seq: u64, mut s: Surface, scale: f32) {
     }
 }
 
+/// When CEF next wants `do_message_loop_work` (from `on_schedule_message_pump_work`, any thread),
+/// and the main loop's channel, so a deadline sooner than its wait wakes it.
+static PUMP_DUE: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+static PUMP_WAKE: std::sync::OnceLock<std::sync::Mutex<mpsc::Sender<Incoming>>> = std::sync::OnceLock::new();
+/// The loop pumps at least this often even when CEF schedules nothing (CEF's own guidance).
+const PUMP_FALLBACK: Duration = Duration::from_millis(33);
+/// Messages handled per pass, so a burst of input never starves the pump.
+const DRAIN_MAX: usize = 64;
+
+pub(crate) fn pump_due(delay_ms: i64) {
+    let at = std::time::Instant::now() + Duration::from_millis(delay_ms.max(0) as u64);
+    let sooner = {
+        let mut due = PUMP_DUE.lock().unwrap();
+        let sooner = due.is_none_or(|d| at < d);
+        if sooner {
+            *due = Some(at);
+        }
+        sooner
+    };
+    if sooner && let Some(tx) = PUMP_WAKE.get() {
+        let _ = tx.lock().unwrap().send(Incoming::Wake);
+    }
+}
+
 enum Incoming {
+    /// CEF asked for a pump sooner than the loop's wait.
+    Wake,
     Msg(AppToHost),
     Bad(String),
     Gone,
@@ -811,6 +837,7 @@ fn serve(socket: &Path, listener: UnixListener, args: &Args) -> io::Result<()> {
     send(HostToApp::Ready { version: PROTOCOL_VERSION, cef_version: cef_version(), cdp_port: cdp, cdp_pipe: CDP_PIPE.load(std::sync::atomic::Ordering::SeqCst) });
 
     let (tx, rx) = mpsc::channel();
+    let _ = PUMP_WAKE.set(std::sync::Mutex::new(tx.clone()));
     std::thread::spawn(move || {
         for line in reader.lines() {
             let Ok(line) = line else { break };
@@ -828,14 +855,22 @@ fn serve(socket: &Path, listener: UnixListener, args: &Args) -> io::Result<()> {
         let _ = tx.send(Incoming::Gone);
     });
 
+    // CEF's external pump (SEC: frames, acks and input all wait on it): run `do_message_loop_work`,
+    // handle a bounded batch of messages, then wait until CEF's own deadline
+    // (`on_schedule_message_pump_work`) or the next message, whichever is first, never longer than
+    // PUMP_FALLBACK. A fixed sleep here made every frame and ack wait for the next pass.
+    let mut woke: Option<Incoming> = None;
     loop {
+        *PUMP_DUE.lock().unwrap() = None;
         let pump = trace::on().then(trace::now);
         do_message_loop_work();
         let drain = trace::on().then(trace::now);
         let mut drained = 0;
-        while let Ok(m) = rx.try_recv() {
+        while drained < DRAIN_MAX {
+            let Some(m) = woke.take().or_else(|| rx.try_recv().ok()) else { break };
             drained += 1;
             match m {
+                Incoming::Wake => {}
                 Incoming::Msg(AppToHost::Shutdown) | Incoming::Gone => {
                     with_host(|h| h.quit = true);
                 }
@@ -855,7 +890,32 @@ fn serve(socket: &Path, listener: UnixListener, args: &Args) -> io::Result<()> {
                 trace::line("pump", format_args!("work_us={} drain_us={} msgs={drained}", (d - p) / 1000, (end - d) / 1000));
             }
         }
-        std::thread::sleep(Duration::from_millis(4));
+        if drained == DRAIN_MAX {
+            continue;
+        }
+        // Wait for CEF's deadline. A frame ack is handled as it comes (it only promotes the next
+        // frame; no CEF work) without pumping early, so CEF keeps its own capture rhythm; input,
+        // anything else and CEF asking sooner end the wait.
+        loop {
+            let now = std::time::Instant::now();
+            let due = PUMP_DUE.lock().unwrap().map_or(now + PUMP_FALLBACK, |d| d.min(now + PUMP_FALLBACK));
+            let wait = due.saturating_duration_since(now);
+            if wait.is_zero() {
+                break;
+            }
+            match rx.recv_timeout(wait) {
+                Ok(Incoming::Msg(m @ AppToHost::FrameAck { .. })) => handle(m),
+                Ok(m) => {
+                    woke = Some(m);
+                    break;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    woke = Some(Incoming::Gone);
+                    break;
+                }
+            }
+        }
     }
 
     // Close every browser, let CEF finish closing, then shut down.
