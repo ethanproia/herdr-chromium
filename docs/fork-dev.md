@@ -54,6 +54,16 @@ and never self-update (`update::start`, "a build from source").
 `scripts/fork-run.sh <name> down` stops that fork's window (only if its
 command line is this build) and its core.
 
+### Test-only clicks: `do mod.click`
+Headless homes start with `HERDR_APP_TEST_INPUT=1` (`fork-run.sh up`; pass
+`HERDR_APP_TEST_INPUT=0` to leave it out). Only then does
+`do mod.click --copy <slot> --x <px> --y <px>` exist: a left click at pane-local
+pixels in a shown mod copy (for a mod in a tab, its pane id: `status`
+`focused_pane`). The app draws first, so no `shot` is needed. Without the
+variable it is an unknown command and `commands` never lists it: agents must
+never be able to click a mod's approval prompt in a real run.
+`scripts/test-mod-click.sh` checks both.
+
 ## Offscreen render: `scripts/fork-render.sh`
 
 `scripts/fork-render.sh <layout.json> <out.png> [name]` starts the app

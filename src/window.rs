@@ -403,6 +403,8 @@ pub struct AppWindow {
     /// Mods placed once; later the layout decides where (or whether) they show.
     seen: BTreeSet<String>,
     bounds: Rc<RefCell<HashMap<String, Bounds<Pixels>>>>,
+    /// HERDR: each shown mod copy's bounds by slot, for test-only mod.click (filled only with test input on).
+    slot_bounds: Rc<RefCell<HashMap<String, Bounds<Pixels>>>>,
     drag: Option<Drag>,
     written_layout: String,
     /// The shown layout as its file has it; `chrome` is this plus the clicks
@@ -516,6 +518,7 @@ impl AppWindow {
             folders: mods::scan().into_iter().map(|f| (f.id.clone(), f)).collect(),
             seen,
             bounds: Default::default(),
+            slot_bounds: Default::default(),
             drag: None,
             written_layout: String::new(),
             file_chrome: default_layout("main"),
@@ -2718,6 +2721,43 @@ impl AppWindow {
         }
     }
 
+    /// HERDR: `mod.click` (test runs only): a left click at pane-local x, y in a shown mod copy,
+    /// dispatched after this command returns, as real input would arrive.
+    fn mod_click(&mut self, a: &Value, window: &mut Window, cx: &mut Context<Self>) -> Result<Value, String> {
+        if !crate::commands::test_input() {
+            return Err("unknown command \"mod.click\"".into());
+        }
+        let slot = Self::arg(a, "copy").unwrap_or_default();
+        let num = |k: &str| a.get(k).and_then(|v| v.as_f64().or_else(|| v.as_str()?.parse().ok()));
+        let (Some(x), Some(y)) = (num("x"), num("y")) else { return Err("mod.click needs numbers x and y".into()) };
+        if !self.copies.contains_key(slot) {
+            return Err(format!("no mod copy {slot:?} is shown"));
+        }
+        if x < 0. || y < 0. {
+            return Err(format!("{x}, {y}: x and y count from the copy's top left"));
+        }
+        // Outside this window's update: draw first (a headless window paints nothing by itself, so
+        // the copy has no measured place yet), then click as real input arrives.
+        let (handle, map, slot) = (window.window_handle(), self.slot_bounds.clone(), slot.to_owned());
+        cx.defer(move |cx| {
+            use gpui::InputEvent;
+            let _ = handle.update(cx, |_, window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+                let Some(b) = map.borrow().get(&slot).copied() else { return tracing::warn!("mod.click: {slot:?} has no place on screen") };
+                if x > f64::from(f32::from(b.size.width)) || y > f64::from(f32::from(b.size.height)) {
+                    return tracing::warn!("mod.click: {x}, {y} is outside {slot:?} ({} x {})", f32::from(b.size.width), f32::from(b.size.height));
+                }
+                let position = gpui::point(b.origin.x + px(x as f32), b.origin.y + px(y as f32));
+                let down = MouseDownEvent { button: MouseButton::Left, position, modifiers: Default::default(), click_count: 1, first_mouse: false };
+                let up = gpui::MouseUpEvent { button: MouseButton::Left, position, modifiers: Default::default(), click_count: 1 };
+                window.dispatch_event(down.to_platform_input(), cx);
+                window.dispatch_event(up.to_platform_input(), cx);
+            });
+        });
+        Ok(json!({ "ok": true }))
+    }
+
     fn argv(args: &Value) -> Option<Vec<String>> {
         args.get("argv").and_then(|v| serde_json::from_value(v.clone()).ok())
     }
@@ -3410,6 +3450,11 @@ impl AppWindow {
             }
             "window.close" | "window.minimize" | "window.maximize" => return self.window_command(name, window, cx),
             "window.native" => return self.answer(Self::window_native(window)),
+            // HERDR: test-only (commands::TEST_COMMANDS): unknown unless HERDR_APP_TEST_INPUT=1 at start.
+            "mod.click" => {
+                let r = self.mod_click(a, window, cx);
+                return self.answer(r);
+            }
             // Hiding apps is macOS's (bound natively there).
             "app.hide" | "app.hide_others" | "app.show_all" => return,
             other => {
@@ -4064,7 +4109,7 @@ impl AppWindow {
         let mut el = div().relative().overflow_hidden().size_full().flex();
         let bounds_map = self.bounds.clone();
         let id = n.id.clone();
-        el = el.child(canvas(move |b, _, _| { bounds_map.borrow_mut().insert(id, b); }, |_, _, _, _| {}).absolute().size_full());
+        el = el.child(canvas(move |b, _, _| { bounds_map.borrow_mut().insert(id, b); }, |_, _, _, _| {}).absolute().top_0().left_0().size_full());
         el = apply_look(el, n, focused.contains(&n.id));
         if n.window_drag {
             el = self.window_drag(el, cx);
@@ -4480,6 +4525,11 @@ impl AppWindow {
                 // spinners over it, waking only itself (GPUI rebuilds all under a cached
                 // view that changed, so a spinner step would rebuild the mod).
                 .map(|d| if in_overlay { d.h_auto().min_h_0().flex().flex_col().child(root.clone()) } else { d.child(root.clone()) })
+                // HERDR: where each copy is, for test-only mod.click (recorded only with HERDR_APP_TEST_INPUT=1).
+                .when(crate::commands::test_input(), |d| {
+                    let (map, id) = (self.slot_bounds.clone(), slot.to_owned());
+                    d.relative().child(canvas(move |b, _, _| { map.borrow_mut().insert(id, b); }, |_, _, _, _| {}).absolute().top_0().left_0().size_full())
+                })
                 .into_any_element(),
             Some(Copy { error, inst, .. }) => div()
                 .id(SharedString::from(format!("err-{slot}")))
