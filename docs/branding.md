@@ -28,32 +28,3 @@ Internal names keep herdr. That covers the crates and binaries (`herdr-app`,
 modules, the stock `herdr-app` and `hc` CLIs that mods call, and the `labs` layout (the
 person's own file, with its window state). That way, merges from
 upstream Herdr stay small.
-
-## Deep rename (for a release branch)
-
-`scripts/rename-brand.sh --dry-run` lists every internal herdr name the deep rename would
-change: each file, its match count, and what the allow-list protects. These are:
-
-- vendored and third-party code;
-- licence and notice files;
-- lines with URLs;
-- the stock `herdr-app` CLI in `defaults/`;
-- stock Herdr's own paths.
-
-`scripts/rename-brand.sh --deep` applies it. That rewrites:
-
-- the crates and binaries to `<slug>-app` and `<slug>-browser-*`;
-- `HERDR_` to `<SLUG>_`;
-- the bundled mods' `fork-` prefix to `<slug>-`;
-- the names of files and folders carrying these names.
-
-It refuses to run on `ethan/browser-parity`, `master` or `main`. Run it on a throwaway
-release branch (`ethan/release-<name>`) and never merge that branch back.
-
-`scripts/test-rename-brand.sh [slug]` proves it on a scratch copy. After a deep rename to
-another name, the copy must:
-
-- build (workspace, all targets, and the CEF host feature);
-- pass the app tests;
-- pass `test-brand.sh`;
-- pass the installer's scratch-HOME test.
