@@ -138,29 +138,33 @@ export default class Agents extends View {
     return sawDone ? RANK.done : RANK[a.status] ?? 0;
   }
 
+  // Same look as core's shared menu (menuRow / groupLabel): 4px padding, a 30px label, 32px rows with a 15px icon in
+  // a 16px slot, 13px names, a check on the right for the current choice. Height stated (a popup has none of its own).
   sortMenu(t) {
     const on = sortOf().id;
     return v_flex()
       .w_full()
-      .p(5)
+      .h(8 + 30 + SORTS.length * 32)
+      .p(4)
       .bg(t.popover)
-      .text_size(12.8)
-      .child(div().px(8).pt(4).pb(6).text_size(11).text_color(t.dim).child("Sort agents"))
+      .child(div().h(30).flex_none().flex().items_end().px(8).pb(6).text_size(12).line_height("18px").font_weight(500).text_color(t.dim).child("Sort Agents"))
       .children(SORTS.map((s) => h_flex()
         .id(`sort-${s.id}`)
-        .h(31)
+        .h(32)
+        .flex_none()
         .px(8)
-        .gap(9)
-        .rounded(7)
+        .gap(10)
+        .rounded(6)
         .items_center()
+        .cursor_pointer()
         .text_color(t.foreground)
         .hover((el) => el.bg(t.hover))
         .on_click(() => {
           setShared("agents.sort", s.id);
           closeOverlay(props().overlay);
         })
-        .child(svg(`mods/workspace-chrome/${s.icon}.svg`).size(14).flex_none().text_color(t.muted))
-        .child(div().flex_1().child(s.label))
+        .child(div().size(16).flex_none().flex().items_center().justify_center().text_color(t.muted).child(svg(`mods/workspace-chrome/${s.icon}.svg`).size(15)))
+        .child(div().flex_1().min_w(0).truncate().text_size(13).child(s.label))
         .when(s.id === on, (el) => el.child(svg("mods/workspace-chrome/check.svg").size(14).flex_none().text_color(t.foreground)))));
   }
 
@@ -444,7 +448,7 @@ export default class Agents extends View {
                 .text_size(11)
                 .text_color(t.dim)
                 .hover((s) => s.text_color(t.foreground))
-                .on_click(() => openOverlay({ mod: "fork-agents-named", kind: "popup", width: 200, height: 140, props: { sortMenu: true } }))
+                .on_click(() => openOverlay({ mod: "fork-agents-named", kind: "popup", width: 220, height: 8 + 30 + SORTS.length * 32, props: { sortMenu: true } }))
                 .tooltip(`Sort Agents: ${sort.label}`)
                 .child(svg(`mods/workspace-chrome/${sort.icon}.svg`).size(14)),
             ),
