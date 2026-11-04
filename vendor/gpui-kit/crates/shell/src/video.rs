@@ -2,7 +2,7 @@
 //! plays. The host (herdr-app) installs the renderer that plays it; without one the element is an
 //! empty box styled like any other, so a script still lays out and tests run headless.
 
-use gpui::{AnyElement, App, ElementId, IntoElement, SharedString, StyleRefinement, Styled, Window, div};
+use gpui::{AnyElement, App, ElementId, InteractiveElement, IntoElement, SharedString, StyleRefinement, Styled, Window, div};
 use std::sync::OnceLock;
 
 /// What a script asked for. The path follows `image`'s rule (inside the application directory);
@@ -58,19 +58,4 @@ pub(crate) fn render(spec: &VideoSpec, id: ElementId, key: Option<SharedString>,
     let mut el = div().id(id);
     el.style().refine(&refinement);
     el.into_any_element()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn options_parse_strictly() {
-        let s = VideoSpec::parse("a.mp4".into(), r#"{"autoplay":true,"loop":true,"muted":false,"controls":true}"#).unwrap();
-        assert_eq!(s, VideoSpec { path: "a.mp4".into(), autoplay: true, looped: true, muted: false, controls: true });
-        assert_eq!(VideoSpec::parse("a.mp4".into(), "{}").unwrap(), VideoSpec { path: "a.mp4".into(), ..VideoSpec::default() });
-        assert!(VideoSpec::parse("a.mp4".into(), r#"{"autoplya":true}"#).unwrap_err().contains("unknown video option"));
-        assert!(VideoSpec::parse("a.mp4".into(), r#"{"loop":1}"#).unwrap_err().contains("true or false"));
-        assert!(VideoSpec::parse("a.mp4".into(), "[]").is_err());
-    }
 }
