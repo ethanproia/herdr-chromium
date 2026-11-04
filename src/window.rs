@@ -11,6 +11,8 @@ mod pane_drag;
 #[cfg(target_os = "macos")]
 mod native_titlebar;
 mod titlebar;
+// HERDR: toasts as a Sonner-style deck.
+mod toasts;
 
 use crate::layout::{Axis, Background as Paint, Content, Fit, HeaderContent, Kind, Line, Node, PaneFrame, Size as Span};
 use crate::model::{self, Tab, Model};
@@ -346,6 +348,8 @@ struct Overlay {
     /// The app's own screen (a `frame-` mod: What's new, the welcome): only
     /// its own close ends it, never a layout switch.
     frame: bool,
+    /// HERDR: a toast fading out since then (removed once the fade is over).
+    leaving: Option<Instant>,
 }
 
 struct Drag {
@@ -463,6 +467,10 @@ pub struct AppWindow {
     /// What's waiting, in words (`update_label`).
     update_ready: Option<String>,
     update_dismissed: Option<String>,
+    /// HERDR: the pointer is over the toast deck since then: every toast's timer waits.
+    deck_hover: Option<Instant>,
+    /// HERDR: each toast card's last two y's in the deck (design px), for the move animation.
+    deck_moves: RefCell<HashMap<String, (f32, f32)>>,
     update_success: bool,
     update_status: String,
     focus: FocusHandle,
@@ -549,6 +557,8 @@ impl AppWindow {
             polls: 0,
             update_ready: None,
             update_dismissed: None,
+            deck_hover: None,
+            deck_moves: RefCell::default(),
             update_success: false,
             update_status: String::new(),
             focus: cx.focus_handle(),
@@ -3571,6 +3581,7 @@ impl AppWindow {
             place,
             key: key.clone(),
             frame: spec.get("mod").and_then(Value::as_str).is_some_and(|m| m.starts_with("frame-")),
+            leaving: None,
         });
         if let Some(k) = &key {
             if spec.get("keep").and_then(Value::as_bool) == Some(true) {
@@ -3829,7 +3840,15 @@ impl AppWindow {
             self.sync_folders(window, cx);
         }
         let now = Instant::now();
-        let expired: Vec<String> = self.overlays.iter().filter(|o| o.expires.is_some_and(|e| e <= now)).map(|o| o.id.clone()).collect();
+        // HERDR: toasts wait while the pointer is over the deck; a timed-out one fades, then goes.
+        if self.deck_hover.is_none() {
+            for o in self.overlays.iter_mut().filter(|o| o.leaving.is_none() && o.expires.is_some_and(|e| e <= now)) {
+                o.leaving = Some(now);
+                cx.notify();
+            }
+        }
+        let fade = Duration::from_millis(toasts::ANIM_MS);
+        let expired: Vec<String> = self.overlays.iter().filter(|o| o.leaving.is_some_and(|t| now >= t + fade)).map(|o| o.id.clone()).collect();
         for id in expired {
             self.close_overlay(&id, window, cx);
         }
@@ -4218,6 +4237,16 @@ impl AppWindow {
                     input.update(cx, |i, _| i.enter(crate::browser::input::Owner::Pick));
                     cx.notify();
                 }
+                // HERDR: P2-18. Nobody picked in time: the agent is told so, and the block leaves pick mode.
+                self._tasks.push(cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(crate::browser::agent::PERSON_WAIT + Duration::from_millis(200)).await;
+                    let _ = this.update(cx, |this, cx| {
+                        for ended in this.browsers.expire_picks() {
+                            this.browsers.end_pick(&ended, cx);
+                        }
+                        cx.notify();
+                    });
+                }));
                 return;
             }
             // The person sees "<agent> is driving · Take Control" and their input is refused while the lease holds.
@@ -4518,12 +4547,9 @@ impl AppWindow {
 
     fn render_overlays(&self, viewport: Size<Pixels>, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut out = Vec::new();
-        let mut toast_y = 16.0;
+        let mut toast_cards = Vec::new();
         // Drawn last, so it stays clickable over an open dialog.
         let pill = self.render_update_pill(cx);
-        if pill.is_some() {
-            toast_y += UPDATE_PILL_HEIGHT + 8.0;
-        }
         // Windows under dialogs, popups and toasts; each kind in the order opened
         // (a window pressed last is last: on top).
         let order = self.overlays.iter().filter(|o| o.kind == OverlayKind::Window).chain(self.overlays.iter().filter(|o| o.kind != OverlayKind::Window));
@@ -4585,22 +4611,136 @@ impl AppWindow {
                             .into_any_element(),
                     );
                 }
-                OverlayKind::Toast => {
-                    out.push(div().absolute().right(settings::z(16.0)).bottom(settings::z(toast_y)).child(body).into_any_element());
-                    toast_y += o.size.height + 8.0;
-                }
+                OverlayKind::Toast => toast_cards.push((o, body)),
             }
         }
-        if let Some(error) = crate::update::core().error {
-            out.push(div().absolute().right(settings::z(16.0)).bottom(settings::z(toast_y))
+        let error = crate::update::core().error.map(|error| {
+            div()
                 .max_w(settings::z(540.0)).p(settings::z(12.0)).rounded_lg().bg(c("popover"))
                 .border_1().border_color(c("border")).text_size(settings::z(13.0)).text_color(c("foreground"))
                 .id("core-update-error").cursor_pointer()
                 .on_click(cx.listener(|this, _, w, cx| this.run("app.settings", json!({ "section": "updates" }), w, cx)))
-                .child(format!("herdr-core update failed: {error} · Open Updates")).into_any_element());
-        }
-        out.extend(pill);
+                .child(format!("herdr-core update failed: {error} · Open Updates")).into_any_element()
+        });
+        out.push(self.render_toast_deck(pill, error, toast_cards, cx));
         out
+    }
+
+    /// HERDR: toasts as a Sonner-style deck in the `toast_corner` (toasts.rs has the arithmetic).
+    /// The update pill and a core update error are pinned in front of it and never time out.
+    fn render_toast_deck(&self, pill: Option<AnyElement>, error: Option<AnyElement>, mut cards: Vec<(&Overlay, Stateful<Div>)>, cx: &mut Context<Self>) -> AnyElement {
+        let z = settings::z;
+        let top = settings::get().toast_corner == settings::ToastCorner::TopRight;
+        let edge = toasts::edge_bars(&self.chrome, top) + 8.0;
+        let at = move |d: Div, y: f32| if top { d.top(z(y)) } else { d.bottom(z(y)) };
+        let mut head = 0.0;
+        let mut pinned = Vec::new();
+        for (el, h) in [(pill, UPDATE_PILL_HEIGHT), (error, 44.0)] {
+            if let Some(el) = el {
+                pinned.push(at(div().absolute().right(z(0.0)), head).child(el).into_any_element());
+                head += h + toasts::GAP;
+            }
+        }
+        // Newest first: the overlays list is in the order opened.
+        cards.reverse();
+        let heights: Vec<f32> = cards.iter().map(|(o, _)| o.size.height).collect();
+        let expanded = self.deck_hover.is_some();
+        let slots = toasts::deck(&heights, expanded);
+        let mut moves = self.deck_moves.borrow_mut();
+        moves.retain(|id, _| cards.iter().any(|(o, _)| &o.id == id));
+        let mut placed: Vec<(usize, AnyElement)> = Vec::new();
+        for ((o, body), slot) in cards.into_iter().zip(slots.iter().copied()) {
+            if !slot.shown {
+                continue;
+            }
+            let to = head + slot.y;
+            let fresh = !moves.contains_key(&o.id);
+            let entry = moves.entry(o.id.clone()).or_insert((to, to));
+            if entry.1 != to {
+                *entry = (entry.1, to);
+            }
+            let from = entry.0;
+            let id = o.id.clone();
+            let close = div()
+                .id(SharedString::from(format!("toast-x-{id}")))
+                .absolute()
+                .top(z(4.0))
+                .right(z(6.0))
+                .px(z(4.0))
+                .cursor_pointer()
+                .text_size(z(12.0))
+                // The same grey as the toast's body line (the toast mod's `theme().muted`).
+                .text_color(c("muted"))
+                .child("×")
+                .on_click(cx.listener(move |this, _, w, cx| this.close_overlay(&id, w, cx)));
+            let card = div()
+                .absolute()
+                .right(z(0.0))
+                .w(z(o.size.width * slot.width))
+                .h(z(slot.height))
+                .overflow_hidden()
+                .rounded(z(8.0))
+                // A narrower card behind keeps its right edge; the overflow goes on the left.
+                .flex()
+                .justify_end()
+                .child(body)
+                .when(expanded, |d| d.child(close));
+            let anim = Animation::new(Duration::from_millis(toasts::ANIM_MS)).with_easing(ease_out_quint());
+            let key = SharedString::from(format!("toast-{}-{}-{}", o.id, (to * 10.0) as i64, o.leaving.is_some()));
+            let leaving = o.leaving.is_some();
+            // A hidden window (HERDR_APP_HEADLESS, shots) never ticks animation frames: draw where it ends.
+            if crate::control::headless() {
+                let card = if o.leaving.is_some() { at(card, to).opacity(0.0) } else { at(card, to) };
+                placed.push((slot.z, card.into_any_element()));
+                continue;
+            }
+            let card = card.with_animation(key, anim, move |d, t| {
+                let y = from + (to - from) * t;
+                let d = at(d, y);
+                if leaving {
+                    d.opacity(1.0 - t)
+                } else if fresh {
+                    // Slides in from the corner's side and fades in.
+                    d.opacity(t).right(z(24.0 * (1.0 - t)))
+                } else {
+                    d
+                }
+            });
+            placed.push((slot.z, card.into_any_element()));
+        }
+        drop(moves);
+        // Lower z first: the front card is drawn last, on top.
+        placed.sort_by_key(|(z, _)| *z);
+        let extent = head + toasts::extent(&slots);
+        at(div(), edge)
+            .id("toast-deck")
+            .absolute()
+            .right(z(16.0))
+            .w(z(340.0))
+            .h(z(extent))
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| this.deck_hovered(*hovered, cx)))
+            .children(pinned)
+            .children(placed.into_iter().map(|(_, e)| e))
+            .into_any_element()
+    }
+
+    /// HERDR: the pointer entered or left the toast deck. While it's over the deck, the deck is
+    /// a list and no toast times out; on leave each toast gets back the time it waited.
+    fn deck_hovered(&mut self, hovered: bool, cx: &mut Context<Self>) {
+        match (hovered, self.deck_hover) {
+            (true, None) => self.deck_hover = Some(Instant::now()),
+            (false, Some(since)) => {
+                let waited = since.elapsed();
+                for o in self.overlays.iter_mut().filter(|o| o.kind == OverlayKind::Toast) {
+                    if let Some(e) = o.expires.as_mut() {
+                        *e += waited;
+                    }
+                }
+                self.deck_hover = None;
+            }
+            _ => return,
+        }
+        cx.notify();
     }
 }
 
@@ -4627,10 +4767,8 @@ impl AppWindow {
         let label = self.update_ready.clone().or_else(|| success.then(|| format!("Updated to {}", env!("CARGO_PKG_VERSION"))))?;
         let dismissal = app_version.map(|v| format!("app:{v}")).unwrap_or_else(|| label.clone());
         if self.update_dismissed.as_ref() == Some(&dismissal) { return None; }
+        // Placed by the toast deck (pinned in front of it).
         let pill = div()
-            .absolute()
-            .right(settings::z(16.0))
-            .bottom(settings::z(16.0))
             .h(settings::z(UPDATE_PILL_HEIGHT))
             .pl(settings::z(14.0))
             .pr(settings::z(6.0))

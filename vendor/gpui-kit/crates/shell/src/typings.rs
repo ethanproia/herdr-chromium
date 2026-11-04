@@ -2091,6 +2091,17 @@ const ELEMENTS: &str = r#"
    */
   export function image(path: string): NativeElement;
 
+  /**
+   * HERDR: a video from the application's own directory (the same rule as `image`). The host
+   * plays it (macOS: .mp4 / .mov). Give it `.id(...)` to drive it with herdr's `videoPlay`,
+   * `videoPause` and `videoSeek`, and read `nextVideoEvent()`. Without `autoplay` it shows its
+   * first frame as a still until played.
+   */
+  export function video(
+    path: string,
+    options?: { autoplay?: boolean; loop?: boolean; muted?: boolean; controls?: boolean },
+  ): NativeElement;
+
   /** The visible items, as a half-open `[start, end)` interval. */
   export interface ItemRange {
     start: number;

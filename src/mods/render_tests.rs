@@ -283,6 +283,24 @@ fn shipped_initial_descriptions(cx: &mut TestAppContext) {
     );
 }
 
+/// HERDR: `video(path, options)` is an element like `image`; its options are checked strictly.
+#[gpui::test]
+fn a_mod_can_place_a_video_and_bad_options_are_refused(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+    let write = |name: &str, body: &str| {
+        let dir = staged.0.join("mods").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("main.js"), format!("import {{ View, video }} from \"gpui-kit\";\nexport default class V extends View {{ render() {{ return {body}; }} }}\n")).unwrap();
+    };
+    write("vtest", r#"video("mods/vtest/clip.mp4", { autoplay: true, loop: true, muted: true }).id("clip").absolute().w(320).h(180)"#);
+    let tree = describe_with_values(cx, &staged, "mods/vtest", fixture(true, props(), updates("current", "current")), None).unwrap();
+    assert!(tree.contains(r#"video "mods/vtest/clip.mp4" autoplay loop muted"#), "{tree}");
+    write("vbad", r#"video("mods/vbad/clip.mp4", { autoplya: true })"#);
+    let err = describe_with_values(cx, &staged, "mods/vbad", fixture(true, props(), updates("current", "current")), None).unwrap_err();
+    assert!(format!("{err:#}").contains("unknown video option `autoplya`"), "{err:#}");
+}
+
 #[gpui::test]
 fn brand_leaves_room_for_macos_traffic_lights_only_outside_full_screen(cx: &mut TestAppContext) {
     cx.update(gpui_shell::init);

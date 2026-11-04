@@ -2935,6 +2935,20 @@ impl Browsers {
         agent.lock().unwrap().run(name, args, self, &focus, reply)
     }
 
+    /// HERDR: P2-18. Picks that waited past `PERSON_WAIT` are answered "timed out"; the blocks left with
+    /// nobody waiting come back so the window can end their pick mode.
+    pub fn expire_picks(&self) -> Vec<BrowserId> {
+        self.agent.as_ref().map(|a| a.lock().unwrap().expire_waiters(std::time::Instant::now())).unwrap_or_default()
+    }
+
+    /// HERDR: P2-18. Ends pick mode on a block whose pick timed out (a comment the person is writing stays).
+    pub fn end_pick(&self, id: &str, cx: &mut App) {
+        if let Some((view, _)) = self.views.get(id) {
+            let input = view.read(cx).input().clone();
+            input.update(cx, |i, _| i.end_pick());
+        }
+    }
+
     // HERDR: browser block (part 5). The person picked an element: the agent captures it for `browser.pick`.
     /// Send's batch (S7 attach flow) for the agent side (fork-agent's S8 takes it from here);
     /// the newest 20 are kept for `browser.annotations`.

@@ -705,6 +705,12 @@ What's about the user, never a look:
   background; this is a threshold, not a guaranteed resulting ratio.
   Box/block, Powerline and sprite glyph colors are never adjusted.
   Changes apply immediately, including text already on screen.
+- `toast_corner`: where notices stack, `"top-right"` (default) or
+  `"bottom-right"`. Top right starts below the layout's top bar (and the
+  side panel's strip while it is open), so toasts never cover those controls.
+  Toasts form a deck: the newest in front, up to three peeking behind.
+  Hovering the deck lists them all and pauses their timers until the
+  pointer leaves.
 - `glass`: macOS only, `true` blurs what's behind the window through the
   layout's own background colors (sidebar, canvas, shown at 60%); panes,
   terminals and browser blocks stay opaque. Off by default.
@@ -799,6 +805,10 @@ has 120 programs (agents, editors, runtimes, tools, databases, infra);
   `image("mods/<name>/logo.svg")` (full color), `svg("mods/<name>/icon.svg")`
   (tinted with the text color). Saving an asset under `mods/` updates every
   mod showing it, including images that were missing or invalid on first load.
+- Videos follow the same rule: `video("mods/<name>/clip.mp4", {autoplay, loop, muted,
+  controls})` (macOS: .mp4 and .mov). Without `autoplay` it shows its first frame as a still.
+  Unknown options are an error. Give it `.id("clip")` to drive it from code (see `videoPlay` in
+  herdr.d.ts). A file outside `~/.config/herdr-app` is copied in first, as the board does with pictures.
 - The defaults are mods too, read them as examples: `spaces`, `agents`,
   `tabs` (the tab bar), `menu`, `prompt`, `confirm`, `help`, `toast`,
   Terminals' `picker`, `peek`, and `pane` (an
@@ -909,7 +919,11 @@ Chained builders with GPUI's snake_case names: `div()`, `h_flex()`,
 `.hover((s) => s.bg(c))`, `.on_scroll_wheel(...)`; keyboard: `this.h = cx.focus_handle()`
 in init, `.track_focus(this.h).on_key_down((e, cx) => …)`, `this.h.focus()`.
 `.on_drop((event, cx) => …)` on a plain layout element receives external files as
-`event.paths` (absolute paths). The feedback form accepts dropped images with
+`event.paths` (absolute paths). Beside it, `.on_drag_enter((event, cx) => …)`
+(`event.count` files, `event.x`/`event.y` in the window) and
+`.on_drag_leave((event, cx) => …)` let a drop target light up while files
+are dragged over it; leave also comes when the drag ends or is dropped.
+The feedback form accepts dropped images with
 the same limits, previews and removal as picked images.
 `.on_hover((hovered, cx) => …)` reports pointer entry and exit on buttons
 and other interactive controls too.

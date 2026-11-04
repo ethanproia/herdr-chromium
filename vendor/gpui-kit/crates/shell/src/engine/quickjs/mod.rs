@@ -1122,6 +1122,8 @@ pub(crate) mod exports {
         "div",
         "svg",
         "image",
+        // HERDR: a video the host plays.
+        "video",
         // GPUI's own lazy lists. Base's virtual lists live in `gpui-base`;
         // these are GPUI's, and are exported where `div` is.
         "list",
@@ -6874,6 +6876,8 @@ globalThis.__gpui = (() => {
     v_flex: () => element(__v_flex()),
     svg: (path) => element(__svg(String(path))),
     image: (path) => element(__image(String(path))),
+    // HERDR: video(path, {autoplay, loop, muted, controls}).
+    video: (path, options) => element(__video(String(path), JSON.stringify(options ?? {}))),
     PathBuilder: {
       fill: () => pathBuilder(true, 0),
       stroke: (width) => pathBuilder(false, finitePositive(width, "stroke width")),
@@ -7326,6 +7330,17 @@ impl ShellRuntime {
             )?;
             text_constructor(&globals, "__svg", runtime.clone(), Component::Svg)?;
             text_constructor(&globals, "__image", runtime.clone(), Component::Image)?;
+            // HERDR: video.
+            {
+                let runtime = runtime.clone();
+                globals.set(
+                    "__video",
+                    Func::from(move |ctx: Ctx<'_>, path: String, options: String| -> JsResult<SpecId> {
+                        let spec = crate::video::VideoSpec::parse(path, &options).map_err(|e| rquickjs::Exception::throw_type(&ctx, &e))?;
+                        Ok(upgrade(&runtime, &ctx)?.push_node(Component::Video(spec)))
+                    }),
+                )?;
+            }
             text_constructor(
                 &globals,
                 "__accordion",

@@ -1,6 +1,7 @@
 # Installing the fork next to stock Herdr (plan, for review)
 
-Status: plan only. Nothing here has been run. `scripts/install-macos` is
+Status: `scripts/install-fork-macos` implements this plan, tested on a scratch HOME only
+(`scripts/test-install-fork.sh`). It has not been run against Ethan's real HOME. `scripts/install-macos` is
 unchanged and must not be used for the fork: it overwrites
 `~/Applications/Herdr.app` (bundle id `dev.herdr.app`) and the
 `~/.local/bin/herdr-app` link, and it doesn't install the browser host
@@ -23,7 +24,7 @@ unchanged and must not be used for the fork: it overwrites
 | CLI link | `~/.local/bin/herdr-app` | `~/.local/bin/herdr-labs` |
 | Home | `~/.config/herdr-app` | `~/.config/herdr-labs` (`HERDR_APP_HOME`) |
 | Core session | stock's | `HC_SESSION=herdr-labs` (own herdr-core, own terminals) |
-| Browser host | none | `Contents/Frameworks/herdr-browser-host` |
+| Browser host | none | `Contents/Frameworks/herdr-browser-host.app` |
 | Updates | upstream | off: a source build never checks (`HERDR_APP_RELEASE` unset); `HERDR_RELEASES_URL` stays unset until a fork channel exists |
 
 The fork reads its home from `HERDR_APP_HOME` (`src/mods.rs:53`). It finds the
@@ -31,14 +32,15 @@ browser host from `HERDR_BROWSER_HOST`, or else beside its own binary
 (`src/browser/view.rs:146`). Both are set in the bundle's `LSEnvironment`, so
 Finder and Dock launches get them.
 
-## Steps (a new `scripts/install-fork-macos`, to write after review)
+## Steps (`scripts/install-fork-macos`)
 
 1. Build: `cargo build --release` and the browser host
    (`crates/herdr-browser-host`, release), both through the build slot.
 2. Assemble `~/Applications/Herdr Labs.app.new`:
    - `Contents/MacOS/Herdr Labs`: the release `herdr-app` binary.
-   - `Contents/Frameworks/herdr-browser-host` and the CEF framework and
-     helpers it needs, with the layout CEF expects (see `docs/fork-host.md`).
+   - `Contents/Frameworks/herdr-browser-host.app`: the host bundle from
+     `scripts/fork-host-bundle.sh release`, which carries its own CEF framework
+     and helpers (see `docs/fork-host.md`).
    - `Contents/Resources/Herdr.icns`. A distinct icon later, so the two apps
      can be told apart in the Dock.
    - An `Info.plist` like stock's, except:
@@ -46,8 +48,8 @@ Finder and Dock launches get them.
      - `CFBundleName` and `CFBundleDisplayName` `Herdr Labs`;
      - `CFBundleExecutable` `Herdr Labs`;
      - `LSEnvironment` sets `HERDR_APP_HOME=~/.config/herdr-labs`,
-       `HC_SESSION=herdr-labs`,
-       `HERDR_BROWSER_HOST=<app>/Contents/Frameworks/herdr-browser-host`, and
+       `HC_SESSION=herdr-labs`, `HERDR_APP_ID=herdr-labs`,
+       `HERDR_BROWSER_HOST=<app>/Contents/Frameworks/herdr-browser-host.app/Contents/MacOS/herdr-browser-host`, and
        stock's PATH line.
 3. Sign it: `codesign --force --deep --sign - "Herdr Labs.app.new"`. This is
    ad hoc for Ethan's Mac only; public builds need Developer ID signing,
@@ -89,7 +91,8 @@ copy brings over spaces and layout state, but not live terminals.
 
 ## Switching back
 
-`herdr-labs uninstall` (or `scripts/install-fork-macos --remove`):
+`herdr-labs uninstall` (or `scripts/install-fork-macos --remove`; the app keeps a copy of
+the installer in `Contents/Resources`, so this works after the checkout is gone):
 
 1. Quits Herdr Labs (`herdr-labs do app.quit`), and stops its herdr-core
    session with `hc --session herdr-labs` and the core's stop command.
