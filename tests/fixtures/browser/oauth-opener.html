@@ -1,6 +1,9 @@
 <!doctype html><title>opener</title>
 <button id="signin" style="position:absolute;left:20px;top:20px;width:200px;height:60px">Sign in</button>
 <script>
-document.getElementById("signin").onclick = () => window.open("/oauth-auth.html", "oauth", "width=480,height=560");
+// ?next=<url>: the popup goes on to <url> by itself, as an OAuth redirect does.
+const next = new URLSearchParams(location.search).get("next");
+const auth = "/oauth-auth.html" + (next ? "?next=" + encodeURIComponent(next) : "");
+document.getElementById("signin").onclick = () => window.open(auth, "oauth", "width=480,height=560");
 window.addEventListener("message", (e) => { if (e.origin === location.origin && e.data && e.data.token) document.title = "signed in: " + e.data.token; });
 </script>

@@ -1311,6 +1311,11 @@ impl BrowserView {
         self.blocked_popup.as_deref()
     }
 
+    /// The page size the host was last told (None: not laid out yet).
+    pub fn page_size(&self) -> Option<Dips> {
+        self.sized.map(|(s, _)| s)
+    }
+
     /// This view's opener when it is a popup.
     pub fn opener(&self) -> Option<&str> {
         self.opener.as_deref()
