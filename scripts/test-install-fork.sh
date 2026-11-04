@@ -29,12 +29,20 @@ printf '# My note\n' > "$H/Notes/notepad.md"
 
 # A stand-in host bundle: the installer only copies it.
 host=$scratch/herdr-browser-host.app
-mkdir -p "$host/Contents/MacOS" && printf '#!/bin/sh\n' > "$host/Contents/MacOS/herdr-browser-host" && chmod +x "$host/Contents/MacOS/herdr-browser-host"
+mkdir -p "$host/Contents/MacOS"
+printf '#!/bin/sh\n[ "$1" = --capabilities ] && echo '"'"'{"protocol":1,"sandboxed":true}'"'"'\n' > "$host/Contents/MacOS/herdr-browser-host"
+chmod +x "$host/Contents/MacOS/herdr-browser-host"
+# A pre-SEC4 host: it doesn't know --capabilities.
+old_host=$scratch/old-host.app
+mkdir -p "$old_host/Contents/MacOS" && printf '#!/bin/sh\nexit 2\n' > "$old_host/Contents/MacOS/herdr-browser-host" && chmod +x "$old_host/Contents/MacOS/herdr-browser-host"
 
 stock_sum() { (cd "$H" && find Applications/Herdr.app .local/bin/herdr-app .config/herdr-app Notes -print0 | sort -z | xargs -0 shasum 2>/dev/null; readlink .local/bin/herdr-app) | shasum; }
 before=$(stock_sum)
 run() { HOME=$H HERDR_APP_BIN=$HERDR_APP_BIN HERDR_HOST_APP=$host FORK_INSTALL_NO_REGISTER=1 scripts/install-fork-macos "$@"; }
 
+# SEC4: a host without sandboxed helpers is refused, and nothing is installed.
+out=$(HOME=$H HERDR_APP_BIN=$HERDR_APP_BIN HERDR_HOST_APP=$old_host FORK_INSTALL_NO_REGISTER=1 scripts/install-fork-macos 2>&1)
+[[ $? -ne 0 && $out == *"does not report sandboxed helpers"* && ! -e "$H/Applications/$BRAND_NAME.app" ]] && ok "a pre-SEC4 host is refused" || bad "old host: $out"
 run >"$scratch/install.log" 2>&1 && ok "install runs" || bad "install: $(tail -3 "$scratch/install.log")"
 grep -q "^Installed $BRAND_NAME $BRAND_VERSION (Herdr " "$scratch/install.log" && ok "installer prints the version line" || bad "no version line: $(tail -1 "$scratch/install.log")"
 app="$H/Applications/$BRAND_NAME.app"

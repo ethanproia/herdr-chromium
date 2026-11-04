@@ -10,6 +10,13 @@ fn main() {
     if std::env::args().any(|a| a.starts_with("--type=")) {
         std::process::exit(herdr_browser_host::cef::main(None));
     }
+    // What this build can do, for installers to check before using it (SEC4: helpers sandboxed).
+    // Answers without starting CEF.
+    if std::env::args().nth(1).as_deref() == Some("--capabilities") {
+        let sandboxed = cfg!(all(feature = "cef", target_os = "macos"));
+        println!("{{\"protocol\":{},\"sandboxed\":{sandboxed}}}", herdr_browser_protocol::PROTOCOL_VERSION);
+        return;
+    }
     let mut socket = None;
     let mut stub = false;
     let mut args = std::env::args().skip(1);
@@ -24,7 +31,7 @@ fn main() {
         }
     }
     let Some(socket) = socket else {
-        eprintln!("usage: herdr-browser-host --socket <path> [--stub]");
+        eprintln!("usage: herdr-browser-host --socket <path> [--stub] | --capabilities");
         std::process::exit(2);
     };
     if stub {
