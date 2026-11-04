@@ -1,6 +1,6 @@
 //! CEF callbacks, each turned into a protocol message for the app.
 
-use super::{deny_permissions, downloads_dir, keep_chooser, keep_dialog, keep_permission, PermCb, next_req, on_frame, on_popup_frame, on_popup_show, on_popup_size, send, view_of};
+use super::{cancel_choosers, deny_permissions, downloads_dir, keep_chooser, keep_dialog, keep_permission, PermCb, next_req, on_frame, on_popup_frame, on_popup_show, on_popup_size, send, view_of};
 use cef::*;
 use herdr_browser_protocol::{DialogKind, DownloadState, HostToApp};
 
@@ -361,8 +361,9 @@ wrap_display_handler! {
     impl DisplayHandler {
         fn on_address_change(&self, _browser: Option<&mut Browser>, frame: Option<&mut Frame>, url: Option<&CefString>) {
             if frame.is_some_and(|f| f.is_main() == 1) {
-                // Leaving the page denies what it asked for.
+                // Leaving the page denies what it asked for and closes its file choosers.
                 deny_permissions(Some(&self.id), false);
+                cancel_choosers(&self.id);
                 send(HostToApp::Url { id: self.id.clone(), url: s(url) });
             }
         }
@@ -527,7 +528,7 @@ wrap_dialog_handler! {
             let multiple = *mode.as_ref() == sys::cef_file_dialog_mode_t::FILE_DIALOG_OPEN_MULTIPLE;
             let accept = accept_filters.map(|l| std::mem::take(l).into_iter().map(|a| a.to_string()).collect()).unwrap_or_default();
             let req = next_req();
-            keep_chooser(req, cb.clone());
+            keep_chooser(&self.id, req, cb.clone());
             send(HostToApp::FileChooser { id: self.id.clone(), req, multiple, accept });
             1
         }
