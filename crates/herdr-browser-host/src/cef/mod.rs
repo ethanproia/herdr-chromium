@@ -1022,6 +1022,7 @@ fn handle(m: AppToHost) {
         | M::Overlay { .. }
         | M::PickInfo { .. }
         | M::PickRelative { .. }
+        | M::TextEdit { .. }
         | M::Styles { .. }
         | M::SetStyle { .. }
         | M::RevertStyle { .. }
@@ -1071,7 +1072,7 @@ fn browser_msg(m: AppToHost) {
     let id = match &m {
         M::Navigate { id, .. } | M::Back { id } | M::Forward { id } | M::Reload { id, .. } | M::Stop { id } | M::Resize { id, .. }
         | M::Focus { id, .. } | M::SetZoom { id, .. } | M::Input { id, .. } | M::Edit { id, .. } | M::Find { id, .. } | M::StopFind { id, .. }
-        | M::DevTools { id, .. } | M::Eval { id, .. } | M::Overlay { id, .. } | M::PickInfo { id, .. } | M::PickRelative { id, .. } | M::Styles { id, .. } | M::SetStyle { id, .. } | M::RevertStyle { id, .. } | M::SetVisible { id, .. } => id.clone(),
+        | M::DevTools { id, .. } | M::Eval { id, .. } | M::Overlay { id, .. } | M::PickInfo { id, .. } | M::PickRelative { id, .. } | M::TextEdit { id, .. } | M::Styles { id, .. } | M::SetStyle { id, .. } | M::RevertStyle { id, .. } | M::SetVisible { id, .. } => id.clone(),
         _ => {
             debug(format_args!("not a browser message, dropped"));
             return;
@@ -1205,6 +1206,18 @@ fn browser_msg(m: AppToHost) {
             {
                 handlers::eval_unsent(&id);
                 send(HostToApp::PickInfoResult { id, req, ok: false, selector: String::new(), label: String::new(), rect: herdr_browser_protocol::CssRect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 } });
+            }
+        }
+        // HERDR: S13 inline text edit, only on the element the person's own pick reached.
+        M::TextEdit { req, ref selector, op, .. } => {
+            let refuse = |id: String| send(HostToApp::TextEditResult { id, req, ok: false, before: String::new(), after: String::new() });
+            if !handlers::picked_by_person(&id, selector) {
+                refuse(id);
+            } else if let Some(call) = handlers::text_edit_message(&id, req, selector, op)
+                && host.send_dev_tools_message(Some(&call)) == 0
+            {
+                handlers::eval_unsent(&id);
+                refuse(id);
             }
         }
         // Style panel (S10): the host side is fork-host's slice; until it lands every request answers "no such element".

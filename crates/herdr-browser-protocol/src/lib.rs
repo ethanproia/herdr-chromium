@@ -215,6 +215,11 @@ pub enum AppToHost {
     /// element stepped to. `ok` false: no such relative (top of the document, no children, no
     /// sibling) or `from` no longer matches; the app keeps the current pick then.
     PickRelative { id: BrowserId, req: u64, from: String, step: PickStep },
+    /// Inline text edit (S13) of `selector`, which must be the element the person's own last pick
+    /// reached (the host refuses any other). `Begin` makes it editable in place (plain text only, an
+    /// element whose children are all text) and selects its text; `Commit` keeps what was typed;
+    /// `Cancel` restores the text exactly. Answered by `TextEditResult` with the same `req`.
+    TextEdit { id: BrowserId, req: u64, selector: String, op: TextEditOp },
     /// Read the style panel rows for the element `node` (a CSS selector, as `Picked` reports it) for
     /// `props`; answered by `StylesResult` with the same `req`. Driven by the user's panel, so no
     /// agent grant applies; answers carry CSS values only, never input values or page text.
@@ -251,6 +256,15 @@ pub enum AppToHost {
     /// The person's answer to `Permission { req }`, covering all of its kinds at once (v1 has no partial grant).
     PermissionResult { id: BrowserId, req: u64, allow: bool },
     Shutdown,
+}
+
+/// What a `TextEdit` does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextEditOp {
+    Begin,
+    Commit,
+    Cancel,
 }
 
 /// A step from a picked element to a relative (`PickRelative`). Element nodes only: text and
@@ -312,6 +326,10 @@ pub enum HostToApp {
     /// the element's own text, aria-label or alt; never an input's value) and the element box.
     /// `ok` false: nothing there. Page-derived text: the app labels it untrusted before any agent sees it.
     PickInfoResult { id: BrowserId, req: u64, ok: bool, selector: String, label: String, rect: CssRect },
+    /// Answer to `TextEdit`. `before`: the text when the edit began (page text); `after`: the text
+    /// now (Commit), or `before` again (Cancel). `ok` false: not the person's pick, not plain text,
+    /// no edit in progress, or the element is gone; nothing changed then.
+    TextEditResult { id: BrowserId, req: u64, ok: bool, before: String, after: String },
     /// Answer to `Styles`, `SetStyle` and `RevertStyle` with the same `req`. `ok` false: no such
     /// element (it moved or the page navigated) or the property was refused; `rows` empty then.
     StylesResult { id: BrowserId, req: u64, ok: bool, rows: Vec<StyleRow> },
@@ -388,6 +406,9 @@ mod tests {
         for step in [PickStep::Parent, PickStep::Child, PickStep::Prev, PickStep::Next] {
             roundtrip_app(AppToHost::PickRelative { id: "b1".into(), req: 14, from: "#go".into(), step });
         }
+        for op in [TextEditOp::Begin, TextEditOp::Commit, TextEditOp::Cancel] {
+            roundtrip_app(AppToHost::TextEdit { id: "b1".into(), req: 15, selector: "#t".into(), op });
+        }
         roundtrip_app(AppToHost::Shutdown);
     }
 
@@ -407,6 +428,7 @@ mod tests {
         roundtrip_host(HostToApp::CdpTarget { id: "b1".into(), target_id: "T1".into() });
         roundtrip_host(HostToApp::ContextMenu { id: "b1".into(), req: 7, x: 4.0, y: 5.0, kind: vec!["link".into()], link_url: Some("https://a.test/".into()), src_url: None, selection: None, items: vec![MenuItem { command: 100, label: "Back".into(), enabled: true, checked: false, submenu: vec![] }, MenuItem { command: 0, label: String::new(), enabled: false, checked: false, submenu: vec![] }] });
         roundtrip_host(HostToApp::StylesResult { id: "b1".into(), req: 9, ok: true, rows: vec![StyleRow { prop: "padding".into(), computed: "16px".into(), inline: Some("16px".into()), matched: None }, StyleRow { prop: "color".into(), computed: "rgb(0, 0, 0)".into(), inline: None, matched: Some("red".into()) }] });
+        roundtrip_host(HostToApp::TextEditResult { id: "b1".into(), req: 15, ok: true, before: "Hello".into(), after: "Hello v2".into() });
         roundtrip_host(HostToApp::PickInfoResult { id: "b1".into(), req: 13, ok: true, selector: "#go".into(), label: "button Go".into(), rect: CssRect { x: 1.0, y: 2.0, w: 98.0, h: 43.0 } });
         roundtrip_host(HostToApp::OverlayRects { id: "b1".into(), req: 3, epoch: 9, rects: vec![CssRect { x: 1.0, y: 2.0, w: 30.0, h: 40.0 }], frames: vec![CssPoint { x: 5.0, y: 6.0 }] });
         roundtrip_host(HostToApp::Viewport { id: "b1".into(), scroll_x: 0.0, scroll_y: 120.5, zoom_level: 1.0 });

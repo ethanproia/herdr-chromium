@@ -33,6 +33,8 @@ pub enum Op {
     Styles { set: Option<String>, revert: Option<String> },
     /// A pick (S4): describe the element under a point.
     Pick,
+    /// An inline text edit (S13).
+    TextEdit,
     Eval,
     Overlay { epoch: u64 },
     /// The page-is-live probe for load `generation` (see `super::on_loading`).
@@ -170,6 +172,39 @@ pub fn pick_relative_message(id: &str, req: u64, from: &str, step: herdr_browser
          {step}if(!n)return{{ok:false}};el=n;{PICK_DESCRIBE}}})()"
     );
     evaluate(id, req, Op::Pick, &js)
+}
+
+thread_local! {
+    /// HERDR: S13. The selector each browser's last successful pick reported (picks are the
+    /// person's: the app sends PickInfo / PickRelative only from its pick mode).
+    static LAST_PICK: std::cell::RefCell<std::collections::HashMap<String, String>> = Default::default();
+}
+
+/// Whether `selector` is what the person's last pick in browser `id` reached.
+pub fn picked_by_person(id: &str, selector: &str) -> bool {
+    LAST_PICK.with_borrow(|m| m.get(id).is_some_and(|s| s == selector))
+}
+
+/// `TextEdit` (S13): an inline edit of the element `selector` matches, in the isolated world.
+/// Begin: only an element whose children are all text nodes; it becomes
+/// contenteditable="plaintext-only", gets focus, and its text is selected; the original text and
+/// attribute are kept in this world (the page can't see or change them). Commit keeps the text
+/// typed; Cancel puts back the original text exactly. Either way the attribute is restored.
+pub fn text_edit_message(id: &str, req: u64, selector: &str, op: herdr_browser_protocol::TextEditOp) -> Option<Vec<u8>> {
+    use herdr_browser_protocol::TextEditOp as T;
+    let sel = serde_json::to_string(selector).expect("encodes");
+    let body = match op {
+        T::Begin => "if(self.__herdrEdit)return{ok:false};            if(![...el.childNodes].every(c=>c.nodeType===3))return{ok:false};            const before=el.textContent,attr=el.getAttribute('contenteditable');            self.__herdrEdit={el,before,attr};el.setAttribute('contenteditable','plaintext-only');el.focus();            const r=document.createRange();r.selectNodeContents(el);const s=getSelection();s.removeAllRanges();s.addRange(r);            return{ok:true,before,after:before}",
+        T::Commit | T::Cancel => {
+            if op == T::Cancel {
+                "const e=self.__herdrEdit;if(!e||e.el!==el)return{ok:false};if(el.textContent!==e.before)el.textContent=e.before;                 if(e.attr===null)el.removeAttribute('contenteditable');else el.setAttribute('contenteditable',e.attr);                 self.__herdrEdit=null;el.blur();return{ok:true,before:e.before,after:el.textContent}"
+            } else {
+                "const e=self.__herdrEdit;if(!e||e.el!==el)return{ok:false};                 if(e.attr===null)el.removeAttribute('contenteditable');else el.setAttribute('contenteditable',e.attr);                 self.__herdrEdit=null;el.blur();return{ok:true,before:e.before,after:el.textContent}"
+            }
+        }
+    };
+    let js = format!("(()=>{{let el=null;try{{el=document.querySelector({sel})}}catch(e){{}}if(!el)return{{ok:false}};{body}}})()");
+    evaluate(id, req, Op::TextEdit, &js)
 }
 
 fn style_rows(value: &serde_json::Value) -> Vec<herdr_browser_protocol::StyleRow> {
@@ -376,7 +411,16 @@ fn finish(id: String, req: u64, op: Op, ok: bool, value: serde_json::Value) {
             let text = |k: &str| if ok { value[k].as_str().unwrap_or_default().to_string() } else { String::new() };
             let f = |k: &str| value["rect"][k].as_f64().unwrap_or(0.0) as f32;
             let rect = herdr_browser_protocol::CssRect { x: f("x"), y: f("y"), w: f("w"), h: f("h") };
+            // HERDR: S13: only the element the person's own pick reached can be edited.
+            if ok {
+                LAST_PICK.with_borrow_mut(|m| m.insert(id.clone(), text("selector")));
+            }
             send(HostToApp::PickInfoResult { id, req, ok, selector: text("selector"), label: text("label"), rect });
+        }
+        Op::TextEdit => {
+            let ok = ok && value["ok"].as_bool() == Some(true);
+            let text = |k: &str| if ok { value[k].as_str().unwrap_or_default().to_string() } else { String::new() };
+            send(HostToApp::TextEditResult { id, req, ok, before: text("before"), after: text("after") });
         }
         Op::Ready { generation } => {
             super::debug(format_args!("{id}: input path live: {value}"));

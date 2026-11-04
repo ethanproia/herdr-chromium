@@ -538,6 +538,8 @@ fn target(msg: &HostToApp) -> Option<&BrowserId> {
         | H::ContextMenu { id, .. }
         | H::StylesResult { id, .. }
         | H::PickInfoResult { id, .. }
+        // HERDR: S13 inline text edit.
+        | H::TextEditResult { id, .. }
         | H::Url { id, .. }
         | H::Loading { id, .. }
         | H::Cursor { id, .. }

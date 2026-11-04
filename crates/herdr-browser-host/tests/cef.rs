@@ -710,6 +710,63 @@ fn pick_relative_steps_to_parent_child_and_siblings() {
     h.shutdown();
 }
 
+fn text_edit(h: &mut Host, req: u64, selector: &str, op: herdr_browser_protocol::TextEditOp) -> (bool, String, String) {
+    h.send(AppToHost::TextEdit { id: "b1".into(), req, selector: selector.into(), op });
+    match h.until(10 * SEC, |m| matches!(m, HostToApp::TextEditResult { req: r, .. } if *r == req)) {
+        HostToApp::TextEditResult { ok, before, after, .. } => (ok, before, after),
+        _ => unreachable!(),
+    }
+}
+
+/// S13: the person's pick, edited in place: typing replaces the selected text, Commit keeps it,
+/// Cancel restores the original exactly; only the person's last pick and only plain text.
+#[test]
+fn text_edit_on_the_persons_pick_commits_or_cancels() {
+    use herdr_browser_protocol::TextEditOp::*;
+    if real_host().is_none() {
+        return;
+    }
+    let p = pages();
+    let mut h = Host::start("cef-text-edit");
+    create(&mut h, "b1", &p.url("pick"), 400.0, 250.0, 1.0);
+    loaded(&mut h);
+    h.send(AppToHost::Focus { id: "b1".into(), focused: true });
+    assert!(h.eval("b1", 1, "1").0);
+    let three = pick(&mut h, 10, 220.0, 60.0 + 5.0);
+    assert!(three.0 && three.2 == "p three", "{three:?}");
+    assert!(!text_edit(&mut h, 11, "#go", Begin).0, "not the person's pick");
+    let t0 = std::time::Instant::now();
+    assert_eq!(text_edit(&mut h, 12, &three.1, Begin), (true, "three".into(), "three".into()));
+    println!("METRIC text_edit_begin_ms={}", t0.elapsed().as_millis());
+    assert!(!text_edit(&mut h, 13, &three.1, Begin).0, "one edit at a time");
+    h.send(AppToHost::Input { id: "b1".into(), event: InputEvent::Text { text: "3 edited".into() } });
+    let expr = format!("document.querySelector({}).textContent", serde_json::to_string(&three.1).unwrap());
+    let mut live = serde_json::Value::Null;
+    for r in 0..50 {
+        live = h.eval("b1", 100 + r, &expr).1;
+        if live == "3 edited" {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert_eq!(live, serde_json::json!("3 edited"), "typing replaced the selected text");
+    assert_eq!(text_edit(&mut h, 15, &three.1, Commit), (true, "three".into(), "3 edited".into()));
+    let (_, attr) = h.eval("b1", 16, &format!("[document.querySelector({0}).textContent, document.querySelector({0}).hasAttribute('contenteditable')]", serde_json::to_string(&three.1).unwrap()));
+    assert_eq!(attr, serde_json::json!(["3 edited", false]), "kept until reload, no longer editable");
+    // Cancel puts back the original text exactly.
+    let four = pick(&mut h, 20, 220.0, 80.0 + 5.0);
+    assert!(four.0 && four.2 == "p four", "{four:?}");
+    assert!(text_edit(&mut h, 21, &four.1, Begin).0);
+    h.send(AppToHost::Input { id: "b1".into(), event: InputEvent::Text { text: "gone".into() } });
+    assert_eq!(text_edit(&mut h, 22, &four.1, Cancel), (true, "four".into(), "four".into()));
+    // An element with element children is not plain text.
+    let card = step(&mut h, 30, &four.1, herdr_browser_protocol::PickStep::Parent);
+    assert!(card.0 && card.2 == "div", "{card:?}");
+    assert!(!text_edit(&mut h, 31, &card.1, Begin).0, "not plain text");
+    assert!(!text_edit(&mut h, 32, &card.1, Commit).0, "no edit in progress");
+    h.shutdown();
+}
+
 /// Probe (docs/browser-cdp-pipe.md step 1): the host bundle, given fds 3/4 and Hello.cdp_pipe,
 /// answers CDP Browser.getVersion over the pipe (NUL-framed JSON) and listens on no TCP port.
 #[test]
