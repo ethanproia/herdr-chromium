@@ -15,6 +15,14 @@ bad() { echo "FAIL $1"; fails=$((fails + 1)); }
 BRAND_FILE=$root/brand.json source "$root/scripts/brand.sh"
 want=$(python3 -c 'import json,sys; b=json.load(open(sys.argv[1])); print(b["name"], b["slug"], b["cli"], b["session"])' brand.json)
 [[ "$BRAND_NAME $BRAND_SLUG $BRAND_CLI $BRAND_SESSION" == "$want" ]] && ok "scripts/brand.sh reads brand.json ($BRAND_NAME)" || bad "scripts/brand.sh: $BRAND_NAME $BRAND_SLUG $BRAND_CLI $BRAND_SESSION, want $want"
+# The reader: version is optional (0.0.0); a missing required key stops with a clear message.
+t=$(mktemp -d)
+printf '{"name":"A","slug":"a","bundle_id":"d.a","cli":"a","home":".config/a","session":"a"}' > "$t/ok.json"
+printf '{"name":"A","slug":"a","cli":"a","home":".config/a","session":"a"}' > "$t/bad.json"
+[[ $(bash -c "BRAND_FILE='$t/ok.json' source '$root/scripts/brand.sh'; echo \$BRAND_VERSION") == 0.0.0 ]] && ok "version is optional (0.0.0)" || bad "version without a default"
+out=$(bash -c "BRAND_FILE='$t/bad.json' source '$root/scripts/brand.sh'; echo went-on" 2>&1)
+[[ $out == *"missing required key(s): bundle_id"* && $out != *went-on* ]] && ok "a missing required key stops, naming it" || bad "missing key: $out"
+rm -rf "$t"
 # The app's name strings come from src/brand.rs, never a literal of the current name.
 lit=$(git grep -n -I -F "\"$BRAND_NAME\"" -- 'src/*.rs' 'src/**/*.rs' | grep -v '^src/brand.rs' || true)
 [[ -z $lit ]] && ok "no literal \"$BRAND_NAME\" in src (it comes from brand.rs)" || bad "literal brand name in src: $lit"

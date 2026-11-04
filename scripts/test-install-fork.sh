@@ -123,7 +123,7 @@ mrun "$V" "$V/fakebin:$PATH" >/dev/null 2>&1 && grep -q "HC_SESSION='$P_SESSION'
 B=$scratch/brand && mkdir -p "$B/Applications/Herdr.app/Contents/MacOS" && printf 'stock\n' > "$B/Applications/Herdr.app/Contents/MacOS/Herdr"
 python3 - "$scratch/other-brand.json" <<'PY2'
 import json, sys
-json.dump({"name": "Zz Other", "slug": "zzother", "bundle_id": "dev.zzother.app", "cli": "zzother", "home": ".config/zzother", "session": "zzother", "previous": []}, open(sys.argv[1], "w"))
+json.dump({"name": "Zz Other", "slug": "zzother", "version": "9.9.9", "bundle_id": "dev.zzother.app", "cli": "zzother", "home": ".config/zzother", "session": "zzother", "previous": []}, open(sys.argv[1], "w"))
 PY2
 HOME=$B BRAND_FILE=$scratch/other-brand.json HERDR_APP_BIN=$HERDR_APP_BIN HERDR_HOST_APP=$host FORK_INSTALL_NO_REGISTER=1 scripts/install-fork-macos >"$scratch/other.log" 2>&1 && ok "install under another brand.json runs" || bad "other brand: $(tail -3 "$scratch/other.log")"
 op="$B/Applications/Zz Other.app/Contents/Info.plist"
