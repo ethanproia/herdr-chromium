@@ -76,9 +76,11 @@ export async function flushNote(mod, io) {
   for (let i = 0; i < 30; i++) {
     const a = io.shared("notepad.flushAck");
     if (a && a.req === req) {
+      // Give other open copies a moment to answer the same request; one failure wins (they never overwrite it).
       await io.sleep(150);
       const z = io.shared("notepad.flushAck");
-      return z?.ok ? null : (z?.error || "The note could not be saved");
+      const ack = z && z.req === req ? z : a;
+      return ack.ok ? null : (ack.error || "The note could not be saved");
     }
     await io.sleep(100);
   }

@@ -26,7 +26,9 @@ export function toggleSection(cur, key) {
 // A row can't be switched off when it is the only list still on.
 export const sectionLocked = (cur, key) => toggleSection(cur, key) === null;
 // Footer block height: 1 border + 8 padding on every side + 28 per row.
-export const footerHeight = (rows) => 17 + 28 * rows;
+// The fork's version line adds one 20px row under the others (fork only: stock has no appInfo).
+export const VERSION_ROW_PX = 20;
+export const footerHeight = (rows, version = false) => 17 + 28 * rows + (version ? VERSION_ROW_PX : 0);
 // Settings moved to the sidebar's top bar (Ethan 2026-11-03), so the footer holds only Add machine: 0 rows = hidden.
 // Rail footer: 1 border + 9 + buttons of 26 with 4 between + 9 (the same 9 px margin as the rail's top button).
 export const railFooterHeight = (sections) => { const n = 2 + (normalizeSections(sections).addMachine ? 1 : 0); return 1 + 9 + 26 * n + 4 * (n - 1) + 9; };
@@ -46,10 +48,10 @@ export function sectionsPlan(sections, state) {
     return cmds;
   }
   const rows = footerRows(s);
-  if (!rows) { if (!state.footerHidden) cmds.push(["layout.hide", { id: "sidebar-footer" }]); }
+  if (!rows && !state.version) { if (!state.footerHidden) cmds.push(["layout.hide", { id: "sidebar-footer" }]); }
   else {
     if (state.footerHidden) cmds.push(["layout.show", { id: "sidebar-footer" }]);
-    const px = footerHeight(rows);
+    const px = footerHeight(rows, Boolean(state.version));
     if (state.footerPx !== px) cmds.push(["layout.resize", { id: "sidebar-footer", px }]);
   }
   return cmds;
@@ -77,4 +79,18 @@ export function sidebarRulesPending(tree, collapsed) {
     || (lists != null && lists.resizable !== true)
     || (brand != null && brand.size?.px !== BRAND_OPEN)
     || Boolean(sp?.size?.px);
+}
+
+// The fork's version line from appInfo() ({name, version, base, sha}): short "Trestle 0.2.0 · 1a2b3c4" in the footer,
+// full "Trestle 0.2.0 (Herdr 0.1.13, <sha>)" on hover and on the clipboard. Null without a name and version.
+export function versionLine(info) {
+  if (!info || typeof info !== "object") return null;
+  const name = typeof info.name === "string" ? info.name.trim() : "";
+  const version = typeof info.version === "string" ? info.version.trim() : "";
+  if (!name || !version) return null;
+  const sha = typeof info.sha === "string" ? info.sha.trim() : "";
+  const base = typeof info.base === "string" ? info.base.trim() : "";
+  const head = `${name} ${version}`;
+  const inner = [base ? `Herdr ${base}` : "", sha].filter(Boolean).join(", ");
+  return { short: sha ? `${head} · ${sha.slice(0, 7)}` : head, full: inner ? `${head} (${inner})` : head };
 }

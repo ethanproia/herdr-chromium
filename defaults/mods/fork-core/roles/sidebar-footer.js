@@ -5,6 +5,8 @@ import { div, svg } from "gpui-kit";
 import { h_flex, v_flex } from "gpui-base";
 import { theme, run, shared, settings } from "herdr";
 import { icon } from "../self.js";
+import { copyText } from "../look.js";
+import { appVersion } from "../app-info.js";
 import { narrow, openSectionsMenu } from "./sections.js";
 // With the fork's "glass" setting the sidebar's layout background draws translucent over a blurred window; painting
 // our own opaque chrome here would hide it, so sidebar roots leave the background to the layout then.
@@ -35,8 +37,13 @@ export default class SidebarFooter {
         .child(ctl("rail-search", "search", "Search", () => run("mod.open", { name: "picker" })))
         .child(ctl("rail-settings", "settings", "Settings", () => run("app.settings")));
     }
+    // Fork only: one dim version line at the very bottom (hover = full line, click = copy it). Stock: no appInfo, no line.
+    const ver = appVersion();
     return v_flex().size_full().when(!glassOn(), (el) => el.bg(t.chrome)).border_t(1).border_color(t.border).p(8).text_size(13)
       .on_mouse_down("right", () => openSectionsMenu())
-      .when(showAddMachine(), (el) => el.child(row("machine", icon("plus"), "Add Machine", true, () => run("mod.open", { name: "machine-add" }))));
+      .when(showAddMachine(), (el) => el.child(row("machine", icon("plus"), "Add Machine", true, () => run("mod.open", { name: "machine-add" }))))
+      .when(Boolean(ver), (el) => el.child(div().id("app-version").h(20).px(8).flex().items_center().text_size(11).text_color(t.dim)
+        .truncate().cursor_pointer().hover((s) => s.text_color(t.muted)).tooltip(ver.full)
+        .on_click(() => copyText(ver.full, "Version copied")).child(ver.short)));
   }
 }
