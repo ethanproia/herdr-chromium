@@ -414,7 +414,7 @@ Show one child of a stack.
 
 ## `layout.reset`
 
-Reset a shipped layout and its clicks (the old file is kept aside).
+Reset a shipped layout (or the fork's labs, to its bundled copy) and its clicks (the old file is kept aside).
 
 | Argument | Required |
 |---|---|
