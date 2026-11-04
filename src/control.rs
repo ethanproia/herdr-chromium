@@ -237,7 +237,9 @@ pub fn masked_shot(window: &mut gpui::Window, cx: &mut gpui::App, path: &std::pa
     use std::sync::atomic::Ordering::SeqCst;
     crate::browser::view::SHOT_MASK.store(true, SeqCst);
     window.refresh();
+    let started = std::time::Instant::now();
     window.draw(cx).clear(cx);
+    crate::frame_stats::shot_draw(window.window_handle().window_id().as_u64(), started.elapsed().as_secs_f64() * 1e3);
     let r = save_shot(window, path);
     crate::browser::view::SHOT_MASK.store(false, SeqCst);
     window.refresh();
