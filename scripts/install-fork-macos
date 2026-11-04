@@ -174,11 +174,12 @@ SH
 chmod +x "$cli.new"
 mv -f "$cli.new" "$cli"
 
-# First install: a copy of stock's home (read only; sockets and layout state left out).
+# First install: a copy of stock's home (read only; sockets, layout state and
+# stock's pending-update marker left out — a fork never applies it).
 if [[ ! -e $labs_home ]]; then
   mkdir -p "$labs_home"
   if [[ -d $stock_home ]]; then
-    rsync -a --exclude '*.sock' --exclude 'layouts/.state' --exclude 'keys.json.bak' "$stock_home/" "$labs_home/"
+    rsync -a --exclude '*.sock' --exclude 'layouts/.state' --exclude 'keys.json.bak' --exclude '.updated' "$stock_home/" "$labs_home/"
   fi
   python3 - "$labs_home/shared.json" <<'PY'
 import json, os, sys

@@ -24,6 +24,7 @@ printf '{ "layout": "main", "frame.welcomed": "done" }\n' > "$H/.config/herdr-ap
 printf '{ "global": { "cmd-t": "tab.new" } }\n' > "$H/.config/herdr-app/keys.json"
 printf 'state\n' > "$H/.config/herdr-app/layouts/.state/main.json"
 printf 'sock\n' > "$H/.config/herdr-app/herdr-app.sock"
+printf 'pending core update\n' > "$H/.config/herdr-app/.updated"
 printf '# My note\n' > "$H/Notes/notepad.md"
 
 # A stand-in host bundle: the installer only copies it.
@@ -52,6 +53,7 @@ L=$H/$BRAND_HOME
 [[ $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["layout"])' "$L/shared.json") == labs ]] && ok "copy opens on labs" || bad "copy layout"
 cmp -s "$L/settings.json" "$H/.config/herdr-app/settings.json" && cmp -s "$L/keys.json" "$H/.config/herdr-app/keys.json" && ok "settings and keys copied" || bad "copy content"
 [[ ! -e $L/herdr-app.sock && ! -e $L/layouts/.state ]] && ok "sockets and layout state left out" || bad "copied sockets or state"
+[[ ! -e $L/.updated ]] && ok "stock's update marker left out" || bad "copied .updated"
 cmp -s "$L/data/notepad/notepad.md" "$H/Notes/notepad.md" && ok "note copied into the labs home" || bad "note copy"
 [[ $(stock_sum) == "$before" ]] && ok "stock untouched after install" || bad "stock changed by install"
 
