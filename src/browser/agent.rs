@@ -133,6 +133,12 @@ impl Agent {
                 return Step::Done;
             }
         };
+        // A popup moves itself (OAuth redirects); CEF can drop a navigate or eval sent into one, so
+        // agents are told plainly instead of losing the call (docs D17).
+        if POPUP_DRIVEN.contains(&name) && reg.state(&id).is_some_and(|s| s.opener.is_some()) {
+            reply(Err(format!("{name} is not available on popup {id:?}: popups are driven by their page")));
+            return Step::Done;
+        }
         if let Err(e) = self.allowed(name, a, &id, reg) {
             reply(Err(e));
             return Step::Done;
@@ -597,6 +603,9 @@ impl CdpFile {
 pub const PERSON_PROFILE: &str = "default";
 
 /// The grants an agent command on one block needs (Control is implied on blocks agents opened).
+/// Commands a popup refuses (its page drives it).
+const POPUP_DRIVEN: [&str; 5] = ["browser.navigate", "browser.back", "browser.forward", "browser.reload", "browser.eval"];
+
 /// The profile a name means to the host: trimmed, and empty is the default (person's) profile.
 pub fn canonical_profile(name: &str) -> String {
     match name.trim() {
@@ -753,7 +762,9 @@ mod tests {
     impl BrowserRegistry for Reg {
         fn state(&self, id: &BrowserId) -> Option<BrowserState> {
             let profile = if self.person.contains(&id.as_str()) { PERSON_PROFILE } else { AGENT_PROFILE };
-            self.live.contains(&id.as_str()).then(|| BrowserState { profile: profile.into(), ..Default::default() })
+            // "<opener>-pop<n>" is a popup of <opener>.
+            let opener = id.split_once("-pop").map(|(o, _)| o.to_string());
+            self.live.contains(&id.as_str()).then(|| BrowserState { profile: profile.into(), opener, ..Default::default() })
         }
         fn link(&self) -> &dyn HostLink {
             &self.link
@@ -1161,6 +1172,19 @@ mod tests {
 
     /// Every agent `browser.*` command but the window's (new, remote) and the ungated ones (open, annotations).
     const COMMANDS_COVERED: [&str; 12] = ["navigate", "back", "forward", "reload", "stop", "devtools", "eval", "screenshot", "find", "lock", "close", "pick"];
+
+    #[test]
+    fn popups_refuse_navigate_and_eval_plainly() {
+        let (_d, mut a) = agent();
+        let reg = Reg { live: vec!["b1", "b1-pop1"], person: vec![], link: Link::default() };
+        for name in POPUP_DRIVEN {
+            let r = run(&mut a, &reg, name, json!({ "id": "b1-pop1", "url": "https://x.test", "expr": "1" }));
+            assert!(r.unwrap().unwrap_err().contains("popups are driven by their page"), "{name}");
+        }
+        assert!(sent(&reg).is_empty(), "nothing reached the host");
+        // Its opener still takes them.
+        assert!(!matches!(run(&mut a, &reg, "browser.navigate", json!({ "id": "b1", "url": "https://x.test" })), Some(Err(e)) if e.contains("popups")));
+    }
 
     #[test]
     fn the_persons_popups_are_not_listed_to_agents() {
