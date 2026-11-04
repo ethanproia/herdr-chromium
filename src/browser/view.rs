@@ -1218,7 +1218,7 @@ impl BrowserView {
             }
             // The host minted `id`; only this page's own popups, and never an id already in use.
             H::PopupOpened { opener, id, url, w, h } if opener == self.id => {
-                if self.states.lock().unwrap().contains_key(&id) || self.popups_due.iter().any(|(p, ..)| *p == id) {
+                if !herdr_browser_protocol::is_popup_id(&id) || self.states.lock().unwrap().contains_key(&id) || self.popups_due.iter().any(|(p, ..)| *p == id) {
                     // Never Close it: that id is a live block's.
                     tracing::warn!("browser {}: popup id {id} is already in use; ignored", self.id);
                 } else {
@@ -1611,6 +1611,12 @@ impl BrowserView {
     }
 
     /// S29: a grant (or the sensitive mark) as the person set it in the shield; never an agent's.
+    /// Marked sensitive by the person: a popup is as sensitive as its opener.
+    pub fn sensitive(&self) -> bool {
+        let id = self.opener.clone().unwrap_or_else(|| self.id.clone());
+        self.agent.as_ref().is_some_and(|a| a.lock().unwrap().grants.get(&id, Grant::Sensitive))
+    }
+
     pub fn grant(&self, g: Grant) -> bool {
         self.agent.as_ref().is_some_and(|a| a.lock().unwrap().grants.get(&self.id, g))
     }
@@ -2742,7 +2748,7 @@ impl Render for BrowserView {
             });
         }
         // A window shot covers a page the person marked sensitive (its pixels never reach the file).
-        let masked = SHOT_MASK.load(std::sync::atomic::Ordering::SeqCst) && self.grant(Grant::Sensitive);
+        let masked = SHOT_MASK.load(std::sync::atomic::Ordering::SeqCst) && self.sensitive();
         let frame = if masked { None } else { frame };
         let page = match (&self.crashed, frame) {
             _ if masked => page.child(

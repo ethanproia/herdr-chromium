@@ -722,7 +722,9 @@ wrap_life_span_handler! {
         fn on_before_popup(&self, _browser: Option<&mut Browser>, _frame: Option<&mut Frame>, _popup_id: ::std::os::raw::c_int, target_url: Option<&CefString>, _target_frame_name: Option<&CefString>, target_disposition: WindowOpenDisposition, user_gesture: ::std::os::raw::c_int, popup_features: Option<&PopupFeatures>, window_info: Option<&mut WindowInfo>, client: Option<&mut Option<Client>>, settings: Option<&mut BrowserSettings>, _extra_info: Option<&mut Option<DictionaryValue>>, _no_javascript_access: Option<&mut ::std::os::raw::c_int>) -> ::std::os::raw::c_int {
             let disposition = disposition_name(&target_disposition);
             if disposition == "new_popup" {
-                if user_gesture == 0 {
+                // Chromium's gesture alone isn't enough: an agent's eval carries one. The person's own
+                // click or key on this page, just now, is.
+                if user_gesture == 0 || !super::person_active(&self.id) {
                     send(HostToApp::PopupBlocked { id: self.id.clone(), url: s(target_url) });
                     return 1;
                 }
