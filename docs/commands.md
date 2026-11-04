@@ -611,6 +611,24 @@ Toggle the command palette: every command by name, with its key; calling again c
 
 No arguments.
 
+## `notifications.read_all`
+
+Mark every notification in the bell read.
+
+No arguments.
+
+## `notifications.clear_all`
+
+Delete every notification in the bell's history.
+
+No arguments.
+
+## `notifications.toggle_dnd`
+
+Turn Do Not Disturb on or off: no toasts or sounds; the bell still counts.
+
+No arguments.
+
 ## `app.settings`
 
 Open the settings (section: look, alerts, updates).
