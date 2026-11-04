@@ -85,6 +85,7 @@ pub const COMMANDS: &[Command] = &[
     cmd("browser.navigate", &[req("url"), opt("id"), opt("pane")], "Load url in a browser (id, or the one in pane; default: the focused browser)."),
     cmd("browser.back", &[opt("id"), opt("pane")], "Go back in a browser's history."),
     cmd("browser.forward", &[opt("id"), opt("pane")], "Go forward in a browser's history."),
+    cmd("browser.device", &[opt("id"), opt("pane"), opt("name"), opt("w"), opt("h"), opt("scale"), opt("off")], "Preview a browser as a device (responsive mode): name \"iPhone 15\", \"Pixel 8\" or \"iPad Air\", or a custom w and h (scale optional); off: true goes back. The page gets that real viewport; named devices also get their mobile user agent and touch."),
     cmd("browser.reload", &[opt("id"), opt("pane"), opt("ignore_cache")], "Reload a browser's page (ignore_cache: true skips the cache)."),
     cmd("browser.stop", &[opt("id"), opt("pane")], "Stop loading a browser's page."),
     cmd("browser.screenshot", &[opt("id"), opt("pane"), opt("path")], "Save a full-resolution PNG of a browser's page to path (default: browser/shots/ in the app's home); answers the path."),

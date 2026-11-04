@@ -26,8 +26,11 @@ stock_app="$HOME/Applications/Herdr.app"
 stock_cli="$HOME/.local/bin/herdr-app"
 
 trash() { # move to the user's Trash under a unique name; never delete outright
-  local src=$1 dest="$HOME/.Trash/$(basename "$1") $(date +%Y%m%d-%H%M%S)"
+  # Unique even within one second (the CLI and the home are both named herdr-labs).
+  local src=$1 dest n=0
   mkdir -p "$HOME/.Trash"
+  dest="$HOME/.Trash/$(basename "$1") $(date +%Y%m%d-%H%M%S)"
+  while [[ -e $dest || -L $dest ]]; do n=$((n + 1)); dest="$HOME/.Trash/$(basename "$1") $(date +%Y%m%d-%H%M%S) $n"; done
   mv "$src" "$dest"
   echo "moved $src to $dest"
 }

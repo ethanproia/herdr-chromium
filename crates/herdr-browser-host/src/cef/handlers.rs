@@ -1090,6 +1090,23 @@ pub fn scheme_message(dark: bool) -> Vec<u8> {
     serde_json::to_vec(&call).expect("json encodes")
 }
 
+/// The DevTools message id for device-mode calls (their results are not needed).
+pub const DEVICE_MSG: i32 = 3;
+
+/// The DevTools calls that put a page in a device mode, or (None) take it out: an empty user
+/// agent and touch off restore exactly the desktop page (no override left behind).
+pub fn device_messages(device: Option<&herdr_browser_protocol::Device>) -> Vec<Vec<u8>> {
+    let (touch, mobile, ua) = device.map_or((false, false, String::new()), |d| (d.touch, d.mobile, d.user_agent.clone().unwrap_or_default()));
+    [
+        serde_json::json!({ "id": DEVICE_MSG, "method": "Emulation.setTouchEmulationEnabled", "params": { "enabled": touch, "maxTouchPoints": if touch { 5 } else { 1 } } }),
+        serde_json::json!({ "id": DEVICE_MSG, "method": "Emulation.setEmitTouchEventsForMouse", "params": { "enabled": touch, "configuration": if mobile { "mobile" } else { "desktop" } } }),
+        serde_json::json!({ "id": DEVICE_MSG, "method": "Emulation.setUserAgentOverride", "params": { "userAgent": ua } }),
+    ]
+    .iter()
+    .map(|c| serde_json::to_vec(c).expect("json encodes"))
+    .collect()
+}
+
 /// The DevTools message id used for `Target.getTargetInfo` (one per browser, so any fixed id works).
 pub const TARGET_INFO_MSG: i32 = 1;
 
@@ -1196,6 +1213,18 @@ mod tests {
         // A new document drops the world; the next probe makes it again.
         world_reset("w1");
         assert_eq!(call(overlay_message("w1", 5, 1, &q()).unwrap())["method"], "Page.getFrameTree");
+    }
+
+    #[test]
+    fn device_mode_on_and_off() {
+        let on = herdr_browser_protocol::Device { mobile: true, touch: true, user_agent: Some("UA-phone".into()) };
+        let calls: Vec<serde_json::Value> = device_messages(Some(&on)).iter().map(|c| serde_json::from_slice(c).unwrap()).collect();
+        assert_eq!(calls[0]["params"]["enabled"], true);
+        assert_eq!(calls[1]["params"]["configuration"], "mobile");
+        assert_eq!(calls[2]["params"]["userAgent"], "UA-phone");
+        // Off: every override cleared (an empty UA restores the browser's own).
+        let off: Vec<serde_json::Value> = device_messages(None).iter().map(|c| serde_json::from_slice(c).unwrap()).collect();
+        assert_eq!((off[0]["params"]["enabled"].clone(), off[1]["params"]["enabled"].clone(), off[2]["params"]["userAgent"].clone()), (serde_json::json!(false), serde_json::json!(false), serde_json::json!("")));
     }
 
     #[test]

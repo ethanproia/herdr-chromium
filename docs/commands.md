@@ -457,6 +457,20 @@ Go forward in a browser's history.
 | `id` | no |
 | `pane` | no |
 
+## `browser.device`
+
+Preview a browser as a device (responsive mode): name "iPhone 15", "Pixel 8" or "iPad Air", or a custom w and h (scale optional); off: true goes back. The page gets that real viewport; named devices also get their mobile user agent and touch.
+
+| Argument | Required |
+|---|---|
+| `id` | no |
+| `pane` | no |
+| `name` | no |
+| `w` | no |
+| `h` | no |
+| `scale` | no |
+| `off` | no |
+
 ## `browser.reload`
 
 Reload a browser's page (ignore_cache: true skips the cache).
