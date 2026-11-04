@@ -23,6 +23,8 @@ pub mod devices;
 // HERDR: part 4, design slice S11.
 pub mod edits;
 pub mod frame;
+// HERDR: HERDR_BROWSER_TRACE frame timeline (app side).
+pub mod trace;
 pub mod geometry;
 // HERDR: part 4, the S27 inbox formatter.
 pub mod handoff;

@@ -5,6 +5,7 @@
 //! CEF callback therefore runs on the main thread too, so host state lives in a thread-local.
 //! Rule for that state: never call into CEF while it is borrowed (CEF may call back synchronously).
 
+mod trace;
 mod blit;
 mod handlers;
 mod keys;
@@ -412,6 +413,7 @@ pub(crate) fn on_popup_size(id: &str, x: i32, y: i32, w: i32, h: i32) {
 /// Keep a copy of a freshly painted layer (CEF's surface dies with the callback), then compose the
 /// page and, if open, its popup at the popup's bounds into a pool surface and send it.
 fn paint(id: &str, layer: Option<(bool, *mut std::ffi::c_void, u32, u32)>) {
+    trace::line("callback", format_args!("{id} layer={}", layer.map_or("none", |l| if l.0 { "popup" } else { "page" })));
     let ready = with_host(|host| {
         let entry = host.browsers.get_mut(id)?;
         let blitter = host.blitter.as_ref()?;
@@ -464,6 +466,7 @@ fn paint(id: &str, layer: Option<(bool, *mut std::ffi::c_void, u32, u32)>) {
             }
             Ok(Out(entry.pool.submit(dst).map(|f| (f.seq, f.surface.clone(), entry.scale))))
         })();
+        trace::line("copied", format_args!("{id} us={} out={}", t.elapsed().as_micros(), match &res { Ok(Out(Some((seq, _, _)))) => format!("seq{seq}"), Ok(Out(None)) => "held".into(), Ok(Shots(..)) => "shots".into(), Err(_) => "error".into() }));
         // Stats (HERDR_BROWSER_STATS): copy cost, and the first paint at a new size after Resize.
         let hidden = entry.hidden;
         let size = entry.view.as_ref().map(|v| v.size());
@@ -649,12 +652,39 @@ fn send_frame(id: &str, seq: u64, mut s: Surface, scale: f32) {
         Ok(surface) => {
             let size = s.size();
             send(HostToApp::Frame { id: id.into(), seq, surface, size, scale });
+            trace::line("sent", format_args!("{id} seq={seq}"));
         }
         Err(e) => send(HostToApp::Error { id: Some(id.into()), message: format!("export: {e}") }),
     }
 }
 
+/// When CEF next wants `do_message_loop_work` (from `on_schedule_message_pump_work`, any thread),
+/// and the main loop's channel, so a deadline sooner than its wait wakes it.
+static PUMP_DUE: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+static PUMP_WAKE: std::sync::OnceLock<std::sync::Mutex<mpsc::Sender<Incoming>>> = std::sync::OnceLock::new();
+/// The loop pumps at least this often even when CEF schedules nothing (CEF's own guidance).
+const PUMP_FALLBACK: Duration = Duration::from_millis(33);
+/// Messages handled per pass, so a burst of input never starves the pump.
+const DRAIN_MAX: usize = 64;
+
+pub(crate) fn pump_due(delay_ms: i64) {
+    let at = std::time::Instant::now() + Duration::from_millis(delay_ms.max(0) as u64);
+    let sooner = {
+        let mut due = PUMP_DUE.lock().unwrap();
+        let sooner = due.is_none_or(|d| at < d);
+        if sooner {
+            *due = Some(at);
+        }
+        sooner
+    };
+    if sooner && let Some(tx) = PUMP_WAKE.get() {
+        let _ = tx.lock().unwrap().send(Incoming::Wake);
+    }
+}
+
 enum Incoming {
+    /// CEF asked for a pump sooner than the loop's wait.
+    Wake,
     Msg(AppToHost),
     Bad(String),
     Gone,
@@ -795,7 +825,10 @@ fn serve(socket: &Path, listener: UnixListener, args: &Args) -> io::Result<()> {
             next_popup: 0,
             perms: HashMap::new(),
             quit: false,
-            stats: BlitStats::open(profile_dir.parent().unwrap_or(&profile_dir)),
+            stats: {
+                trace::open(profile_dir.parent().unwrap_or(&profile_dir));
+                BlitStats::open(profile_dir.parent().unwrap_or(&profile_dir))
+            },
         })
     });
     if with_host(|h| h.blitter.is_none()).unwrap_or(true) {
@@ -804,6 +837,7 @@ fn serve(socket: &Path, listener: UnixListener, args: &Args) -> io::Result<()> {
     send(HostToApp::Ready { version: PROTOCOL_VERSION, cef_version: cef_version(), cdp_port: cdp, cdp_pipe: CDP_PIPE.load(std::sync::atomic::Ordering::SeqCst) });
 
     let (tx, rx) = mpsc::channel();
+    let _ = PUMP_WAKE.set(std::sync::Mutex::new(tx.clone()));
     std::thread::spawn(move || {
         for line in reader.lines() {
             let Ok(line) = line else { break };
@@ -822,9 +856,14 @@ fn serve(socket: &Path, listener: UnixListener, args: &Args) -> io::Result<()> {
     });
 
     loop {
+        let pump = trace::on().then(trace::now);
         do_message_loop_work();
+        let drain = trace::on().then(trace::now);
+        let mut drained = 0;
         while let Ok(m) = rx.try_recv() {
+            drained += 1;
             match m {
+                Incoming::Wake => {}
                 Incoming::Msg(AppToHost::Shutdown) | Incoming::Gone => {
                     with_host(|h| h.quit = true);
                 }
@@ -837,6 +876,13 @@ fn serve(socket: &Path, listener: UnixListener, args: &Args) -> io::Result<()> {
         }
         nudge_waiting();
         deny_permissions(None, true);
+        if let (Some(p), Some(d)) = (pump, drain) {
+            // Only slow passes: a pump or drain over 8 ms is where a frame can wait.
+            let end = trace::now();
+            if end - p > 8_000_000 {
+                trace::line("pump", format_args!("work_us={} drain_us={} msgs={drained}", (d - p) / 1000, (end - d) / 1000));
+            }
+        }
         std::thread::sleep(Duration::from_millis(4));
     }
 
@@ -1038,6 +1084,7 @@ fn handle(m: AppToHost) {
             cb.cont(accept as i32, text.as_deref().map(CefString::from).as_ref());
         }
         M::FrameAck { id, seq } => {
+            trace::line("ack", format_args!("{id} seq={seq}"));
             let next = with_host(|h| h.browsers.get_mut(&id).map(|e| (e.pool.ack(seq).map(|f| (f.seq, f.surface.clone())), e.scale))).flatten();
             match next {
                 Some((Some((seq, s)), scale)) => send_frame(&id, seq, s, scale),
