@@ -117,6 +117,12 @@ if [[ -z $host ]]; then
 fi
 [[ -x $bin ]] || { echo "no herdr-app binary at $bin" >&2; exit 1; }
 [[ -x $host/Contents/MacOS/herdr-browser-host ]] || { echo "no browser host bundle at $host" >&2; exit 1; }
+# SEC4: only a host whose helpers run sandboxed (a pre-SEC4 bundle doesn't know --capabilities).
+caps=$("$host/Contents/MacOS/herdr-browser-host" --capabilities 2>/dev/null || true)
+if ! python3 -c 'import json,sys; sys.exit(0 if json.loads(sys.argv[1]).get("sandboxed") is True else 1)' "$caps" 2>/dev/null; then
+  echo "refusing: the browser host at $host does not report sandboxed helpers (a pre-SEC4 build?); rebuild it with scripts/fork-host-bundle.sh release" >&2
+  exit 1
+fi
 
 # Assemble beside the app, then swap it in, so a failed step never leaves half an app.
 new="$app.new"

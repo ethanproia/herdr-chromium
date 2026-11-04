@@ -303,7 +303,9 @@ pub enum PickStep {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HostToApp {
     /// `cdp_pipe`: true once the host started with the pipe switch.
-    Ready { version: u32, cef_version: String, cdp_port: Option<u16>, #[serde(default)] cdp_pipe: bool },
+    /// `sandboxed`: every helper runs in Chromium's sandbox (SEC4). A host from before SEC4 doesn't send it
+    /// (read as false), and the app refuses a real host without it.
+    Ready { version: u32, cef_version: String, cdp_port: Option<u16>, #[serde(default)] cdp_pipe: bool, #[serde(default)] sandboxed: bool },
     /// A new frame. At most one frame per browser is unacknowledged at a time: the host holds the
     /// newest pending frame until `FrameAck` and drops older ones.
     Frame { id: BrowserId, seq: u64, surface: SurfaceRef, size: PixelSize, scale: f32 },
@@ -435,7 +437,7 @@ mod tests {
 
     #[test]
     fn host_messages_roundtrip() {
-        roundtrip_host(HostToApp::Ready { version: PROTOCOL_VERSION, cef_version: "0".into(), cdp_port: None, cdp_pipe: false });
+        roundtrip_host(HostToApp::Ready { version: PROTOCOL_VERSION, cef_version: "0".into(), cdp_port: None, cdp_pipe: false, sandboxed: true });
         roundtrip_host(HostToApp::Frame { id: "b1".into(), seq: 1, surface: SurfaceRef::GlobalId { id: 42 }, size: PixelSize { w: 1600, h: 1200 }, scale: 2.0 });
         roundtrip_host(HostToApp::Frame { id: "b1".into(), seq: 2, surface: SurfaceRef::MachPort { name: "com.herdr.s".into() }, size: PixelSize { w: 2, h: 2 }, scale: 1.0 });
         roundtrip_host(HostToApp::Loading { id: "b1".into(), loading: true, can_back: false, can_forward: false });
