@@ -128,6 +128,14 @@ fn unix_agent_argv(sh: String, cmd: Vec<String>, login: bool) -> Vec<String> {
     run
 }
 
+/// HERDR: a machine name meaning this work Mac, which is outbound-only (no remote desktop to it):
+/// basis, mac, ethan-basis, local or This Mac, any case, with or without a trailing `.local`.
+fn is_work_mac(machine: &str) -> bool {
+    let m = machine.trim().to_ascii_lowercase();
+    let m = m.strip_suffix(".local").unwrap_or(&m);
+    matches!(m, "basis" | "mac" | "ethan-basis" | "local" | "this mac" | "this-mac")
+}
+
 fn launch_failure(record: &Value, output: &str) -> Option<String> {
     let code = record["exit_code"].as_i64().filter(|c| *c != 0)?;
     let elapsed = record["finished_ms"].as_u64()?.checked_sub(record["created_ms"].as_u64()?)?;
@@ -4556,6 +4564,11 @@ impl AppWindow {
     // --ensure [--machine m]` off the UI thread; its one printed url opens with raw chords. The
     // url carries a token: it is never logged, and the document keeps it without the token.
     fn open_remote_desktop(&mut self, machine: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        // HERDR: the work Mac is outbound-only: never a remote desktop target (labs #1350 refuses in the bridge too).
+        if machine.as_deref().is_some_and(is_work_mac) {
+            let note = json!({"title":"Remote desktop to this work Mac is off","level":"info","key":"remote-desktop-work-mac"});
+            return self.post_note("machines", "herdr", "Remote desktop", note, window, cx);
+        }
         let labs = std::env::var("HERDR_LABS_CHECKOUT").ok().filter(|v| !v.is_empty())
             .or_else(|| settings::load_person().ok().and_then(|p| p.labs_checkout));
         let Some(labs) = labs else {
@@ -5657,6 +5670,17 @@ fn changed_asset_paths(home: &std::path::Path, changed: &[std::path::PathBuf]) -
 
 #[cfg(test)]
 mod tests {
+    // HERDR: the work Mac is never a remote desktop target, under any of its names.
+    #[test]
+    fn the_work_mac_is_never_a_remote_desktop_target() {
+        for name in ["basis", "Basis", "MAC", "ethan-basis", "Ethan-Basis.local", "local", "This Mac", " this mac ", "this-mac"] {
+            assert!(super::is_work_mac(name), "{name}");
+        }
+        for name in ["studio", "box", "exe-labs", "basis-studio", "macbook", "machine", ""] {
+            assert!(!super::is_work_mac(name), "{name}");
+        }
+    }
+
     #[test]
     fn only_plain_local_http_counts_as_the_bridge_url() {
         for ok in ["http://127.0.0.1:7123/?token=t&machine=box", "http://127.0.0.1:80", "http://127.0.0.1:65535/x#y"] {
