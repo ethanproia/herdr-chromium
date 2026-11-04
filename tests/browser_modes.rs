@@ -51,10 +51,10 @@ fn main() {
     p.click(210.0, 130.0);
     p.pump();
     assert!(p.events().iter().any(|e| matches!(e, BrowserEvent::Picked { x, y } if (*x - 210.0).abs() < 0.5 && (*y - 130.0).abs() < 0.5)), "picked at (210, 130): {:?}", p.events());
-    // HERDR: S13. Pick waits out the double-click window (350 ms) before it ends.
+    // HERDR: S13. Pick waits out the double-click window (the platform's interval) before it ends.
     assert_eq!(owner(&mut p), Owner::Pick, "still picking inside the double-click window");
     // The harness clock is simulated: move it past the window.
-    p.cx.advance_clock(Duration::from_millis(400));
+    p.cx.advance_clock(Duration::from_millis(browser::text_edit::double_click_ms() + 50));
     p.pump();
     assert_eq!(owner(&mut p), Owner::Browse, "a pick ends pick mode");
     assert_eq!(mouse_lines(&mut p), before, "the page saw none of the pick");
@@ -62,7 +62,7 @@ fn main() {
     // under it. (The stub host answers no element, so the edit itself is browser_text_edit's, on CEF.)
     p.cx.update(|cx| v.update(cx, |v, cx| v.toggle_mode(Owner::Pick, cx)));
     p.double_click(210.0, 130.0);
-    p.cx.advance_clock(Duration::from_millis(400));
+    p.cx.advance_clock(Duration::from_millis(browser::text_edit::double_click_ms() + 50));
     p.pump();
     assert_eq!(owner(&mut p), Owner::Pick, "the double-click cancelled the exit");
     assert_eq!(mouse_lines(&mut p), before, "the page saw none of the double-click");
