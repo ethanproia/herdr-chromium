@@ -491,9 +491,14 @@ pub struct HostApp;
 wrap_app! {
     pub(crate) struct AppBuilder {
         app: HostApp,
+        pump: BrowserProcessHandler,
     }
 
     impl App {
+        fn browser_process_handler(&self) -> Option<BrowserProcessHandler> {
+            Some(self.pump.clone())
+        }
+
         fn on_before_command_line_processing(&self, _process_type: Option<&CefString>, command_line: Option<&mut CommandLine>) {
             let Some(cl) = command_line else { return };
             // Never touch the login keychain (no prompt on the user's screen); no first-run UI.
@@ -509,9 +514,19 @@ wrap_app! {
 }
 
 pub fn app() -> App {
-    AppBuilder::new(HostApp)
+    AppBuilder::new(HostApp, Pump::new())
 }
 
+// CEF's external message pump contract: it says when it next needs `do_message_loop_work`.
+wrap_browser_process_handler! {
+    pub(crate) struct Pump;
+
+    impl BrowserProcessHandler {
+        fn on_schedule_message_pump_work(&self, delay_ms: i64) {
+            super::pump_due(delay_ms);
+        }
+    }
+}
 
 wrap_render_handler! {
     pub(crate) struct Render {
