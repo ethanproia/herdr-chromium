@@ -5,6 +5,7 @@
 //! CEF callback therefore runs on the main thread too, so host state lives in a thread-local.
 //! Rule for that state: never call into CEF while it is borrowed (CEF may call back synchronously).
 
+mod trace;
 mod blit;
 mod handlers;
 mod keys;
@@ -412,6 +413,7 @@ pub(crate) fn on_popup_size(id: &str, x: i32, y: i32, w: i32, h: i32) {
 /// Keep a copy of a freshly painted layer (CEF's surface dies with the callback), then compose the
 /// page and, if open, its popup at the popup's bounds into a pool surface and send it.
 fn paint(id: &str, layer: Option<(bool, *mut std::ffi::c_void, u32, u32)>) {
+    trace::line("callback", format_args!("{id} layer={}", layer.map_or("none", |l| if l.0 { "popup" } else { "page" })));
     let ready = with_host(|host| {
         let entry = host.browsers.get_mut(id)?;
         let blitter = host.blitter.as_ref()?;
@@ -464,6 +466,7 @@ fn paint(id: &str, layer: Option<(bool, *mut std::ffi::c_void, u32, u32)>) {
             }
             Ok(Out(entry.pool.submit(dst).map(|f| (f.seq, f.surface.clone(), entry.scale))))
         })();
+        trace::line("copied", format_args!("{id} us={} out={}", t.elapsed().as_micros(), match &res { Ok(Out(Some((seq, _, _)))) => format!("seq{seq}"), Ok(Out(None)) => "held".into(), Ok(Shots(..)) => "shots".into(), Err(_) => "error".into() }));
         // Stats (HERDR_BROWSER_STATS): copy cost, and the first paint at a new size after Resize.
         let hidden = entry.hidden;
         let size = entry.view.as_ref().map(|v| v.size());
@@ -649,6 +652,7 @@ fn send_frame(id: &str, seq: u64, mut s: Surface, scale: f32) {
         Ok(surface) => {
             let size = s.size();
             send(HostToApp::Frame { id: id.into(), seq, surface, size, scale });
+            trace::line("sent", format_args!("{id} seq={seq}"));
         }
         Err(e) => send(HostToApp::Error { id: Some(id.into()), message: format!("export: {e}") }),
     }
@@ -795,7 +799,10 @@ fn serve(socket: &Path, listener: UnixListener, args: &Args) -> io::Result<()> {
             next_popup: 0,
             perms: HashMap::new(),
             quit: false,
-            stats: BlitStats::open(profile_dir.parent().unwrap_or(&profile_dir)),
+            stats: {
+                trace::open(profile_dir.parent().unwrap_or(&profile_dir));
+                BlitStats::open(profile_dir.parent().unwrap_or(&profile_dir))
+            },
         })
     });
     if with_host(|h| h.blitter.is_none()).unwrap_or(true) {
@@ -822,8 +829,12 @@ fn serve(socket: &Path, listener: UnixListener, args: &Args) -> io::Result<()> {
     });
 
     loop {
+        let pump = trace::on().then(trace::now);
         do_message_loop_work();
+        let drain = trace::on().then(trace::now);
+        let mut drained = 0;
         while let Ok(m) = rx.try_recv() {
+            drained += 1;
             match m {
                 Incoming::Msg(AppToHost::Shutdown) | Incoming::Gone => {
                     with_host(|h| h.quit = true);
@@ -837,6 +848,13 @@ fn serve(socket: &Path, listener: UnixListener, args: &Args) -> io::Result<()> {
         }
         nudge_waiting();
         deny_permissions(None, true);
+        if let (Some(p), Some(d)) = (pump, drain) {
+            // Only slow passes: a pump or drain over 8 ms is where a frame can wait.
+            let end = trace::now();
+            if end - p > 8_000_000 {
+                trace::line("pump", format_args!("work_us={} drain_us={} msgs={drained}", (d - p) / 1000, (end - d) / 1000));
+            }
+        }
         std::thread::sleep(Duration::from_millis(4));
     }
 
@@ -1038,6 +1056,7 @@ fn handle(m: AppToHost) {
             cb.cont(accept as i32, text.as_deref().map(CefString::from).as_ref());
         }
         M::FrameAck { id, seq } => {
+            trace::line("ack", format_args!("{id} seq={seq}"));
             let next = with_host(|h| h.browsers.get_mut(&id).map(|e| (e.pool.ack(seq).map(|f| (f.seq, f.surface.clone())), e.scale))).flatten();
             match next {
                 Some((Some((seq, s)), scale)) => send_frame(&id, seq, s, scale),

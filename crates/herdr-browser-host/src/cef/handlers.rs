@@ -512,6 +512,7 @@ pub fn app() -> App {
     AppBuilder::new(HostApp)
 }
 
+
 wrap_render_handler! {
     pub(crate) struct Render {
         id: String,
