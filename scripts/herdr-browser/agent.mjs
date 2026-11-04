@@ -12,6 +12,8 @@ const KEYS = { Enter: 13, Backspace: 8, Tab: 9, Escape: 27, Delete: 46, ArrowLef
   Home: 36, End: 35, PageUp: 33, PageDown: 34, " ": 32 };
 const MODS = { Alt: 1, Control: 2, Meta: 4, Shift: 8 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// "https://a.b/c?token=x#y" -> "https://a.b": where a page is, without its path, query or fragment.
+export const origin = (url) => { try { const u = new URL(url); return u.origin === "null" ? `${u.protocol}` : u.origin; } catch { return ""; } };
 
 // One rule for "this field holds a secret", used by snapshots, redaction and the capture check.
 const SECRET_FIELD = `((c) => c.tagName === "INPUT" && (c.type === "password" || /cc-|password|one-time-code/i.test(c.autocomplete || "")
@@ -119,8 +121,13 @@ export default function register({ sessions, onEvent, onOpen, route, dir, openTa
   };
   // Map values can be the open() promise even after the page is ready (core keeps it), so await them all.
   const pages = async () => (await Promise.all([...sessions.values()])).filter((s) => s?.state);
-  const tabs = async () => (await pages()).map((s) => ({ tab: s.id, url: s.state.url, title: s.state.title,
-    loading: s.state.loading, controllable: controllable(s), agentOpened: !!s.state.agentOpened }));
+  // A tab the agent can't drive is the person's: list where it is (origin), not the full URL or
+  // title, which can carry tokens, ids or private text.
+  const tabs = async () => (await pages()).map((s) => {
+    const own = controllable(s);
+    return { tab: s.id, url: own ? s.state.url : origin(s.state.url), title: own ? s.state.title : "",
+      loading: s.state.loading, controllable: own, agentOpened: !!s.state.agentOpened };
+  });
 
   // Each fn(s, args) acts on one tab; the helper checks the tab exists and is controllable first.
   const acts = {
