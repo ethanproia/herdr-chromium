@@ -135,7 +135,9 @@ pub(super) const WELCOME_AGENT_COMMAND: &str = "fork-core.new-menu";
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    // Not `super::*`: that brings gpui's `test` attribute in over the standard one.
+    use super::{LOAD_TIMEOUT, Loading, loading_state};
+    use std::time::{Duration, Instant};
 
     #[test]
     fn loading_says_why_after_the_timeout() {
