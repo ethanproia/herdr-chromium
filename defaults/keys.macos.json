@@ -2,6 +2,7 @@
   "global": {
     "cmd-shift-y": "mod.open:fork-board",
     "cmd-q": "app.quit",
+    "ctrl-cmd-f": "window.fullscreen",
     "cmd-h": "app.hide",
     "cmd-alt-h": "app.hide_others",
     "cmd-t": "tab.new",

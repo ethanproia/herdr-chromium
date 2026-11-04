@@ -1,6 +1,6 @@
 use gpui::*;
 
-actions!(herdr, [Quit, Hide, HideOthers, ShowAll, Settings]);
+actions!(herdr, [Quit, Hide, HideOthers, ShowAll, Settings, ToggleFullScreen]);
 
 pub fn init(cx: &mut App) {
     cx.on_action(|_: &Quit, cx| cx.quit());
@@ -8,6 +8,8 @@ pub fn init(cx: &mut App) {
     cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
     cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
     cx.on_action(|_: &Settings, _| crate::mods::request(crate::mods::Request::Run { name: "app.settings".into(), args: serde_json::Value::Null }));
+    // HERDR: View > Enter Full Screen, the standard Mac place for it (ctrl-cmd-f in keys.json).
+    cx.on_action(|_: &ToggleFullScreen, _| crate::mods::request(crate::mods::Request::Run { name: "window.fullscreen".into(), args: serde_json::Value::Null }));
     cx.set_menus([Menu::new("Herdr").items([
         MenuItem::action("Settings", Settings),
         MenuItem::separator(),
@@ -18,7 +20,7 @@ pub fn init(cx: &mut App) {
         MenuItem::action("Show All", ShowAll),
         MenuItem::separator(),
         MenuItem::action("Quit Herdr", Quit),
-    ])]);
+    ]), Menu::new("View").items([MenuItem::action("Enter Full Screen", ToggleFullScreen)])]);
 }
 
 pub fn action(name: &str) -> Option<Box<dyn Action>> {
