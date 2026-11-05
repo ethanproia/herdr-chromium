@@ -10,7 +10,7 @@ import { fadeLabel, over } from "../scroll.js";
 import { icon, openInTab, openRegistry } from "../look.js";
 import { inboxSnapshot } from "../notes.js";
 import { badgeState, inboxHeight, INBOX_W, BELL_MENU_H } from "../inbox-pure.js";
-import { tabbarMenuHeight, tabBarPins } from "../pure.js";
+import { tabbarMenuHeight, tabBarPins, tabDropPlan } from "../pure.js";
 
 const SIDE = (id) => `panels.side.${id}`;
 
@@ -43,7 +43,7 @@ export default class Tabs {
     const space = spaces().find((sp) => sp.active)?.id;
     const tool = this.reg.tools.find((t) => t.id === "browser" || t.id === "browser-native");
     if (tool) return openInTab(tool, space);
-    run("tab.new", { name: "Browser", space, mod: "browser", props: { id: `b${Date.now().toString(36)}` } });
+    openInTab({ name: "Browser", open: { mod: "browser", props: { id: `b${Date.now().toString(36)}` } } }, space);
   }
 
   // Switching space shows that space's choice (closed if it never had one); opening or closing the panel records it.
@@ -111,11 +111,13 @@ export default class Tabs {
       return h_flex().id(`tab-${c.id}`).h(29).px(10).gap(7).rounded(7).items_center().flex_none().text_size(12.8)
         .border(1).border_color(c.active ? t.border : t.chrome).bg(chip).text_color(c.active ? t.foreground : t.muted)
         .on_hover((h, cx) => { const next = h ? c.id : (this.hoverTab === c.id ? null : this.hoverTab); if (next !== this.hoverTab) { this.hoverTab = next; cx.notify(); } })
-        .on_mouse_down("left", (e, cx) => { cx.stop_propagation(); this.pressed = i; if (e.click_count === 2) run("tab.rename", { id: c.id }); })
+        // The press keeps the tab's id and space, not its index: the list can change before release (a tab closes or
+        // moves), and an index would then name another tab. Release re-reads both in the current list.
+        .on_mouse_down("left", (e, cx) => { cx.stop_propagation(); this.pressed = { id: c.id, space: space.id }; if (e.click_count === 2) run("tab.rename", { id: c.id }); })
         .on_mouse_up("left", () => {
           const from = this.pressed; this.pressed = null;
-          if (from !== null && from !== i) run("tab.move", { id: shown[from].id, index: space.tabs.findIndex((x) => x.id === c.id) + 1 });
-          else run("tab.select", { id: c.id });
+          const plan = tabDropPlan(from, c.id, space.id, spaces().find((s) => s.id === space.id)?.tabs ?? []);
+          if (plan) run(plan.name, plan.args);
         })
         .on_mouse_down("right", (_e, cx) => { cx.stop_propagation(); openOverlay({ mod: SELF, kind: "popup", width: 260, height: 220, props: { role: "menu", tab: "tab", target: { id: c.id, space: space.id } } }); })
         .child(this.tabIcon(c, agentPane, program, t))

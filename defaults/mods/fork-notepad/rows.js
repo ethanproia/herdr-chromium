@@ -115,12 +115,6 @@ export function slugOf(title, stamp) {
   return s && title !== "Untitled" ? s : `untitled-${stamp}`;
 }
 
-export function uniqueName(slug, taken) {
-  const set = new Set(taken);
-  if (!set.has(`${slug}.md`)) return `${slug}.md`;
-  for (let k = 2; ; k++) if (!set.has(`${slug}-${k}.md`)) return `${slug}-${k}.md`;
-}
-
 export function ageOf(ms, now) {
   const s = Math.max(0, Math.floor((now - ms) / 1000));
   if (s < 60) return "now";

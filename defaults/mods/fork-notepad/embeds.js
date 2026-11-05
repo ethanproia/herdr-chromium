@@ -8,7 +8,7 @@
 import { div, image } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { exec, readTextFile, home, appHome, run } from "herdr";
-import { parseMeta, hashKey, extOf, isRemote, excerpt, lineOf, fit, cover, clampText, domainOf, cacheGet, cacheSet, FAIL_TTL, isSafeFetchUrl, CURL_SAFE, CURL_BODY_SCRIPT, fetchHops, pinArgs, ipsFromDig, digArgs, RESOLVE_ERROR, loadFailure } from "./embeds-core.js";
+import { parseMeta, hashKey, extOf, isRemote, excerpt, lineOf, fit, cover, clampText, domainOf, cacheGet, cacheSet, FAIL_TTL, isSafeFetchUrl, CURL_SAFE, CURL_BODY_SCRIPT, fetchHops, pinArgs, ipsFromDig, digArgs, RESOLVE_ERROR, loadFailure, evictList, parseStat, heldNames, CACHE_MAX_FILES, CACHE_MAX_BYTES } from "./embeds-core.js";
 import { openableUrl } from "./rows.js";
 
 const FILE_RECHECK_MS = 2000;
@@ -29,21 +29,42 @@ const IMG_CAP = 20 * 1024 * 1024;   // a remote image larger than this is not do
 
 async function dims(path) {
   try {
-    const r = await exec("sips", ["-g", "pixelWidth", "-g", "pixelHeight", path]);
+    // A relative path that starts with "-" must not reach sips as an option.
+    const p = path.startsWith("/") ? path : "./" + path;
+    const r = await exec("sips", ["-g", "pixelWidth", "-g", "pixelHeight", p]);
     const w = /pixelWidth:\s*(\d+)/.exec(r.stdout), h = /pixelHeight:\s*(\d+)/.exec(r.stdout);
     if (r.code === 0 && w && h) return { w: Number(w[1]), h: Number(h[1]) };
   } catch { /* no size: caller falls back */ }
   return null;
 }
 
+// Names a live cached() call is downloading or about to return. Sweep skips them.
+// stat's mtime is whole seconds, so a same-second tie would otherwise follow ls
+// order and could delete the file another call just validated. Refcounted: two
+// loads of one url share a name, and the name stays pinned until both finish.
+const inUse = new Map();
+// Every open note's Embeds (added in the constructor, removed by dispose when the pane closes).
+const liveEmbeds = new Set();
+const pinName = (name) => inUse.set(name, (inUse.get(name) || 0) + 1);
+const unpinName = (name) => {
+  const n = (inUse.get(name) || 1) - 1;
+  if (n <= 0) inUse.delete(name);
+  else inUse.set(name, n);
+};
+
 // Download a remote image once; returns {path (relative to appHome), w, h} or null.
 async function cached(url) {
   if (!isSafeFetchUrl(url)) return null;
+  const name = `${hashKey(url)}.${extOf(url)}`;
+  pinName(name);
   try {
-    const name = `${hashKey(url)}.${extOf(url)}`;
     const abs = `${appHome()}/${CACHE_REL}/${name}`;
     let d = await dims(abs);
-    if (!d) {
+    if (d) {
+      // mtime is last use, not download time, so a later sweep evicts LRU.
+      // -c: never create an empty file if a sweep already removed this one.
+      await exec("touch", ["-c", abs]).catch(() => {});
+    } else {
       await exec("mkdir", ["-p", `${appHome()}/${CACHE_REL}`]);
       // Each redirect is checked before it is followed; -w prints the next hop (the body goes to the file).
       const got = await fetchHops(url, async (u, extra) => {
@@ -53,9 +74,26 @@ async function cached(url) {
       if (got?.error === RESOLVE_ERROR) { await exec("rm", ["-f", abs]); return { error: RESOLVE_ERROR }; }
       d = got ? await dims(abs) : null;
       if (!d) { await exec("rm", ["-f", abs]); return null; }   // not an image (html error page etc.)
+      await sweep(`${appHome()}/${CACHE_REL}`);
     }
     return { path: `${CACHE_REL}/${name}`, ...d };
   } catch { return null; }
+  finally { unpinName(name); }
+}
+
+// Cache eviction: over either cap, the least recently used files (oldest mtime) go until under both.
+async function sweep(dir) {
+  try {
+    const names = (await exec("ls", ["-1", dir])).stdout.split("\n").filter(Boolean);
+    if (!names.length) return;
+    const st = await exec("stat", ["-f", "%m %z %N", ...names.map((n) => `${dir}/${n}`)]);
+    // No exit-code check: BSD stat exits 1 when one file vanished since ls, but still lists the rest.
+    // Skip names a download is using and every file an open note still draws.
+    const keep = new Set(inUse.keys());
+    for (const e of liveEmbeds) for (const n of heldNames(e.cache.values(), CACHE_REL)) keep.add(n);
+    const drop = evictList(parseStat(st.stdout, dir), CACHE_MAX_FILES, CACHE_MAX_BYTES, keep);
+    if (drop.length) await exec("rm", ["-f", ...drop.map((n) => `${dir}/${n}`)]);
+  } catch { /* keep the image; the next download sweeps again */ }
 }
 
 async function withTimeout(p, ms, cx) {
@@ -97,7 +135,13 @@ async function load(e, cx) {
       const html = got.result && typeof got.result.stdout === "string" ? got.result.stdout : "";
       meta = parseMeta(html.slice(0, FETCH_CAP), got.url);
     } catch { /* offline or slow: the card still shows the url */ }
-    const [thumb, icon] = await Promise.all([meta.image ? cached(meta.image) : null, meta.favicon ? cached(meta.favicon) : null]);
+    // Thumb and favicon download together; keep both names pinned until both finish, since neither is in
+    // Embeds.cache (and so held from the sweep) before the card's result is stored.
+    const names = [meta.image, meta.favicon].filter((u) => u && isSafeFetchUrl(u)).map((u) => `${hashKey(u)}.${extOf(u)}`);
+    names.forEach(pinName);
+    let thumb, icon;
+    try { [thumb, icon] = await Promise.all([meta.image ? cached(meta.image) : null, meta.favicon ? cached(meta.favicon) : null]); }
+    finally { names.forEach(unpinName); }
     const shown = (img) => (img?.path ? img : null);
     return { ok: true, ...meta, thumb: shown(thumb), icon: shown(icon) };
   }
@@ -111,7 +155,8 @@ async function load(e, cx) {
 }
 
 export class Embeds {
-  constructor() { this.cache = new Map(); this.busy = new Set(); this.checked = new Map(); }
+  constructor() { this.cache = new Map(); this.busy = new Set(); this.checked = new Map(); liveEmbeds.add(this); }
+  dispose() { liveEmbeds.delete(this); }
   // At most 3 loads at once (the rest start as these finish and redraw); keep the newest 200 results.
   static MAX_LOADS = 3;
   static MAX_CACHE = 200;

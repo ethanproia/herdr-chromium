@@ -208,6 +208,35 @@ export function resolveOpen(tool, now = Date.now()) {
   return { kind: "mod", mod: o.mod, props: Object.keys(props).length ? props : undefined };
 }
 
+// Commands `openInTab` runs, in order. `hasActive` is whether some space is already
+// the selected one. An explicit `space` is that space's id.
+// A terminal `tab.new` with no space starts a space on its own (a person's new tab
+// with nothing open). A mod tab does not: `tab.new` with `mod` set returns
+// "no space yet" unless a space id is passed or one is already active. A command
+// such as `browser.new` opens in the current space and takes no space argument,
+// so it fails the same way. Those two start a space first. openInTab queues that
+// step, then the following command; the host finishes space.new (and selects it)
+// before starting the next, so the command lands in it. A named space, or one
+// already active, is not given a second.
+export function openInTabPlan(tool, { space, hasActive = false } = {}) {
+  const o = resolveOpen(tool);
+  const explicit = typeof space === "string" && space !== "";
+  if (o.kind === "terminal") return [{ name: "tab.new", args: explicit ? { space } : {} }];
+  if (o.kind === "command") {
+    const steps = [];
+    if (!hasActive) steps.push({ name: "space.new", args: {} });
+    steps.push({ name: o.name, args: {} });
+    return steps;
+  }
+  const args = { name: tool.name, mod: o.mod };
+  if (explicit) args.space = space;
+  if (o.props) args.props = o.props;
+  const steps = [];
+  if (!explicit && !hasActive) steps.push({ name: "space.new", args: {} });
+  steps.push({ name: "tab.new", args });
+  return steps;
+}
+
 // One scan: bundled + discovered, merged. Bad files are skipped and named in `errors`.
 // A shortcut the + menu will not honor is cleared and named in `warnings`; that tool stays.
 export async function loadRegistry(io) {
