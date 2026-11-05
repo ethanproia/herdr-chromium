@@ -490,10 +490,16 @@ fn no_visibility_report_keeps_playing_and_only_outside_pauses() {
     assert_eq!(c.playing(), vec!["v".to_string()]);
     c.sweep(t + OFFSCREEN);
     assert!(c.playing().is_empty(), "outside for OFFSCREEN pauses");
-    // Back inside resets it.
-    c.play("v", t + OFFSCREEN).unwrap();
-    c.seen("v", true, t + OFFSCREEN);
-    c.sweep(t + OFFSCREEN * 3);
+    // Back inside resets it (still rendered every frame, as a playing clip is).
+    let mut t = t + OFFSCREEN;
+    c.play("v", t).unwrap();
+    c.seen("v", true, t);
+    let end = t + OFFSCREEN * 3;
+    while t < end {
+        t += Duration::from_millis(16);
+        c.rendered("v", "v", &looped, t);
+        c.sweep(t);
+    }
     assert_eq!(c.playing(), vec!["v".to_string()], "inside clears the outside timer");
 }
 
