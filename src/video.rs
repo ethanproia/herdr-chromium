@@ -4,8 +4,8 @@
 //! plays it is a still: the first frame (or the frame at the last seek), decoded once, so 50 idle
 //! clips cost about 50 images and hold no player. Playing makes a player; pausing, ending or
 //! leaving the screen releases it and keeps the last frame as the still. At most `MAX_PLAYING`
-//! play at once (the longest playing pauses); a playing clip outside its window's visible area for
-//! `OFFSCREEN` pauses. A clip that stops rendering (its mod closed, or it left the layout) is
+//! play at once (the longest playing pauses); a playing clip that layout reports outside its window's
+//! visible area for `OFFSCREEN` pauses (no report is not "outside"). A clip that stops rendering (its mod closed, or it left the layout) is
 //! dropped after `GONE` while it holds a player, or `GONE_IDLE` as a still (a cached view may skip
 //! renders while it stays on screen). Paths follow `image`'s rule: inside the app directory
 //! (`gpui_shell::AppAssets::checked_path`).
@@ -52,6 +52,10 @@ struct Clip<P, Pic> {
     rendered: Instant,
     /// Last seen inside the window's visible area (layout says so, not a guess).
     visible: Option<Instant>,
+    /// Since when layout has said it is OUTSIDE the visible area (None: inside, or not known).
+    /// Only this pauses a playing clip: a view that skips layout (a board's cached canvas) says
+    /// nothing, and nothing is not "off screen".
+    outside_since: Option<Instant>,
     last_time_event: Option<Instant>,
     ready_sent: bool,
     /// This clip's events; dropping the clip closes them (waiting readers get an error).
@@ -140,11 +144,16 @@ impl<B: Backend> Clips<B> {
         clip.still.clone()
     }
 
-    /// Layout placed clip `id` inside its window's visible area this frame. Autoplay starts here, on
-    /// the first sighting, never on a guess.
-    pub fn seen(&mut self, id: &str, now: Instant) {
+    /// Layout placed clip `id` inside (`inside`) or outside its window's visible area this frame.
+    /// Autoplay starts on the first sighting inside, never on a guess.
+    pub fn seen(&mut self, id: &str, inside: bool, now: Instant) {
         let Some(clip) = self.clips.get_mut(id) else { return };
+        if !inside {
+            clip.outside_since.get_or_insert(now);
+            return;
+        }
         clip.visible = Some(now);
+        clip.outside_since = None;
         if clip.spec.autoplay && !clip.autoplayed {
             clip.autoplayed = true;
             let _ = self.play(id, now);
@@ -305,7 +314,7 @@ impl<B: Backend> Clips<B> {
         let offscreen: Vec<String> = self
             .clips
             .iter()
-            .filter(|(_, c)| c.player.is_some() && c.visible.or(c.started).is_none_or(|v| now.duration_since(v) >= OFFSCREEN))
+            .filter(|(_, c)| c.player.is_some() && c.outside_since.is_some_and(|t| now.duration_since(t) >= OFFSCREEN))
             .map(|(k, _)| k.clone())
             .collect();
         for id in offscreen {
@@ -338,6 +347,7 @@ impl<P, Pic> Clip<P, Pic> {
             autoplayed: false,
             rendered: now,
             visible: None,
+            outside_since: None,
             last_time_event: None,
             ready_sent: false,
             events: async_channel::bounded(EVENTS_KEPT),
@@ -460,9 +470,8 @@ fn render<H: Host>(spec: &VideoSpec, element: ElementId, key: Option<SharedStrin
     el.child(
         canvas(
             move |bounds, window, _| {
-                if window.content_mask().bounds.intersects(&bounds) {
-                    H::with(|c| c.seen(&probe_id, Instant::now()));
-                }
+                let inside = window.content_mask().bounds.intersects(&bounds);
+                H::with(|c| c.seen(&probe_id, inside, Instant::now()));
             },
             |_, _, _, _| {},
         )

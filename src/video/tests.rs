@@ -101,9 +101,7 @@ fn frame(c: &mut Clips<Fake>, id: &str, spec: &VideoSpec, on_screen: bool, now: 
     c.rendered(id, id, spec, now);
     let fake = Fake(c.backend.0.clone(), c.backend.1.clone());
     decode(c, &fake);
-    if on_screen {
-        c.seen(id, now);
-    }
+    c.seen(id, on_screen, now);
     c.picture(id)
 }
 
@@ -466,6 +464,43 @@ fn a_scrub_ends_with_its_clip() {
     start_scrub("v");
     c.sweep(t0 + GONE_IDLE);
     assert!(!scrubbing("v"));
+}
+
+/// A view that skips layout (a board's cached canvas) never reports where the clip is: a playing
+/// clip keeps playing; only layout saying "outside" for OFFSCREEN pauses it.
+#[test]
+fn no_visibility_report_keeps_playing_and_only_outside_pauses() {
+    let (_d, fake, mut c) = setup();
+    let t0 = Instant::now();
+    let looped = VideoSpec { looped: true, ..spec(0) };
+    c.rendered("v", "v", &looped, t0);
+    decode(&mut c, &fake);
+    c.play("v", t0).unwrap();
+    // Rendered every frame for 5 s, never probed (the board's case).
+    let mut t = t0;
+    while t < t0 + Duration::from_secs(5) {
+        t += Duration::from_millis(16);
+        c.rendered("v", "v", &looped, t);
+        c.sweep(t);
+    }
+    assert_eq!(c.playing(), vec!["v".to_string()], "unknown is not off screen");
+    // Layout now says outside: under OFFSCREEN it plays on, past it it pauses.
+    c.seen("v", false, t);
+    c.sweep(t + OFFSCREEN - Duration::from_millis(10));
+    assert_eq!(c.playing(), vec!["v".to_string()]);
+    c.sweep(t + OFFSCREEN);
+    assert!(c.playing().is_empty(), "outside for OFFSCREEN pauses");
+    // Back inside resets it (still rendered every frame, as a playing clip is).
+    let mut t = t + OFFSCREEN;
+    c.play("v", t).unwrap();
+    c.seen("v", true, t);
+    let end = t + OFFSCREEN * 3;
+    while t < end {
+        t += Duration::from_millis(16);
+        c.rendered("v", "v", &looped, t);
+        c.sweep(t);
+    }
+    assert_eq!(c.playing(), vec!["v".to_string()], "inside clears the outside timer");
 }
 
 /// A throwaway directory, removed on drop.
