@@ -129,6 +129,21 @@ mrun "$V" "$V/fakebin:$PATH" >"$scratch/live.log" 2>&1 && ok "update with live t
 grep -q "HC_SESSION='$P_SESSION'" "$V/.local/bin/$BRAND_CLI" && grep -q "kept the core session $P_SESSION" "$scratch/live.log" && ok "live terminals: the old session $P_SESSION is kept, and the installer says so" || bad "live session: $(grep -o "HC_SESSION='[^']*'" "$V/.local/bin/$BRAND_CLI"); $(cat "$scratch/live.log")"
 mrun "$V" "$V/fakebin:$PATH" >/dev/null 2>&1 && grep -q "HC_SESSION='$P_SESSION'" "$V/.local/bin/$BRAND_CLI" && ok "an update keeps the kept session" || bad "update lost the kept session"
 
+# An hc that lists the terminals but exits non-zero: still kept, with no shell arithmetic error.
+F=$scratch/live-fail
+mkdir -p "$F/fakebin" "$F/Applications/Herdr.app/Contents/MacOS" && printf 'stock binary\n' > "$F/Applications/Herdr.app/Contents/MacOS/Herdr"
+old_install "$F"
+printf '#!/bin/sh\necho %s\nexit 3\n' "'{\"terminals\": [{\"id\": \"t1\"}]}'" > "$F/fakebin/hc" && chmod +x "$F/fakebin/hc"
+mrun "$F" "$F/fakebin:$PATH" >"$scratch/live-fail.log" 2>&1 && ok "update with a failing hc runs" || bad "failing hc: $(tail -3 "$scratch/live-fail.log")"
+grep -q "HC_SESSION='$P_SESSION'" "$F/.local/bin/$BRAND_CLI" && ! grep -q "syntax error" "$scratch/live-fail.log" && ok "a failing hc that lists terminals: the old session is still kept, no syntax error" || bad "failing hc: $(grep -o "HC_SESSION='[^']*'" "$F/.local/bin/$BRAND_CLI"); $(grep -i error "$scratch/live-fail.log")"
+# An hc that fails with nothing: no terminals, the new session, no syntax error.
+E=$scratch/dead-hc
+mkdir -p "$E/fakebin" "$E/Applications/Herdr.app/Contents/MacOS" && printf 'stock binary\n' > "$E/Applications/Herdr.app/Contents/MacOS/Herdr"
+old_install "$E"
+printf '#!/bin/sh\nexit 1\n' > "$E/fakebin/hc" && chmod +x "$E/fakebin/hc"
+mrun "$E" "$E/fakebin:$PATH" >"$scratch/dead-hc.log" 2>&1 && ok "update with a dead hc runs" || bad "dead hc: $(tail -3 "$scratch/dead-hc.log")"
+grep -q "HC_SESSION='$BRAND_SESSION'" "$E/.local/bin/$BRAND_CLI" && ! grep -q "syntax error" "$scratch/dead-hc.log" && ok "a dead hc: the new session, no syntax error" || bad "dead hc: $(grep -o "HC_SESSION='[^']*'" "$E/.local/bin/$BRAND_CLI"); $(grep -i error "$scratch/dead-hc.log")"
+
 # ---- Another brand.json: every name follows it.
 B=$scratch/brand && mkdir -p "$B/Applications/Herdr.app/Contents/MacOS" && printf 'stock\n' > "$B/Applications/Herdr.app/Contents/MacOS/Herdr"
 python3 - "$scratch/other-brand.json" <<'PY2'

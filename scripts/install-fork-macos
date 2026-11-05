@@ -79,9 +79,13 @@ migrate() {
       echo "made $labs_home from a copy of $p_dir (the old home stays as a backup)"
       local live=0
       if command -v hc >/dev/null 2>&1; then
+        # One number from python whatever hc's exit (pipefail: a failing hc must not add a
+        # second line); anything that isn't a number counts as none.
         live=$(HC_SESSION=$p_session hc ls --json 2>/dev/null | python3 -c 'import json, sys
 try: print(len(json.load(sys.stdin).get("terminals", [])))
-except Exception: print(0)' 2>/dev/null || echo 0)
+except Exception: print(0)' 2>/dev/null || true)
+        live=${live##*$'\n'}
+        [[ $live =~ ^[0-9]+$ ]] || live=0
       fi
       if [[ ${live:-0} -gt 0 ]]; then
         printf '%s\n' "$p_session" > "$labs_home/.session"
