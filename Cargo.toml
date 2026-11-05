@@ -113,6 +113,11 @@ path = "tests/browser_device_menu.rs"
 harness = false
 
 [[test]]
+name = "browser_shield_visible"
+path = "tests/browser_shield_visible.rs"
+harness = false
+
+[[test]]
 name = "browser_load_errors"
 path = "tests/browser_load_errors.rs"
 harness = false
