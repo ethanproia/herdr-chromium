@@ -24,6 +24,12 @@ fn paced(p: &mut Page, d: Duration, mut each: impl FnMut(&mut Page, u32)) {
         p.pump();
         n += 1;
         let next = start + TICK * n;
+        // Keep pumping until the next tick: a frame that arrives mid-tick is handled now, as the
+        // app's main thread would, not at the next tick (that wait read as 33 ms gaps).
+        while Instant::now() + Duration::from_millis(2) < next {
+            std::thread::sleep(Duration::from_millis(2));
+            p.pump();
+        }
         if let Some(wait) = next.checked_duration_since(Instant::now()) {
             std::thread::sleep(wait);
         }
