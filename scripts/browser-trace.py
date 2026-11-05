@@ -48,6 +48,7 @@ def main():
     ap.add_argument("host")
     ap.add_argument("app")
     ap.add_argument("--gap-ms", type=float, default=33.0)
+    ap.add_argument("--idle-ms", type=float, default=200.0, help="a callback gap this long splits active stretches")
     ap.add_argument("--from-ns", type=int, default=0)
     ap.add_argument("--to-ns", type=int, default=1 << 62)
     args = ap.parse_args()
@@ -73,6 +74,17 @@ def main():
     span = (max(e[0] for e in host + app) - min(e[0] for e in host + app)) / 1e9 if host and app else 0
     print(f"span {span:.1f} s")
     print(f"CEF page callbacks: {len(callbacks)} ({len(callbacks) / span:.1f}/s)" if span else "no events")
+    # The span includes page load and idle before the input starts: the rate that matters is over
+    # the longest stretch of callbacks with no gap of --idle-ms or more.
+    runs, start = [], 0
+    for i in range(1, len(callbacks) + 1):
+        if i == len(callbacks) or ms(callbacks[i] - callbacks[i - 1]) >= args.idle_ms:
+            runs.append((start, i - 1))
+            start = i
+    a, b = max(runs, key=lambda r: callbacks[r[1]] - callbacks[r[0]], default=(0, 0))
+    if b > a:
+        active = (callbacks[b] - callbacks[a]) / 1e9
+        print(f"  active stretch: {b - a + 1} callbacks in {active:.2f} s ({(b - a) / active:.1f}/s)")
     print(summary("  interval between callbacks", [ms(q - p) for p, q in zip(callbacks, callbacks[1:])]))
     print(summary("  copy (incl. GPU wait)", copies) + f"; held for credit: {held}")
     print(f"frames sent {len(sent)} ({len(sent) / span:.1f}/s), presented {len(presented)} ({len(presented) / span:.1f}/s)" if span else "")
