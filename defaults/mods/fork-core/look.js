@@ -2,11 +2,11 @@
 // the safe copy runner, how a tool opens, and the host side of the registry.
 import { div, svg } from "gpui-kit";
 import { h_flex } from "gpui-base";
-import { exec, hc, appHome, readTextFile, settings, notify, run, watchFolder, shared, setShared, openOverlay, writeTextFile } from "herdr";
+import { exec, hc, appHome, readTextFile, settings, notify, run, watchFolder, shared, setShared, openOverlay, writeTextFile, spaces } from "herdr";
 import * as herdr from "herdr";
 import { SELF, icon } from "./self.js";
 import { keysym, COPY_TEXT, COPY_FILE_STRIPPED, watchMembership, registryWatchRelevant, headerActionPlan, registryNotice, runRegistryWatch, registryWatchFailure, runCopyPlan } from "./pure.js";
-import { resolveOpen, createRegistry, readRegistryCache, toolsFromCache, publishRegistryChanges, REGISTRY_CACHE_KEY } from "./registry.js";
+import { resolveOpen, openInTabPlan, createRegistry, readRegistryCache, toolsFromCache, publishRegistryChanges, REGISTRY_CACHE_KEY } from "./registry.js";
 
 export { keysym, registryNotice, icon };
 export const KEYFONT = ".SystemUIFont";   // the bundled UI font has no bold or symbols: macOS menus use the system one
@@ -109,11 +109,14 @@ export function runHeaderAction(action, { pane, mod } = {}) {
 }
 
 // ---- opening a tool ------------------------------------------------------------------------------------------------
+// `run` only queues the command and returns null (herdr-app mods.rs). The window
+// takes one Request::Run at a time and finishes it before the next (window.rs).
+// space.new selects the new space in Model::add_space before that handler returns,
+// so the next command in this loop — tab.new, or a command such as browser.new —
+// sees that space active. The calls stay in this order without waiting on `run`.
 export function openInTab(tool, space) {
-  const o = resolveOpen(tool);
-  if (o.kind === "terminal") run("tab.new", { space });
-  else if (o.kind === "command") run(o.name, {});   // browser.new opens a tab in the current space (no space arg)
-  else run("tab.new", { name: tool.name, space, mod: o.mod, ...(o.props ? { props: o.props } : {}) });
+  const hasActive = spaces().some((s) => s.active);
+  for (const step of openInTabPlan(tool, { space, hasActive })) run(step.name, step.args);
 }
 
 // The extra arguments pane.split takes to start this tool in the new pane (null for a command).

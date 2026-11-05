@@ -715,6 +715,11 @@ pub struct BrowserView {
     load_error: Option<(String, i32, String)>,
     /// Size and scale the host was last told; None: no page made yet.
     sized: Option<(Dips, f32)>,
+    /// HERDR: one resize in flight at a time. When the last one went out, and the newest size laid
+    /// out since (sent when a frame answers, or after RESIZE_WAIT): a drag sends a few sizes, not
+    /// one per layout, so Chromium doesn't relayout for every width on the way.
+    resize_sent: Option<std::time::Instant>,
+    resize_wanted: Option<(Dips, f32)>,
     /// The newest frame from the host, painted into the page area (part 3).
     frames: FrameView,
     /// The last frame acked (each frame is acked once, however often it's painted).
@@ -989,6 +994,8 @@ impl BrowserView {
             prompt_remember: false,
             load_error: None,
             sized: None,
+            resize_sent: None,
+            resize_wanted: None,
             frames: FrameView::new(),
             acked: None,
             focus,
@@ -1197,7 +1204,9 @@ impl BrowserView {
                     p(&FrameEvent::Arrived { seq, surface: surface.clone(), size });
                 }
                 // Acked once painted (`send_ack` after the draw), so the host sends at most one ahead.
-                if let Err(e) = self.frames.on_frame(seq, surface, size, scale) {
+                let result = self.frames.on_frame(seq, surface, size, scale);
+                self.flush_resize(true);
+                if let Err(e) = result {
                     tracing::warn!("browser {}: frame {seq}: {e:#}", self.id);
                     // Unpaintable: ack anyway, or the host waits on it forever.
                     super::trace::line("acked", format_args!("seq={seq}"));
@@ -1323,6 +1332,7 @@ impl BrowserView {
         self.measured = Some((size, scale));
         // Responsive mode: the page gets the device's real viewport, whatever the block's size.
         let (size, scale) = self.device.as_ref().map_or((size, scale), |d| (Dips { w: d.w, h: d.h }, d.scale));
+        self.flush_resize(false);
         match self.sized {
             None if self.adopted => {
                 self.link.send(AppToHost::Resize { id: self.id.clone(), size, scale });
@@ -1338,10 +1348,27 @@ impl BrowserView {
             Some(_) => {
                 self.frames.on_resize_pending(size);
                 self.overlay.changed(Change::Resize);
-                self.link.send(AppToHost::Resize { id: self.id.clone(), size, scale });
+                self.resize_wanted = Some((size, scale));
+                self.flush_resize(false);
             }
         }
         self.sized = Some((size, scale));
+    }
+
+    /// Sends the newest laid-out size if no resize is in flight (or the last one is RESIZE_WAIT
+    /// old); `answered`: a frame just came, so the host is ready for the next.
+    fn flush_resize(&mut self, answered: bool) {
+        const RESIZE_WAIT: std::time::Duration = std::time::Duration::from_millis(150);
+        if answered {
+            self.resize_sent = None;
+        }
+        if self.resize_sent.is_some_and(|t| t.elapsed() < RESIZE_WAIT) {
+            return;
+        }
+        if let Some((size, scale)) = self.resize_wanted.take() {
+            self.resize_sent = Some(std::time::Instant::now());
+            self.link.send(AppToHost::Resize { id: self.id.clone(), size, scale });
+        }
     }
 
     /// An agent drives this page before it was ever shown (a background tab, a headless
@@ -1737,6 +1764,11 @@ impl BrowserView {
             a.lock().unwrap().grants.set(&self.id, g, on);
         }
         cx.notify();
+    }
+
+    /// Whether the shield's grants panel is open.
+    pub fn shield_open(&self) -> bool {
+        self.shield_open
     }
 
     pub fn toggle_shield(&mut self, cx: &mut Context<Self>) {
@@ -2886,9 +2918,14 @@ impl BrowserView {
                     .px_1()
                     .rounded_sm()
                     .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .gap_1()
                     .when(granted, |d| d.bg(rgb(0x0a84ff)).text_color(rgb(0xffffff)))
                     .when(!granted, |d| d.hover(|d| d.bg(hsla(0., 0., 0.5, 0.15))))
-                    .child(if driving { "🛡 Agent" } else { "🛡" })
+                    // Drawn, not an emoji: it shows whatever the fonts, display or theme.
+                    .child(shield_icon(if granted { SHIELD_ON } else { SHIELD_OFF }))
+                    .when(driving, |d| d.child("Agent"))
                     .on_click(cx.listener(|v, _, _, cx| v.toggle_shield(cx)))
             })
     }
@@ -3231,6 +3268,36 @@ pub fn broker_authorizer(agent: Arc<Mutex<Agent>>, states: Arc<Mutex<HashMap<Bro
 
 /// Room for the device label and its gap above the letterboxed frame (DIPs).
 const DEVICE_LABEL_SPACE: f32 = 24.0;
+
+/// The shield's colours: white on the blue tile while a grant is on, mid-gray (seen on light
+/// and dark bars) while none is.
+pub const SHIELD_ON: u32 = 0xffffff;
+pub const SHIELD_OFF: u32 = 0x8e8e93;
+
+/// S29's shield, drawn as a filled path (12×14 DIPs): no font or emoji needed.
+fn shield_icon(color: u32) -> impl IntoElement {
+    canvas(
+        |_, _, _| (),
+        move |b: Bounds<Pixels>, _, window, _| {
+            let (x, y, w, h) = (b.origin.x, b.origin.y, b.size.width, b.size.height);
+            let p = |fx: f32, fy: f32| point(x + w * fx, y + h * fy);
+            let mut path = PathBuilder::fill();
+            path.move_to(p(0.5, 0.0));
+            path.line_to(p(1.0, 0.16));
+            path.line_to(p(1.0, 0.5));
+            path.curve_to(p(0.5, 1.0), p(1.0, 0.84));
+            path.curve_to(p(0.0, 0.5), p(0.0, 0.84));
+            path.line_to(p(0.0, 0.16));
+            path.close();
+            if let Ok(path) = path.build() {
+                window.paint_path(path, rgb(color));
+            }
+        },
+    )
+    .flex_none()
+    .w(px(12.))
+    .h(px(14.))
+}
 
 /// Set while `herdr-app shot` renders the window: blocks marked sensitive draw a cover instead of the page.
 pub static SHOT_MASK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

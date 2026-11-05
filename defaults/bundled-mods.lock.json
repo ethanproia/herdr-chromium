@@ -3,7 +3,7 @@
   "mods": {
     "agents-named": {
       "branch": "main",
-      "commit": "d1c770490e00c04932ffab1347763972bbc1efb0",
+      "commit": "56d67020710e79898da8e9d1160c4a1fbd22d0b9",
       "version": "0.1.0",
       "pr": "essexlabs/labs#1337 (merged to main; on #1334)",
       "path": "projects/herdr-mods/clones/mac/agents-named"
@@ -30,7 +30,7 @@
     },
     "core": {
       "branch": "main",
-      "commit": "d1c770490e00c04932ffab1347763972bbc1efb0",
+      "commit": "56d67020710e79898da8e9d1160c4a1fbd22d0b9",
       "version": "0.1.0",
       "pr": "essexlabs/labs#1337 (merged to main; on #1334)",
       "path": "projects/herdr-mods/core",
@@ -42,7 +42,7 @@
     },
     "notepad": {
       "branch": "main",
-      "commit": "ec71dee685393fa2476e4c75eb1c0d864d418f0c",
+      "commit": "56d67020710e79898da8e9d1160c4a1fbd22d0b9",
       "path": "projects/herdr-mods/notepad",
       "version": "0.1.0",
       "pr": "essexlabs/labs#1334 (merged to main)",
@@ -52,6 +52,7 @@
         "dig",
         "find",
         "git",
+        "ls",
         "mkdir",
         "mktemp",
         "open",
@@ -59,14 +60,16 @@
         "rmdir",
         "sh",
         "sips",
-        "test"
+        "stat",
+        "test",
+        "touch"
       ]
     },
     "notepad-view": {
       "path": "projects/herdr-mods/notepad-view",
       "version": "0.1.0",
       "branch": "main",
-      "commit": "ec71dee685393fa2476e4c75eb1c0d864d418f0c",
+      "commit": "56d67020710e79898da8e9d1160c4a1fbd22d0b9",
       "pr": "essexlabs/labs#1334 (merged to main)"
     },
     "remote-desktop": {
@@ -80,18 +83,20 @@
     },
     "spaces-browser": {
       "branch": "main",
-      "commit": "d1c770490e00c04932ffab1347763972bbc1efb0",
+      "commit": "56d67020710e79898da8e9d1160c4a1fbd22d0b9",
       "version": "0.1.0",
       "pr": "essexlabs/labs#1337 (merged to main; on #1334)",
       "path": "projects/herdr-mods/clones/mac/spaces-browser",
       "exec": [
-        "git"
-      ]
+        "git",
+        "osascript"
+      ],
+      "exec_note": "osascript runs only the fixed 'choose folder' dialog behind Open Folder\u2026 (person-initiated)"
     }
   },
   "layout": {
     "branch": "main",
-    "commit": "d1c770490e00c04932ffab1347763972bbc1efb0",
+    "commit": "56d67020710e79898da8e9d1160c4a1fbd22d0b9",
     "version": "0.1.0",
     "pr": "essexlabs/labs#1337 (merged to main; on #1334)",
     "path": "projects/herdr-mods/clones/mac/layouts/Labs.json",

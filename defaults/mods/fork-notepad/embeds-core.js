@@ -155,6 +155,48 @@ export function cacheGet(cache, key, now) {
   return hit;
 }
 
+// Image cache caps: the download cache sweeps itself after each fetch.
+export const CACHE_MAX_FILES = 200;
+export const CACHE_MAX_BYTES = 200 * 1024 * 1024;
+
+// Which files to delete so the folder is under `maxFiles` files and `maxBytes` bytes.
+// files: [{name, size, mtime}]; the smallest mtime goes first. Equal mtimes keep
+// their incoming order (stat follows `ls`, so a same-second tie is alphabetical).
+// `keep` (a Set or a list of names) counts toward both caps but is never deleted:
+// a file this process just fetched, or is about to return, must survive the sweep.
+export function evictList(files, maxFiles, maxBytes, keep) {
+  const pinned = keep instanceof Set ? keep : new Set(keep || []);
+  const list = (files || []).slice().sort((a, b) => (a.mtime || 0) - (b.mtime || 0));
+  let n = list.length, bytes = 0;
+  for (const f of list) bytes += f.size || 0;
+  const out = [];
+  for (const f of list) {
+    if (n <= maxFiles && bytes <= maxBytes) break;
+    if (pinned.has(f.name)) continue;
+    out.push(f.name);
+    n--;
+    bytes -= f.size || 0;
+  }
+  return out;
+}
+
+// Lines from BSD `stat -f "%m %z %N"`. A line that is not `<mtime> <size> <path>`
+// is skipped, so one bad line does not drop the rest. `dir` is the cache directory;
+// only a path under that directory yields a name (the path with the dir prefix removed).
+// A matching line for some other path is ignored, so a format mismatch cannot invent
+// a name and delete it.
+export function parseStat(out, dir) {
+  const files = [];
+  const prefix = String(dir ?? "").replace(/\/+$/, "") + "/";
+  for (const line of String(out ?? "").split("\n")) {
+    const m = /^(\d+) (\d+) (.+)$/.exec(line);
+    if (!m || !m[3].startsWith(prefix)) continue;
+    const name = m[3].slice(prefix.length);
+    if (name) files.push({ name, size: Number(m[2]), mtime: Number(m[1]) });
+  }
+  return files;
+}
+
 // Clamp text to about `lines` lines of `cpl` characters, with an ellipsis.
 export function clampText(s, cpl, lines) {
   const max = Math.max(8, Math.floor(cpl)) * lines;
@@ -306,4 +348,17 @@ export function digArgs(host, type) {
 export function ipsFromDig(out) {
   return String(out || "").split("\n").map((l) => l.trim())
     .filter((l) => /^\d+\.\d+\.\d+\.\d+$/.test(l) || (/^[0-9a-f:]+$/i.test(l) && l.includes(":")));
+}
+
+// Cache file names an open note still draws: every successful result in an Embeds cache (an image's path,
+// a bookmark's thumb and icon) that lives under `rel`. The sweep never deletes these, so an image on screen
+// never loses its file while its cache entry still says ok.
+export function heldNames(entries, rel) {
+  const out = new Set();
+  const add = (p) => { if (typeof p === "string" && p.startsWith(rel + "/")) out.add(p.slice(rel.length + 1)); };
+  for (const v of entries || []) {
+    if (!v || v.ok !== true) continue;
+    add(v.path); add(v.thumb?.path); add(v.icon?.path);
+  }
+  return out;
 }
