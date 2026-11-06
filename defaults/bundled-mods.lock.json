@@ -103,26 +103,26 @@
     "preview": "projects/herdr-mods/clones/mac/layouts/labs.svg"
   },
   "stock": {
-    "agents": "b0e2d92fafb0f91e",
-    "changes": "87b5c7bf576cab0e",
-    "confirm": "c3c5e99c42bfb7c2",
+    "agents": "32ae95863df18719",
+    "changes": "6c4e93ce7ba90b6c",
+    "confirm": "a0294cf0abddf988",
     "files": "114b0daefa620292",
     "help": "bda54340f8f99a4f",
     "machine-add": "fc0d3c7283eb6b86",
-    "menu": "b306b52329864d0e",
+    "menu": "bcc4c8f2da8b025d",
     "new-menu": "26c2c996b53c6d4c",
     "pane": "4af182fe5751a96d",
     "peek": "dcb2cca951488605",
     "picker": "d5183ad58247fe3a",
     "prompt": "f69767163714eba3",
-    "spaces": "408da9a61185a792",
+    "spaces": "625490b3ec6c51ea",
     "tabs": "2bfd3d2c54497c52",
     "terminals-bar": "2959e52e89528b33",
     "terminals-pane": "b049ae39286a0a89",
     "toast": "96bdc2d91ca5fd99",
     "win98": "f12f2010539e0996",
-    "workspace-chrome": "cf1673749eee9578",
+    "workspace-chrome": "cdd787949cc0292a",
     "workspace-status": "39244abc10f76527",
-    "worktree": "19e431504e4d75bd"
+    "worktree": "85ebdea24e0f0234"
   }
 }
